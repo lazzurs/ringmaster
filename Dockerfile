@@ -4,9 +4,9 @@
 # host's platform and cross-compiles for TARGETPLATFORM with tonistiigi/xx.
 # The runtime stage only copies files, so no RUN executes under QEMU.
 
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0@sha256:c64defb9ed5a91eacb37f96ccc3d4cd72521c4bd18d5442905b95e2226b0e707 AS xx
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.10.0@sha256:40fe21f44bb8cddf1eb1226db190d0a984118f62ee02a91b77d99448d28264a6 AS xx
 
-FROM --platform=$BUILDPLATFORM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS build
+FROM --platform=$BUILDPLATFORM rust:1.100-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS build
 COPY --from=xx / /
 RUN apt-get update \
  && apt-get install -y --no-install-recommends clang lld \
