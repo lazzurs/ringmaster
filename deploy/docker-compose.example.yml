@@ -1,0 +1,103 @@
+# Example deployment on the homeserver.
+#
+#   deploy/
+#     docker-compose.yml   <- this file
+#     .env                 <- secrets (chmod 600, never commit)
+#     ringmaster/config.toml
+#
+# .env:
+#   ANTHROPIC_API_KEY=sk-ant-...
+#   RINGMASTER_WEBHOOK_SECRET=<openssl rand -hex 32>
+#   NTFY_TOKEN=tk_...                       (if your ntfy topic needs auth)
+#   TUNNEL_TOKEN=<Cloudflare Tunnel token>
+#   NEXTCLOUD_HOST=https://cloud.example.com
+#   NEXTCLOUD_USERNAME=rob
+#   NEXTCLOUD_PASSWORD=<Nextcloud app password>
+#   HOMEY_MCP_TOKEN=...                     (if the Homey MCP server needs one)
+#
+# Networks:
+#   edge  - cloudflared <-> ringmaster, with internet access (Claude API, ntfy,
+#           the Mac on the LAN).
+#   mcp   - internal only: ringmaster <-> MCP servers. Nothing is published and
+#           cloudflared cannot reach the MCP servers.
+#   egress - outbound access for MCP servers that must reach Nextcloud/Homey.
+
+name: ringmaster
+
+services:
+  ringmaster:
+    image: ghcr.io/lazzurs/ringmaster:latest   # pin a release tag in practice
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?}
+      RINGMASTER_WEBHOOK_SECRET: ${RINGMASTER_WEBHOOK_SECRET:?}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      HOMEY_MCP_TOKEN: ${HOMEY_MCP_TOKEN:-}
+      RUST_LOG: info
+    volumes:
+      - ./ringmaster/config.toml:/etc/ringmaster/config.toml:ro
+      - ringmaster-data:/data          # SQLite + recordings; the only writable path
+    networks: [edge, mcp]
+    # No ports: cloudflared reaches it as http://ringmaster:8080.
+    # The image has a HEALTHCHECK (`ringmaster healthcheck`).
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.10.7@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?}
+    networks: [edge]
+    depends_on: [ringmaster]
+    # In the Zero Trust dashboard, the tunnel's public hostname routes to
+    # http://ringmaster:8080 with Path  ^/(webhook|confirm/.*)$  so /metrics
+    # and /healthz stay private. Protect /webhook with a Cloudflare Access
+    # application using a service token; the Pebble app sends
+    # CF-Access-Client-Id / CF-Access-Client-Secret as custom headers.
+
+  nextcloud-mcp:
+    # https://github.com/cbcoutinho/nextcloud-mcp-server  (AGPL-3.0)
+    # Image entrypoint: `nextcloud-mcp-server run --host 0.0.0.0`; transport
+    # defaults to streamable-http on port 8000, endpoint /mcp.
+    image: ghcr.io/cbcoutinho/nextcloud-mcp-server:0.207.1@sha256:f2359f6d4fdda860a63e5862640b409bb1ab7f1d7952b51ba94820f4eb3d0bff
+    restart: unless-stopped
+    command: ["--transport", "streamable-http", "--enable-app", "deck", "--log-level", "warning"]
+    environment:
+      # Single-user BasicAuth mode: use a dedicated Nextcloud *app password*.
+      NEXTCLOUD_HOST: ${NEXTCLOUD_HOST:?}
+      NEXTCLOUD_USERNAME: ${NEXTCLOUD_USERNAME:?}
+      NEXTCLOUD_PASSWORD: ${NEXTCLOUD_PASSWORD:?}
+      # Optional hardening: only accept the Host header ringmaster sends.
+      # MCP_DNS_REBINDING_PROTECTION: "true"
+      # MCP_ALLOWED_HOSTS: "nextcloud-mcp:8000"
+    networks: [mcp, egress]
+    # No ports published.
+
+  homey-mcp:
+    # PLACEHOLDER - the Homey MCP server is not chosen yet. Options:
+    #   * Athom's official cloud MCP server (mcp.athom.com). It is a remote
+    #     server, so it would not run here at all: add it to config.toml's
+    #     [[mcp_servers]] with its URL and a token instead of this service.
+    #   * The "MCP AI Bridge" app installed on the Homey itself (runs on the
+    #     Homey, reached over the LAN; again no container needed).
+    #   * A community MCP server for Homey's Web API run as a container here.
+    # Whatever is picked must speak MCP streamable HTTP; config.toml points at
+    # http://homey-mcp:3000/mcp by default. Enable with `--profile homey`.
+    profiles: ["homey"]
+    image: example.invalid/homey-mcp:CHANGE-ME
+    restart: unless-stopped
+    environment:
+      HOMEY_TOKEN: ${HOMEY_MCP_TOKEN:-}
+    networks: [mcp, egress]
+
+networks:
+  edge: {}
+  mcp:
+    internal: true
+  egress: {}
+
+volumes:
+  ringmaster-data: {}
