@@ -136,6 +136,36 @@ pub fn to_defs(tools: Vec<DiscoveredTool>) -> Vec<ToolDef> {
     defs
 }
 
+/// Reject input schemas the Claude API would refuse, so one badly behaved MCP
+/// server cannot break every request. This is a shape check, not a full JSON
+/// Schema validation; anything subtler is caught by the agent's fallback of
+/// retrying without tools when the API rejects the tool list.
+pub fn check_schema(schema: &Map<String, Value>) -> Result<(), String> {
+    match schema.get("type") {
+        None => {}
+        Some(Value::String(t)) if t == "object" => {}
+        Some(other) => return Err(format!("input schema type is {other}, not \"object\"")),
+    }
+    match schema.get("properties") {
+        None => {}
+        Some(Value::Object(props)) => {
+            if let Some((k, _)) = props
+                .iter()
+                .find(|(_, v)| !matches!(v, Value::Object(_) | Value::Bool(_)))
+            {
+                return Err(format!("property {k:?} is not a schema"));
+            }
+        }
+        Some(_) => return Err("\"properties\" is not an object".into()),
+    }
+    match schema.get("required") {
+        None => {}
+        Some(Value::Array(a)) if a.iter().all(Value::is_string) => {}
+        Some(_) => return Err("\"required\" is not a list of names".into()),
+    }
+    Ok(())
+}
+
 type Client = RunningService<RoleClient, ClientConfig>;
 
 /// MCP servers over streamable HTTP. Sessions are opened lazily, kept, and
@@ -339,6 +369,7 @@ fn render_content<T: Serialize>(content: &[T], structured: Option<&Value>) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn tool(server: &str, name: &str) -> DiscoveredTool {
         DiscoveredTool {
@@ -347,6 +378,17 @@ mod tests {
             description: String::new(),
             input_schema: Map::new(),
         }
+    }
+
+    #[test]
+    fn schema_shape_checks() {
+        let ok = |v: Value| check_schema(v.as_object().unwrap());
+        assert!(ok(json!({})).is_ok());
+        assert!(ok(json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]})).is_ok());
+        assert!(ok(json!({"type": "array"})).is_err());
+        assert!(ok(json!({"properties": []})).is_err());
+        assert!(ok(json!({"properties": {"a": 3}})).is_err());
+        assert!(ok(json!({"required": "a"})).is_err());
     }
 
     #[test]

@@ -102,6 +102,13 @@ async fn main() -> ExitCode {
             }
         }
         Command::CheckConfig { config } => match ringmaster::config::Config::load(&config) {
+            Ok(c) if !c.mcp_warnings.is_empty() => {
+                // `serve` would start without these servers; flag them here.
+                for w in &c.mcp_warnings {
+                    eprintln!("warning: {w}");
+                }
+                ExitCode::FAILURE
+            }
             Ok(c) => {
                 println!(
                     "ok: {} profile(s), {} MCP server(s), {} tool policy rule(s)",

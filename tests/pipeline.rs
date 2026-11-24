@@ -142,6 +142,11 @@ impl Respond for ScriptedClaude {
         let n = seen.len();
         seen.push(body);
         match self.turns.get(n) {
+            // `{"__status": 400, "__body": {...}}` scripts an API error.
+            Some(t) if t.get("__status").is_some() => {
+                ResponseTemplate::new(t["__status"].as_u64().unwrap() as u16)
+                    .set_body_json(t["__body"].clone())
+            }
             Some(t) => ResponseTemplate::new(200).set_body_json(t.clone()),
             None => ResponseTemplate::new(500).set_body_string("script exhausted"),
         }
@@ -223,6 +228,7 @@ max_retries = 0
 [agent]
 timezone = "Europe/Dublin"
 retry_base_secs = 1
+tool_discovery_timeout_secs = 2
 
 [[tool_policies]]
 match = "home/*delete*"
@@ -758,15 +764,30 @@ async fn wildcard_profile_skips_unavailable_server() {
     let notes = h.notes.take();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert_eq!(notes[0].kind, Kind::Result);
-    assert_eq!(notes[0].body, "Done.");
+    assert!(notes[0].body.starts_with("Done."), "{}", notes[0].body);
+    assert!(
+        notes[0].body.contains("Unavailable: homey"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("Turn on the kitchen lights."),
+        "{}",
+        notes[0].body
+    );
 }
 
 #[tokio::test]
-async fn named_server_down_retries_instead_of_running() {
-    // The capture profile names `home/...`; that server is down here.
-    let h = harness_with(vec![final_turn("Added.")], Some("buy milk"), |_| {
-        vec![dead_server("home")]
-    })
+async fn only_server_down_still_answers_and_keeps_the_request() {
+    // The capture profile names `home/...` and that server is down: the job
+    // still runs (with no tools), and the reply carries what the user said.
+    let h = harness_with(
+        vec![final_turn(
+            "I couldn't add that: the task list is unavailable.",
+        )],
+        Some("buy milk"),
+        |_| vec![dead_server("home")],
+    )
     .await;
     let (ct, body) = multipart(Some(TONE), None, false);
     let (status, _) = send(
@@ -776,12 +797,105 @@ async fn named_server_down_retries_instead_of_running() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     tick(&h).await;
-    assert!(
-        h.claude_seen.lock().unwrap().is_empty(),
-        "must not run without its named server"
-    );
+
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].get("tools").is_none(), "no tools to offer");
     let job = h.db.get_job(1).await.unwrap().unwrap();
-    assert_eq!(job.status, JobStatus::Queued, "queued for a retry");
+    assert_eq!(job.status, JobStatus::Done);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0].body.contains("Unavailable: home"),
+        "{}",
+        notes[0].body
+    );
+    assert!(notes[0].body.contains("buy milk"), "{}", notes[0].body);
+}
+
+#[tokio::test]
+async fn rejected_tool_definitions_fall_back_to_no_tools() {
+    let h = harness(
+        vec![
+            json!({"__status": 400, "__body": {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "tools.0.input_schema: invalid"}
+            }}),
+            final_turn("Sorry, I can't do that right now."),
+        ],
+        Some("Turn on the kitchen lights."),
+    )
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    send(
+        &h,
+        signed_request("rec-400", "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    tick(&h).await;
+
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "retried once");
+    assert!(seen[0].get("tools").is_some());
+    assert!(seen[1].get("tools").is_none(), "second try has no tools");
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0].body.contains("Unavailable: all tools"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("kitchen lights"),
+        "{}",
+        notes[0].body
+    );
+}
+
+#[tokio::test]
+async fn hung_server_is_skipped_quickly() {
+    // Accepts connections but never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    let h = harness_with(vec![final_turn("Done.")], Some("lights on"), move |home| {
+        vec![
+            home,
+            McpServerConfig {
+                name: "slow".into(),
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                token_env: None,
+            },
+        ]
+    })
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    send(
+        &h,
+        signed_request("rec-hung", "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    tick(&h).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].body.contains("Unavailable: slow"),
+        "{}",
+        notes[0].body
+    );
 }
 
 #[tokio::test]

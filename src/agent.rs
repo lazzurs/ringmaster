@@ -33,6 +33,9 @@ pub struct AgentState {
     /// Set once Claude has given its final answer.
     #[serde(default)]
     pub final_text: Option<String>,
+    /// MCP servers (or "all tools") that could not be used for this job.
+    #[serde(default)]
+    pub unavailable: Vec<String>,
 }
 
 /// Tool calls of one assistant turn, held until the user decides.
@@ -209,6 +212,28 @@ impl Agent {
                 }
                 Err(ClaudeError::Permanent(e)) => {
                     self.audit(job, "claude_error", json!({ "error": e })).await;
+                    // A tool definition the API rejects must not sink the
+                    // request. Before any tool has run, try once more with no
+                    // tools: Claude can still answer, and say what it could
+                    // not do.
+                    if !state.tools.is_empty() && state.messages.len() == 1 && e.starts_with("400")
+                    {
+                        tracing::warn!(job = job.id, error = %e, "API rejected the request with tools; retrying without them");
+                        self.audit(
+                            job,
+                            "tools_dropped",
+                            json!({
+                                "tools": state.tools.iter().map(ToolDef::qualified).collect::<Vec<_>>(),
+                                "error": e,
+                            }),
+                        )
+                        .await;
+                        state.tools.clear();
+                        state.unavailable.push("all tools".into());
+                        state.iterations -= 1;
+                        self.db.save_agent_state(job.id, &state).await?;
+                        continue;
+                    }
                     return Err(AgentError::Permanent(e));
                 }
             };
@@ -260,7 +285,7 @@ impl Agent {
                 }
                 _ => {
                     // end_turn, stop_sequence, or anything new: the answer.
-                    let text = final_text(&content);
+                    let text = with_unavailable_note(final_text(&content), &state, req);
                     state
                         .messages
                         .push(json!({"role": "assistant", "content": content}));
@@ -286,30 +311,57 @@ impl Agent {
             .into_iter()
             .filter(|s| filter.may_use_server(s))
             .collect();
-        // Each server on its own: a server the profile names explicitly must
-        // be up (the job retries later), but one reached only through a
-        // wildcard is skipped while it is down, so one broken integration
-        // does not stop every command.
+        // Every server is optional: one that is down, slow, or misbehaving is
+        // skipped and the job runs with the rest. Servers are listed
+        // concurrently with a short timeout so a hung one costs seconds, not
+        // minutes, and never blocks the others.
+        let timeout = std::time::Duration::from_secs(self.config.agent.tool_discovery_timeout_secs);
+        let listings = futures_util::future::join_all(servers.iter().map(|server| {
+            let tools = self.tools.clone();
+            async move {
+                let res =
+                    tokio::time::timeout(timeout, tools.list_tools(std::slice::from_ref(server)))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(ToolError::Unreachable(
+                                server.clone(),
+                                format!("no answer within {}s", timeout.as_secs()),
+                            ))
+                        });
+                (server.clone(), res)
+            }
+        }))
+        .await;
         let mut discovered = Vec::new();
         let mut unavailable = Vec::new();
-        for server in &servers {
-            match self.tools.list_tools(std::slice::from_ref(server)).await {
-                Ok(tools) => discovered.extend(tools),
-                Err(e) if filter.requires_server(server) => {
-                    return Err(AgentError::Transient(match e {
-                        ToolError::Unreachable(..) => e.to_string(),
-                        ToolError::Other(m) => m,
-                    }));
+        for (server, res) in listings {
+            match res {
+                Ok(tools) => {
+                    for t in tools {
+                        match crate::tools::check_schema(&t.input_schema) {
+                            Ok(()) => discovered.push(t),
+                            Err(why) => {
+                                tracing::warn!(job = job.id, tool = %t.qualified(), %why, "skipping tool with an unusable schema");
+                                self.audit(
+                                    job,
+                                    "tool_skipped",
+                                    json!({"tool": t.qualified(), "reason": why}),
+                                )
+                                .await;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(job = job.id, server = %server, error = %e, "skipping unavailable tool server");
+                    metrics::counter!("ringmaster_tool_server_skipped_total", "server" => server.clone()).increment(1);
                     self.audit(
                         job,
                         "tool_server_skipped",
                         json!({"server": server, "error": e.to_string()}),
                     )
                     .await;
-                    unavailable.push(server.clone());
+                    unavailable.push(server);
                 }
             }
         }
@@ -321,6 +373,7 @@ impl Agent {
             })
             .collect();
         state.tools = to_defs(offered);
+        state.unavailable = unavailable.clone();
         state.model = profile
             .model
             .clone()
@@ -434,7 +487,11 @@ impl Agent {
             })
             .unwrap_or_default();
         if uses.is_empty() {
-            return Ok(Some(AgentOutcome::Final(final_text(&content))));
+            return Ok(Some(AgentOutcome::Final(with_unavailable_note(
+                final_text(&content),
+                state,
+                req,
+            ))));
         }
 
         let calls: Vec<PlannedCall> = uses
@@ -753,6 +810,20 @@ fn summarize_response(resp: &Value, content: &Value) -> Value {
             "cache_creation_input_tokens": u.get("cache_creation_input_tokens"),
         })),
     })
+}
+
+/// When some tools were unavailable, end the reply with which ones and what
+/// the user said, so a request that could not be carried out is never lost.
+fn with_unavailable_note(text: String, state: &AgentState, req: &Request<'_>) -> String {
+    if state.unavailable.is_empty() {
+        return text;
+    }
+    format!(
+        "{}\n\nUnavailable: {}. You said: \"{}\"",
+        text.trim_end(),
+        state.unavailable.join(", "),
+        truncate(req.transcript.trim(), 500)
+    )
 }
 
 pub fn truncate(s: &str, max: usize) -> String {

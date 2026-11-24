@@ -54,6 +54,7 @@ retry_base_secs = 15
 retry_max_secs = 600
 notify_on_retry = true
 tool_timeout_secs = 60
+tool_discovery_timeout_secs = 10
 
 [retention]
 audio_days = 30
@@ -75,10 +76,8 @@ topic = "ringmaster-change-me-to-something-unguessable"
 name = "nextcloud"
 url = "http://nextcloud-mcp:8000/mcp"
 
-# Add more servers the same way. A server that only a wildcard profile entry
-# (such as "*/*") reaches is optional: while it is down, jobs run without its
-# tools. A server a profile names explicitly ("nextcloud/...") is required:
-# jobs wait and retry until it is back.
+# Add more servers the same way. A server that is down or misbehaving never
+# fails a job: the job runs without it and the reply says what was unavailable.
 #
 # [[mcp_servers]]
 # name = "homey"

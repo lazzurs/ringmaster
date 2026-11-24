@@ -47,6 +47,9 @@ pub async fn serve(config_path: &Path) -> Result<()> {
     let secrets = Secrets::from_env(&config)?;
     config.validate_runtime(&secrets)?;
     tracing::info!(version = VERSION, config = %config_path.display(), secrets = ?secrets, "starting");
+    for w in config.mcp_warnings.iter().chain(&secrets.warnings) {
+        tracing::warn!("{w}");
+    }
 
     let data_dir = config.server.data_dir.clone();
     std::fs::create_dir_all(data_dir.join("audio"))

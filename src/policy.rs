@@ -60,24 +60,16 @@ pub struct ToolFilter {
     set: GlobSet,
     /// Server names the profile can reach, `None` meaning any.
     servers: Option<Vec<String>>,
-    /// Servers named literally by at least one glob (`nextcloud/...`). A job
-    /// cannot run without them; servers reached only through a wildcard
-    /// (`*/*`) are optional and are skipped while they are down.
-    named: Vec<String>,
 }
 
 impl ToolFilter {
     pub fn new(globs: &[String]) -> Result<Self> {
         let mut b = GlobSetBuilder::new();
         let mut servers = Some(Vec::new());
-        let mut named: Vec<String> = Vec::new();
         for g in globs {
             b.add(glob(g)?);
             let server = g.split('/').next().unwrap_or_default();
             let literal = !server.is_empty() && !server.contains(['*', '?', '[', '{']);
-            if literal && !named.iter().any(|n| n == server) {
-                named.push(server.to_string());
-            }
             match (&mut servers, literal) {
                 (Some(list), true) => list.push(server.to_string()),
                 _ => servers = None,
@@ -86,7 +78,6 @@ impl ToolFilter {
         Ok(Self {
             set: b.build()?,
             servers,
-            named,
         })
     }
 
@@ -101,12 +92,6 @@ impl ToolFilter {
             None => !self.set.is_empty(),
             Some(list) => list.iter().any(|s| s == server),
         }
-    }
-
-    /// Whether the profile names `server` explicitly, so a job must wait for
-    /// it rather than run without its tools.
-    pub fn requires_server(&self, server: &str) -> bool {
-        self.named.iter().any(|s| s == server)
     }
 }
 
@@ -166,22 +151,5 @@ mod tests {
         let none = ToolFilter::new(&[]).unwrap();
         assert!(!none.allows("homey/x"));
         assert!(!none.may_use_server("homey"));
-    }
-
-    #[test]
-    fn tool_filter_required_servers() {
-        let f = ToolFilter::new(&["nextcloud/deck_*".into()]).unwrap();
-        assert!(f.requires_server("nextcloud"));
-        assert!(!f.requires_server("homey"));
-
-        // Wildcard server: every server is usable, none is required.
-        let all = ToolFilter::new(&["*/*".into()]).unwrap();
-        assert!(!all.requires_server("nextcloud"));
-
-        // Mixed: the named one is required, the rest optional.
-        let mixed = ToolFilter::new(&["nextcloud/deck_*".into(), "*/get_*".into()]).unwrap();
-        assert!(mixed.requires_server("nextcloud"));
-        assert!(!mixed.requires_server("homey"));
-        assert!(mixed.may_use_server("homey"));
     }
 }
