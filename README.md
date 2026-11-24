@@ -129,6 +129,7 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `agent.retry_base_secs` / `agent.retry_max_secs` | `15` / `600` | job back-off |
 | `agent.notify_on_retry` | `true` | one "delayed" notification per job |
 | `agent.tool_timeout_secs` | `60` | per MCP call |
+| `agent.tool_discovery_timeout_secs` | `10` | listing a server's tools; slower servers are skipped for that job |
 | `agent.max_tool_result_chars` | `20000` | tool output truncation |
 | `retention.audio_days` | `30` | delete recordings after this (0 keeps them) |
 | `notify.ntfy.url` / `.topic` | `https://ntfy.sh` / required | |
@@ -140,6 +141,18 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 
 Glob `*` does not cross the `/` between server and tool: `homey/*` matches
 every Homey tool, `*` alone matches nothing.
+
+MCP problems never fail a job or stop the service. For each job, every MCP
+server is listed concurrently with a short timeout
+(`agent.tool_discovery_timeout_secs`, default 10). A server that is down, slow
+or returns an error is skipped, and so is any tool whose input schema the
+Claude API would reject. If the API still rejects the tool list, the request
+is retried once with no tools. Claude is told which servers are unavailable,
+the reply ends with `Unavailable: ... You said: "..."` so the request is never
+lost, and the skip is recorded in the audit log (`tool_server_skipped`,
+`tool_skipped`, `tools_dropped`). A tool call that fails or times out goes
+back to Claude as an error result. A malformed `[[mcp_servers]]` entry is
+ignored with a warning at startup; `check-config` reports it as an error.
 
 ## Phone app setup
 

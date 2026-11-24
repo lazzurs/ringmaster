@@ -52,6 +52,10 @@ pub struct Config {
     pub tool_policies: Vec<ToolPolicyRule>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+    /// Problems with individual `[[mcp_servers]]` entries. Those entries are
+    /// dropped instead of stopping the service; `check-config` reports them.
+    #[serde(skip)]
+    pub mcp_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +234,9 @@ pub struct AgentConfig {
     /// Tell the user when a job is first delayed (Mac asleep, API down...).
     pub notify_on_retry: bool,
     pub tool_timeout_secs: u64,
+    /// How long to wait for an MCP server's tool list before running the job
+    /// without that server.
+    pub tool_discovery_timeout_secs: u64,
     /// Tool output longer than this is truncated before it goes to Claude.
     pub max_tool_result_chars: usize,
 }
@@ -245,6 +252,7 @@ impl Default for AgentConfig {
             retry_max_secs: 600,
             notify_on_retry: true,
             tool_timeout_secs: 60,
+            tool_discovery_timeout_secs: 10,
             max_tool_result_chars: 20_000,
         }
     }
@@ -337,6 +345,8 @@ pub struct Secrets {
     pub ntfy_token: Option<String>,
     /// MCP server name -> bearer token.
     pub mcp_tokens: HashMap<String, String>,
+    /// MCP token problems; the server is still tried without a token.
+    pub warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -372,11 +382,21 @@ pub fn secret_from_env(name: &str) -> Result<Option<String>> {
 impl Secrets {
     pub fn from_env(config: &Config) -> Result<Self> {
         let mut mcp_tokens = HashMap::new();
+        let mut warnings = Vec::new();
         for s in &config.mcp_servers {
-            if let Some(var) = &s.token_env
-                && let Some(tok) = secret_from_env(var)?
-            {
-                mcp_tokens.insert(s.name.clone(), tok);
+            let Some(var) = &s.token_env else { continue };
+            match secret_from_env(var) {
+                Ok(Some(tok)) => {
+                    mcp_tokens.insert(s.name.clone(), tok);
+                }
+                Ok(None) => warnings.push(format!(
+                    "MCP server {:?}: {var} is not set; connecting without a token",
+                    s.name
+                )),
+                Err(e) => warnings.push(format!(
+                    "MCP server {:?}: {e:#}; connecting without a token",
+                    s.name
+                )),
             }
         }
         Ok(Self {
@@ -384,13 +404,15 @@ impl Secrets {
             webhook_secret: secret_from_env(ENV_WEBHOOK_SECRET)?,
             ntfy_token: secret_from_env(ENV_NTFY_TOKEN)?,
             mcp_tokens,
+            warnings,
         })
     }
 }
 
 impl Config {
     pub fn from_toml(text: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(text).context("parsing config")?;
+        let mut cfg: Config = toml::from_str(text).context("parsing config")?;
+        cfg.prune_mcp_servers();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -416,29 +438,47 @@ impl Config {
             .map(|(name, _)| name.as_str())
     }
 
-    pub fn validate(&self) -> Result<()> {
-        jiff::tz::TimeZone::get(&self.agent.timezone)
-            .with_context(|| format!("unknown agent.timezone {:?}", self.agent.timezone))?;
-        if !self.webhook.path.starts_with('/') {
-            bail!("webhook.path must start with '/'");
-        }
-        let mut seen_servers = std::collections::HashSet::new();
-        for s in &self.mcp_servers {
-            if s.name.is_empty()
+    /// Drop `[[mcp_servers]]` entries that cannot work, recording why. One
+    /// bad entry must never stop the service or the other servers.
+    fn prune_mcp_servers(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        let mut warnings = Vec::new();
+        self.mcp_servers.retain(|s| {
+            let problem = if s.name.is_empty()
                 || !s
                     .name
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             {
-                bail!(
-                    "mcp_servers name {:?} must be lowercase letters, digits and '-'",
-                    s.name
-                );
+                Some("name must be lowercase letters, digits and '-'".to_string())
+            } else if seen.contains(&s.name) {
+                Some("duplicate name (the first entry is used)".to_string())
+            } else {
+                match url::Url::parse(&s.url) {
+                    Ok(u) if u.scheme() == "http" || u.scheme() == "https" => None,
+                    Ok(u) => Some(format!("url scheme {:?} is not http(s)", u.scheme())),
+                    Err(e) => Some(format!("bad url {:?}: {e}", s.url)),
+                }
+            };
+            match problem {
+                Some(p) => {
+                    warnings.push(format!("MCP server {:?} ignored: {p}", s.name));
+                    false
+                }
+                None => {
+                    seen.insert(s.name.clone());
+                    true
+                }
             }
-            if !seen_servers.insert(s.name.clone()) {
-                bail!("duplicate mcp_servers name {:?}", s.name);
-            }
-            url::Url::parse(&s.url).with_context(|| format!("mcp server {} url", s.name))?;
+        });
+        self.mcp_warnings = warnings;
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        jiff::tz::TimeZone::get(&self.agent.timezone)
+            .with_context(|| format!("unknown agent.timezone {:?}", self.agent.timezone))?;
+        if !self.webhook.path.starts_with('/') {
+            bail!("webhook.path must start with '/'");
         }
         for r in &self.tool_policies {
             globset::Glob::new(&r.pattern)
@@ -543,6 +583,38 @@ mod tests {
         assert!(c.fallbacks_enabled("claude-opus-5-5"));
         assert!(c.fallbacks_enabled("claude-sonnet-5-5"));
         assert!(!c.fallbacks_enabled("claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn bad_mcp_servers_are_dropped_not_fatal() {
+        let cfg = Config::from_toml(
+            r#"
+[[mcp_servers]]
+name = "deck"
+url = "http://nextcloud-mcp:8000/mcp"
+
+[[mcp_servers]]
+name = "Bad Name"
+url = "http://x/mcp"
+
+[[mcp_servers]]
+name = "deck"
+url = "http://other/mcp"
+
+[[mcp_servers]]
+name = "nourl"
+url = "not a url"
+
+[[mcp_servers]]
+name = "ftp"
+url = "ftp://x/mcp"
+"#,
+        )
+        .expect("bad MCP entries must not make the config invalid");
+        let names: Vec<_> = cfg.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["deck"]);
+        assert_eq!(cfg.mcp_servers[0].url, "http://nextcloud-mcp:8000/mcp");
+        assert_eq!(cfg.mcp_warnings.len(), 4, "{:?}", cfg.mcp_warnings);
     }
 
     #[test]

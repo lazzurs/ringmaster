@@ -142,6 +142,11 @@ impl Respond for ScriptedClaude {
         let n = seen.len();
         seen.push(body);
         match self.turns.get(n) {
+            // `{"__status": 400, "__body": {...}}` scripts an API error.
+            Some(t) if t.get("__status").is_some() => {
+                ResponseTemplate::new(t["__status"].as_u64().unwrap() as u16)
+                    .set_body_json(t["__body"].clone())
+            }
             Some(t) => ResponseTemplate::new(200).set_body_json(t.clone()),
             None => ResponseTemplate::new(500).set_body_string("script exhausted"),
         }
@@ -223,6 +228,7 @@ max_retries = 0
 [agent]
 timezone = "Europe/Dublin"
 retry_base_secs = 1
+tool_discovery_timeout_secs = 2
 
 [[tool_policies]]
 match = "home/*delete*"
@@ -248,6 +254,16 @@ system_prompt = "Capture mode."
 "#;
 
 async fn harness(turns: Vec<Value>, whisper_text: Option<&str>) -> Harness {
+    harness_with(turns, whisper_text, |home| vec![home]).await
+}
+
+/// `servers` gets the live test MCP server ("home") and returns the list the
+/// service is configured with.
+async fn harness_with(
+    turns: Vec<Value>,
+    whisper_text: Option<&str>,
+    servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (mcp_url, mcp_calls, mcp_stop) = start_mcp().await;
 
@@ -283,11 +299,11 @@ async fn harness(turns: Vec<Value>, whisper_text: Option<&str>) -> Harness {
     config.server.data_dir = dir.path().to_path_buf();
     config.stt.primary_url = Some(whisper.uri());
     config.claude.api_base = claude_server.uri();
-    config.mcp_servers = vec![McpServerConfig {
+    config.mcp_servers = servers(McpServerConfig {
         name: "home".into(),
         url: mcp_url,
         token_env: None,
-    }];
+    });
     let config = Arc::new(config);
 
     let db = Db::open(&dir.path().join("test.db")).unwrap();
@@ -695,6 +711,190 @@ async fn profile_allow_list_limits_tools() {
             .as_str()
             .unwrap()
             .ends_with("Capture mode.")
+    );
+}
+
+/// A server nothing is listening on.
+fn dead_server(name: &str) -> McpServerConfig {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    McpServerConfig {
+        name: name.into(),
+        url: format!("http://127.0.0.1:{port}/mcp"),
+        token_env: None,
+    }
+}
+
+#[tokio::test]
+async fn wildcard_profile_skips_unavailable_server() {
+    let h = harness_with(
+        vec![final_turn("Done.")],
+        Some("Turn on the kitchen lights."),
+        |home| vec![home, dead_server("homey")],
+    )
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    let (status, _) = send(
+        &h,
+        signed_request("rec-dead-1", "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tick(&h).await;
+
+    // The job ran with the live server's tools and was told what is missing.
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "Claude should have been called once");
+    let names: Vec<&str> = seen[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| n.starts_with("home__")), "{names:?}");
+    let first = seen[0]["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(first.contains("Unavailable right now"), "{first}");
+    assert!(first.contains("homey"), "{first}");
+
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(notes[0].body.starts_with("Done."), "{}", notes[0].body);
+    assert!(
+        notes[0].body.contains("Unavailable: homey"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("Turn on the kitchen lights."),
+        "{}",
+        notes[0].body
+    );
+}
+
+#[tokio::test]
+async fn only_server_down_still_answers_and_keeps_the_request() {
+    // The capture profile names `home/...` and that server is down: the job
+    // still runs (with no tools), and the reply carries what the user said.
+    let h = harness_with(
+        vec![final_turn(
+            "I couldn't add that: the task list is unavailable.",
+        )],
+        Some("buy milk"),
+        |_| vec![dead_server("home")],
+    )
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    let (status, _) = send(
+        &h,
+        signed_request("rec-dead-2", "single-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tick(&h).await;
+
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].get("tools").is_none(), "no tools to offer");
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0].body.contains("Unavailable: home"),
+        "{}",
+        notes[0].body
+    );
+    assert!(notes[0].body.contains("buy milk"), "{}", notes[0].body);
+}
+
+#[tokio::test]
+async fn rejected_tool_definitions_fall_back_to_no_tools() {
+    let h = harness(
+        vec![
+            json!({"__status": 400, "__body": {
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "tools.0.input_schema: invalid"}
+            }}),
+            final_turn("Sorry, I can't do that right now."),
+        ],
+        Some("Turn on the kitchen lights."),
+    )
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    send(
+        &h,
+        signed_request("rec-400", "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    tick(&h).await;
+
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "retried once");
+    assert!(seen[0].get("tools").is_some());
+    assert!(seen[1].get("tools").is_none(), "second try has no tools");
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0].body.contains("Unavailable: all tools"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("kitchen lights"),
+        "{}",
+        notes[0].body
+    );
+}
+
+#[tokio::test]
+async fn hung_server_is_skipped_quickly() {
+    // Accepts connections but never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    let h = harness_with(vec![final_turn("Done.")], Some("lights on"), move |home| {
+        vec![
+            home,
+            McpServerConfig {
+                name: "slow".into(),
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                token_env: None,
+            },
+        ]
+    })
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    send(
+        &h,
+        signed_request("rec-hung", "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    tick(&h).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].body.contains("Unavailable: slow"),
+        "{}",
+        notes[0].body
     );
 }
 
