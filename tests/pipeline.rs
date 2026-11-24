@@ -248,6 +248,16 @@ system_prompt = "Capture mode."
 "#;
 
 async fn harness(turns: Vec<Value>, whisper_text: Option<&str>) -> Harness {
+    harness_with(turns, whisper_text, |home| vec![home]).await
+}
+
+/// `servers` gets the live test MCP server ("home") and returns the list the
+/// service is configured with.
+async fn harness_with(
+    turns: Vec<Value>,
+    whisper_text: Option<&str>,
+    servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (mcp_url, mcp_calls, mcp_stop) = start_mcp().await;
 
@@ -283,11 +293,11 @@ async fn harness(turns: Vec<Value>, whisper_text: Option<&str>) -> Harness {
     config.server.data_dir = dir.path().to_path_buf();
     config.stt.primary_url = Some(whisper.uri());
     config.claude.api_base = claude_server.uri();
-    config.mcp_servers = vec![McpServerConfig {
+    config.mcp_servers = servers(McpServerConfig {
         name: "home".into(),
         url: mcp_url,
         token_env: None,
-    }];
+    });
     let config = Arc::new(config);
 
     let db = Db::open(&dir.path().join("test.db")).unwrap();
@@ -696,6 +706,82 @@ async fn profile_allow_list_limits_tools() {
             .unwrap()
             .ends_with("Capture mode.")
     );
+}
+
+/// A server nothing is listening on.
+fn dead_server(name: &str) -> McpServerConfig {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    McpServerConfig {
+        name: name.into(),
+        url: format!("http://127.0.0.1:{port}/mcp"),
+        token_env: None,
+    }
+}
+
+#[tokio::test]
+async fn wildcard_profile_skips_unavailable_server() {
+    let h = harness_with(
+        vec![final_turn("Done.")],
+        Some("Turn on the kitchen lights."),
+        |home| vec![home, dead_server("homey")],
+    )
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    let (status, _) = send(
+        &h,
+        signed_request("rec-dead-1", "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tick(&h).await;
+
+    // The job ran with the live server's tools and was told what is missing.
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "Claude should have been called once");
+    let names: Vec<&str> = seen[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.iter().all(|n| n.starts_with("home__")), "{names:?}");
+    let first = seen[0]["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(first.contains("Unavailable right now"), "{first}");
+    assert!(first.contains("homey"), "{first}");
+
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert_eq!(notes[0].body, "Done.");
+}
+
+#[tokio::test]
+async fn named_server_down_retries_instead_of_running() {
+    // The capture profile names `home/...`; that server is down here.
+    let h = harness_with(vec![final_turn("Added.")], Some("buy milk"), |_| {
+        vec![dead_server("home")]
+    })
+    .await;
+    let (ct, body) = multipart(Some(TONE), None, false);
+    let (status, _) = send(
+        &h,
+        signed_request("rec-dead-2", "single-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tick(&h).await;
+    assert!(
+        h.claude_seen.lock().unwrap().is_empty(),
+        "must not run without its named server"
+    );
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Queued, "queued for a retry");
 }
 
 #[tokio::test]

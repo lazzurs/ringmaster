@@ -286,14 +286,33 @@ impl Agent {
             .into_iter()
             .filter(|s| filter.may_use_server(s))
             .collect();
-        let discovered = if servers.is_empty() {
-            Vec::new()
-        } else {
-            self.tools.list_tools(&servers).await.map_err(|e| match e {
-                ToolError::Unreachable(..) => AgentError::Transient(e.to_string()),
-                ToolError::Other(m) => AgentError::Transient(m),
-            })?
-        };
+        // Each server on its own: a server the profile names explicitly must
+        // be up (the job retries later), but one reached only through a
+        // wildcard is skipped while it is down, so one broken integration
+        // does not stop every command.
+        let mut discovered = Vec::new();
+        let mut unavailable = Vec::new();
+        for server in &servers {
+            match self.tools.list_tools(std::slice::from_ref(server)).await {
+                Ok(tools) => discovered.extend(tools),
+                Err(e) if filter.requires_server(server) => {
+                    return Err(AgentError::Transient(match e {
+                        ToolError::Unreachable(..) => e.to_string(),
+                        ToolError::Other(m) => m,
+                    }));
+                }
+                Err(e) => {
+                    tracing::warn!(job = job.id, server = %server, error = %e, "skipping unavailable tool server");
+                    self.audit(
+                        job,
+                        "tool_server_skipped",
+                        json!({"server": server, "error": e.to_string()}),
+                    )
+                    .await;
+                    unavailable.push(server.clone());
+                }
+            }
+        }
         let offered: Vec<_> = discovered
             .into_iter()
             .filter(|t| {
@@ -317,7 +336,7 @@ impl Agent {
         );
         state.messages = vec![json!({
             "role": "user",
-            "content": [{"type": "text", "text": self.context_text(job, req)}],
+            "content": [{"type": "text", "text": self.context_text(job, req, &unavailable)}],
         })];
         self.audit(
             job,
@@ -335,7 +354,7 @@ impl Agent {
 
     /// Volatile context goes in the first user message, never in the system
     /// prompt, so the cached prefix (tools + system) stays identical.
-    fn context_text(&self, job: &Job, req: &Request<'_>) -> String {
+    fn context_text(&self, job: &Job, req: &Request<'_>, unavailable: &[String]) -> String {
         let tz =
             jiff::tz::TimeZone::get(&self.config.agent.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
         let fmt = |ts: jiff::Timestamp| {
@@ -349,8 +368,16 @@ impl Agent {
             .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
             .map(fmt)
             .unwrap_or_else(|| "unknown".into());
+        let unavailable = if unavailable.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Unavailable right now (their tools are missing; say so if the request needs them): {}\n",
+                unavailable.join(", ")
+            )
+        };
         format!(
-            "<context>\nCurrent time: {now} ({tzname})\nRecorded at: {recorded}\nGesture: {trigger}\nTranscript source: {source}\n</context>\n<transcript>\n{text}\n</transcript>",
+            "<context>\nCurrent time: {now} ({tzname})\nRecorded at: {recorded}\nGesture: {trigger}\nTranscript source: {source}\n{unavailable}</context>\n<transcript>\n{text}\n</transcript>",
             tzname = self.config.agent.timezone,
             trigger = job.trigger,
             source = req.transcript_source,

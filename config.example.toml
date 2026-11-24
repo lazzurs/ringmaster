@@ -25,10 +25,10 @@ primary_url = "http://mac-mini.lan:8178"
 # fallback_url = "http://macbook.lan:8178"
 language = "en"
 # Biases recognition towards your own names. Keep it short and specific.
+# Put your own Deck board and list names here.
 vocabulary = [
-  "Homey", "Deck", "Inbox", "Nextcloud",
-  "living room", "kitchen", "hallway", "office", "garden",
-  "front door", "back door", "alarm",
+  "Deck", "Inbox", "Nextcloud",
+  "Shopping", "House", "Work",
 ]
 # Use the phone's transcription (Pebble app "Both" mode) if no whisper server answers.
 use_phone_transcription = true
@@ -75,10 +75,15 @@ topic = "ringmaster-change-me-to-something-unguessable"
 name = "nextcloud"
 url = "http://nextcloud-mcp:8000/mcp"
 
-[[mcp_servers]]
-name = "homey"
-url = "http://homey-mcp:3000/mcp"
-token_env = "HOMEY_MCP_TOKEN"
+# Add more servers the same way. A server that only a wildcard profile entry
+# (such as "*/*") reaches is optional: while it is down, jobs run without its
+# tools. A server a profile names explicitly ("nextcloud/...") is required:
+# jobs wait and retry until it is back.
+#
+# [[mcp_servers]]
+# name = "homey"
+# url = "http://homey-mcp:3000/mcp"
+# token_env = "HOMEY_MCP_TOKEN"
 
 # --------------------------------------------------------------- tool policies
 # Globs over "<server>/<tool>"; first match wins; unmatched tools need
@@ -94,25 +99,18 @@ policy = "deny"
 match = "*/*remove*"
 policy = "confirm"
 
-[[tool_policies]]
-match = "homey/*lock*"
-policy = "confirm"
-
-[[tool_policies]]
-match = "homey/*alarm*"
-policy = "confirm"
-
-[[tool_policies]]
-match = "homey/*security*"
-policy = "confirm"
-
-[[tool_policies]]
-match = "homey/*flow*"
-policy = "confirm"
-
-[[tool_policies]]
-match = "homey/*"
-policy = "allow"
+# Example for a smart-home server, once one is added:
+# [[tool_policies]]
+# match = "homey/*lock*"
+# policy = "confirm"
+#
+# [[tool_policies]]
+# match = "homey/*alarm*"
+# policy = "confirm"
+#
+# [[tool_policies]]
+# match = "homey/*"
+# policy = "allow"
 
 [[tool_policies]]
 match = "nextcloud/deck_get_*"
@@ -153,7 +151,9 @@ tools = ["*/*"]
 # "Turn off the lights" should not run an hour late.
 job_max_age_secs = 900
 system_prompt = """
-Command mode. Carry out the request with the smart home and Nextcloud tools.
-Look devices up by name before changing them; if several match, prefer the one
-in the room the user named. Reply with what changed, e.g. "Kitchen lights off."
+Command mode. Carry out the request with the available tools. Look things up
+by name before changing them (boards, lists, cards); if several match, ask
+rather than guess by replying with the options. If the request needs a tool
+you do not have, say so instead of improvising. Reply with what changed,
+e.g. "Moved 'Book dentist' to Done."
 """

@@ -141,6 +141,14 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 Glob `*` does not cross the `/` between server and tool: `homey/*` matches
 every Homey tool, `*` alone matches nothing.
 
+A profile's servers are required or optional depending on how its `tools`
+name them. A server named literally (`nextcloud/deck_*`) is required: if it is
+down, the job waits and retries. A server reached only through a wildcard
+(`*/*`) is optional: if it is down, the job runs without its tools, Claude is
+told which servers are unavailable, and the skip is recorded in the audit log
+as `tool_server_skipped`. Adding a new MCP server therefore cannot break
+existing gestures.
+
 ## Phone app setup
 
 In the ring's companion app, open the webhook settings for each gesture:
