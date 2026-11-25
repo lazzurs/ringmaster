@@ -75,6 +75,10 @@ topic = "ringmaster-change-me-to-something-unguessable"
 [[mcp_servers]]
 name = "nextcloud"
 url = "http://nextcloud-mcp:8000/mcp"
+# Credentials, if the server needs them (values come from the environment):
+#   token_env = "SOME_TOKEN"                                        -> Bearer
+#   basic_auth = { username = "rob", password_env = "NC_APP_PASSWORD" } -> Basic
+#   headers_env = { "X-Api-Key" = "SOME_KEY" }                      -> any header
 
 # Add more servers the same way. A server that is down or misbehaving never
 # fails a job: the job runs without it and the reply says what was unavailable.

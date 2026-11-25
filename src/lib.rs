@@ -73,7 +73,7 @@ pub async fn serve(config_path: &Path) -> Result<()> {
     )?;
     let tools: Arc<dyn ToolBackend> = Arc::new(McpBackend::new(
         config.mcp_servers.clone(),
-        secrets.mcp_tokens.clone(),
+        secrets.mcp_headers.clone(),
         Duration::from_secs(config.agent.tool_timeout_secs),
     ));
     let agent = Arc::new(Agent::new(

@@ -295,7 +295,7 @@ fn default_ntfy_url() -> String {
     "https://ntfy.sh".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     /// Short name used in tool names and policies (`<name>/<tool>`):
@@ -306,6 +306,108 @@ pub struct McpServerConfig {
     /// Environment variable holding a bearer token for this server.
     #[serde(default)]
     pub token_env: Option<String>,
+    /// HTTP Basic credentials, e.g. a Nextcloud user and app password.
+    #[serde(default)]
+    pub basic_auth: Option<McpBasicAuth>,
+    /// Extra request headers: header name -> environment variable holding
+    /// its value (e.g. `{ "X-Api-Key" = "SOME_SERVICE_KEY" }`).
+    #[serde(default)]
+    pub headers_env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpBasicAuth {
+    pub username: String,
+    /// Environment variable holding the password.
+    pub password_env: String,
+}
+
+/// Headers the MCP transport manages itself; they cannot be overridden.
+const RESERVED_MCP_HEADERS: &[&str] = &[
+    "accept",
+    "content-type",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "last-event-id",
+];
+
+/// MCP server name -> request headers (name, value), credentials included.
+pub type McpHeaders = HashMap<String, Vec<(String, String)>>;
+
+/// The request headers for each MCP server, built from its config and the
+/// environment. Problems become warnings: the server is then tried without
+/// that header, never left out and never fatal.
+pub fn mcp_headers(
+    servers: &[McpServerConfig],
+    lookup: impl Fn(&str) -> Result<Option<String>>,
+) -> (McpHeaders, Vec<String>) {
+    use base64::Engine;
+    let mut out = HashMap::new();
+    let mut warnings = Vec::new();
+    for s in servers {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut warn = |msg: String| warnings.push(format!("MCP server {:?}: {msg}", s.name));
+        let read = |var: &str, what: &str, warn: &mut dyn FnMut(String)| match lookup(var) {
+            Ok(Some(v)) => Some(v),
+            Ok(None) => {
+                warn(format!("{var} is not set; connecting without {what}"));
+                None
+            }
+            Err(e) => {
+                warn(format!("{e:#}; connecting without {what}"));
+                None
+            }
+        };
+        if let Some(b) = &s.basic_auth {
+            if let Some(pw) = read(&b.password_env, "Basic credentials", &mut warn) {
+                let enc = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{pw}", b.username));
+                headers.push(("Authorization".into(), format!("Basic {enc}")));
+            }
+            if s.token_env.is_some() {
+                warn("token_env is ignored because basic_auth is set".into());
+            }
+        } else if let Some(var) = &s.token_env
+            && let Some(tok) = read(var, "a token", &mut warn)
+        {
+            headers.push(("Authorization".into(), format!("Bearer {tok}")));
+        }
+        for (name, var) in &s.headers_env {
+            let lower = name.to_ascii_lowercase();
+            if RESERVED_MCP_HEADERS.contains(&lower.as_str()) {
+                warn(format!(
+                    "header {name:?} is managed by the MCP transport; ignored"
+                ));
+                continue;
+            }
+            if lower == "authorization" && !headers.is_empty() {
+                warn(
+                    "headers_env Authorization ignored: basic_auth or token_env already sets it"
+                        .into(),
+                );
+                continue;
+            }
+            if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                warn(format!("{name:?} is not a valid header name; ignored"));
+                continue;
+            }
+            let Some(value) = read(var, &format!("header {name}"), &mut warn) else {
+                continue;
+            };
+            if reqwest::header::HeaderValue::from_str(&value).is_err() {
+                warn(format!(
+                    "the value of {var} is not a valid header value; header {name} ignored"
+                ));
+                continue;
+            }
+            headers.push((name.clone(), value));
+        }
+        if !headers.is_empty() {
+            out.insert(s.name.clone(), headers);
+        }
+    }
+    (out, warnings)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -343,8 +445,8 @@ pub struct Secrets {
     pub anthropic_api_key: Option<String>,
     pub webhook_secret: Option<String>,
     pub ntfy_token: Option<String>,
-    /// MCP server name -> bearer token.
-    pub mcp_tokens: HashMap<String, String>,
+    /// MCP server name -> request headers (credentials included).
+    pub mcp_headers: McpHeaders,
     /// MCP token problems; the server is still tried without a token.
     pub warnings: Vec<String>,
 }
@@ -355,7 +457,7 @@ impl std::fmt::Debug for Secrets {
             .field("anthropic_api_key", &self.anthropic_api_key.is_some())
             .field("webhook_secret", &self.webhook_secret.is_some())
             .field("ntfy_token", &self.ntfy_token.is_some())
-            .field("mcp_tokens", &self.mcp_tokens.keys().collect::<Vec<_>>())
+            .field("mcp_auth", &self.mcp_headers.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -381,29 +483,12 @@ pub fn secret_from_env(name: &str) -> Result<Option<String>> {
 
 impl Secrets {
     pub fn from_env(config: &Config) -> Result<Self> {
-        let mut mcp_tokens = HashMap::new();
-        let mut warnings = Vec::new();
-        for s in &config.mcp_servers {
-            let Some(var) = &s.token_env else { continue };
-            match secret_from_env(var) {
-                Ok(Some(tok)) => {
-                    mcp_tokens.insert(s.name.clone(), tok);
-                }
-                Ok(None) => warnings.push(format!(
-                    "MCP server {:?}: {var} is not set; connecting without a token",
-                    s.name
-                )),
-                Err(e) => warnings.push(format!(
-                    "MCP server {:?}: {e:#}; connecting without a token",
-                    s.name
-                )),
-            }
-        }
+        let (mcp_headers, warnings) = mcp_headers(&config.mcp_servers, secret_from_env);
         Ok(Self {
             anthropic_api_key: secret_from_env(ENV_ANTHROPIC_API_KEY)?,
             webhook_secret: secret_from_env(ENV_WEBHOOK_SECRET)?,
             ntfy_token: secret_from_env(ENV_NTFY_TOKEN)?,
-            mcp_tokens,
+            mcp_headers,
             warnings,
         })
     }
@@ -615,6 +700,59 @@ url = "ftp://x/mcp"
         assert_eq!(names, ["deck"]);
         assert_eq!(cfg.mcp_servers[0].url, "http://nextcloud-mcp:8000/mcp");
         assert_eq!(cfg.mcp_warnings.len(), 4, "{:?}", cfg.mcp_warnings);
+    }
+
+    #[test]
+    fn mcp_headers_basic_bearer_and_custom() {
+        let servers: Vec<McpServerConfig> = toml::from_str::<Config>(
+            r#"
+[[mcp_servers]]
+name = "nc"
+url = "https://cloud.example/apps/mcp/"
+token_env = "IGNORED"
+basic_auth = { username = "rob", password_env = "NC_PW" }
+headers_env = { "X-Extra" = "EXTRA", "Accept" = "EXTRA", "Authorization" = "EXTRA" }
+
+[[mcp_servers]]
+name = "tok"
+url = "http://tok/mcp"
+token_env = "TOK"
+
+[[mcp_servers]]
+name = "missing"
+url = "http://missing/mcp"
+basic_auth = { username = "x", password_env = "UNSET" }
+"#,
+        )
+        .unwrap()
+        .mcp_servers;
+        let env: HashMap<&str, &str> = [
+            ("NC_PW", "app-pass"),
+            ("TOK", "t0k"),
+            ("EXTRA", "v"),
+            ("IGNORED", "no"),
+        ]
+        .into();
+        let (h, warnings) = mcp_headers(&servers, |k| Ok(env.get(k).map(|v| v.to_string())));
+
+        let nc = &h["nc"];
+        assert!(
+            nc.contains(&("Authorization".into(), "Basic cm9iOmFwcC1wYXNz".into())),
+            "{nc:?}"
+        );
+        assert!(nc.contains(&("X-Extra".into(), "v".into())));
+        assert_eq!(
+            nc.len(),
+            2,
+            "Accept and a second Authorization are refused: {nc:?}"
+        );
+        assert_eq!(
+            h["tok"],
+            vec![("Authorization".to_string(), "Bearer t0k".to_string())]
+        );
+        assert!(!h.contains_key("missing"), "tried without credentials");
+        // token_env ignored, Accept reserved, Authorization duplicate, UNSET missing.
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
     }
 
     #[test]
