@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::llm::Provider;
 use crate::policy::Policy;
 
 pub const ENV_ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
@@ -38,6 +39,12 @@ pub struct Config {
     pub webhook: WebhookConfig,
     #[serde(default)]
     pub stt: SttConfig,
+    /// Provider-neutral model settings. See [`Config::provider_settings`]
+    /// and [`Config::profile_llm`] for how it combines with `[claude]`.
+    #[serde(default)]
+    pub llm: LlmConfig,
+    /// Legacy Claude settings, still honoured: they are the Anthropic
+    /// defaults under `[llm]` / `[llm.anthropic]`.
     #[serde(default)]
     pub claude: ClaudeConfig,
     #[serde(default)]
@@ -207,14 +214,119 @@ impl Default for ClaudeConfig {
     }
 }
 
-impl ClaudeConfig {
-    pub fn fallbacks_enabled(&self, model: &str) -> bool {
-        match self.refusal_fallbacks {
+impl FallbackMode {
+    pub fn enabled_for(self, model: &str) -> bool {
+        match self {
             FallbackMode::On => true,
             FallbackMode::Off => false,
             FallbackMode::Auto => !model.starts_with("claude-haiku"),
         }
     }
+}
+
+impl ClaudeConfig {
+    pub fn fallbacks_enabled(&self, model: &str) -> bool {
+        self.refusal_fallbacks.enabled_for(model)
+    }
+}
+
+/// `[llm]`: the default provider and model, plus a table per provider.
+///
+/// Keys directly under `[llm]` describe the default provider; a
+/// `[llm.<provider>]` table configures that provider whether it is the
+/// default or only used by some profiles, and wins over `[llm]`. For
+/// Anthropic, unset keys fall back to the legacy `[claude]` section.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Default provider (`anthropic` when unset).
+    pub provider: Option<Provider>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub request_timeout_secs: Option<u64>,
+    pub max_retries: Option<u32>,
+    pub max_tokens: Option<u32>,
+    /// Model calls per job, for every provider.
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub anthropic: ProviderConfig,
+    #[serde(default)]
+    pub openai: ProviderConfig,
+    #[serde(default)]
+    pub mistral: ProviderConfig,
+    #[serde(default)]
+    pub openrouter: ProviderConfig,
+    #[serde(default)]
+    pub ollama: ProviderConfig,
+}
+
+impl LlmConfig {
+    pub fn table(&self, p: Provider) -> &ProviderConfig {
+        match p {
+            Provider::Anthropic => &self.anthropic,
+            Provider::OpenAi => &self.openai,
+            Provider::Mistral => &self.mistral,
+            Provider::OpenRouter => &self.openrouter,
+            Provider::Ollama => &self.ollama,
+        }
+    }
+}
+
+/// `[llm.<provider>]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    /// Model used when a profile picks this provider without naming one.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Without the `/v1` path, e.g. `http://m1.lan:11434`.
+    pub base_url: Option<String>,
+    /// Environment variable holding the API key.
+    pub api_key_env: Option<String>,
+    pub request_timeout_secs: Option<u64>,
+    pub max_retries: Option<u32>,
+    /// Output limit; unset leaves it to the provider (Anthropic: 16000).
+    pub max_tokens: Option<u32>,
+    /// Anthropic only.
+    pub refusal_fallbacks: Option<FallbackMode>,
+    /// OpenRouter only: `HTTP-Referer` attribution header.
+    pub app_url: Option<String>,
+    /// OpenRouter only: `X-OpenRouter-Title` attribution header.
+    pub app_title: Option<String>,
+    /// Ollama only: context window in tokens (`options.num_ctx`); 0 leaves
+    /// it to the server.
+    pub num_ctx: Option<u32>,
+}
+
+/// Default context window asked of Ollama. Its own default on a 16 GB Mac is
+/// 4096 tokens, too small for a system prompt plus tool definitions.
+pub const OLLAMA_DEFAULT_NUM_CTX: u32 = 8192;
+
+/// Everything needed to talk to one provider, resolved from the config.
+#[derive(Debug, Clone)]
+pub struct ProviderSettings {
+    pub provider: Provider,
+    pub base_url: String,
+    /// Where the key comes from (`None`: no key, Ollama's default).
+    pub api_key_env: Option<String>,
+    pub request_timeout: std::time::Duration,
+    pub max_retries: u32,
+    pub max_tokens: Option<u32>,
+    pub refusal_fallbacks: FallbackMode,
+    pub app_url: Option<String>,
+    pub app_title: Option<String>,
+    pub num_ctx: Option<u32>,
+}
+
+/// Provider, model and effort a job starts with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmChoice {
+    pub provider: Provider,
+    pub model: String,
+    /// Empty: leave it to the provider.
+    pub effort: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -429,6 +541,9 @@ pub struct ProfileConfig {
     /// Globs over `<server>/<tool>` the profile may use. Empty = no tools.
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Provider for this profile (default: `llm.provider`).
+    #[serde(default)]
+    pub provider: Option<Provider>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -442,7 +557,8 @@ pub struct ProfileConfig {
 /// Secrets read from the environment.
 #[derive(Clone, Default)]
 pub struct Secrets {
-    pub anthropic_api_key: Option<String>,
+    /// API keys of the providers that have one set.
+    pub llm_keys: BTreeMap<Provider, String>,
     pub webhook_secret: Option<String>,
     pub ntfy_token: Option<String>,
     /// MCP server name -> request headers (credentials included).
@@ -454,7 +570,7 @@ pub struct Secrets {
 impl std::fmt::Debug for Secrets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Secrets")
-            .field("anthropic_api_key", &self.anthropic_api_key.is_some())
+            .field("llm_keys", &self.llm_keys.keys().collect::<Vec<_>>())
             .field("webhook_secret", &self.webhook_secret.is_some())
             .field("ntfy_token", &self.ntfy_token.is_some())
             .field("mcp_auth", &self.mcp_headers.keys().collect::<Vec<_>>())
@@ -483,9 +599,25 @@ pub fn secret_from_env(name: &str) -> Result<Option<String>> {
 
 impl Secrets {
     pub fn from_env(config: &Config) -> Result<Self> {
-        let (mcp_headers, warnings) = mcp_headers(&config.mcp_servers, secret_from_env);
+        let (mcp_headers, mut warnings) = mcp_headers(&config.mcp_servers, secret_from_env);
+        let used = config.used_providers();
+        let mut llm_keys = BTreeMap::new();
+        for p in Provider::ALL {
+            let Some(var) = config.provider_settings(p).api_key_env else {
+                continue;
+            };
+            match secret_from_env(&var) {
+                Ok(Some(k)) => {
+                    llm_keys.insert(p, k);
+                }
+                Ok(None) => {}
+                // A broken key file only matters for a provider in use.
+                Err(e) if used.contains(&p) => return Err(e),
+                Err(e) => warnings.push(format!("{p}: {e:#}")),
+            }
+        }
         Ok(Self {
-            anthropic_api_key: secret_from_env(ENV_ANTHROPIC_API_KEY)?,
+            llm_keys,
             webhook_secret: secret_from_env(ENV_WEBHOOK_SECRET)?,
             ntfy_token: secret_from_env(ENV_NTFY_TOKEN)?,
             mcp_headers,
@@ -521,6 +653,185 @@ impl Config {
             .iter()
             .find(|(_, p)| p.triggers.iter().any(|t| t == trigger))
             .map(|(name, _)| name.as_str())
+    }
+
+    /// The default provider (`llm.provider`, else `anthropic`).
+    pub fn default_provider(&self) -> Provider {
+        self.llm.provider.unwrap_or_default()
+    }
+
+    /// Connection settings for a provider. Precedence: `[llm.<provider>]`,
+    /// then `[llm]` if it is the default provider, then (Anthropic only)
+    /// `[claude]`, then built-in defaults.
+    pub fn provider_settings(&self, p: Provider) -> ProviderSettings {
+        let t = self.llm.table(p);
+        let is_default = p == self.default_provider();
+        let anthropic = p == Provider::Anthropic;
+        let base_url = t
+            .base_url
+            .clone()
+            .or_else(|| self.llm.base_url.clone().filter(|_| is_default))
+            .unwrap_or_else(|| {
+                if anthropic {
+                    self.claude.api_base.clone()
+                } else {
+                    p.default_base_url().to_string()
+                }
+            });
+        let api_key_env = t
+            .api_key_env
+            .clone()
+            .or_else(|| self.llm.api_key_env.clone().filter(|_| is_default))
+            .or_else(|| p.default_key_env().map(str::to_string));
+        // A slow local model needs far longer than a hosted API.
+        let (def_timeout, def_retries) = match p {
+            Provider::Anthropic => (self.claude.request_timeout_secs, self.claude.max_retries),
+            Provider::Ollama => (600, 1),
+            _ => (120, 4),
+        };
+        let request_timeout = std::time::Duration::from_secs(
+            t.request_timeout_secs
+                .or_else(|| self.llm.request_timeout_secs.filter(|_| is_default))
+                .unwrap_or(def_timeout),
+        );
+        let max_retries = t
+            .max_retries
+            .or_else(|| self.llm.max_retries.filter(|_| is_default))
+            .unwrap_or(def_retries);
+        let max_tokens = t
+            .max_tokens
+            .or_else(|| self.llm.max_tokens.filter(|_| is_default))
+            .or_else(|| anthropic.then_some(self.claude.max_tokens));
+        let num_ctx = match p {
+            Provider::Ollama => match t.num_ctx {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => Some(OLLAMA_DEFAULT_NUM_CTX),
+            },
+            _ => None,
+        };
+        ProviderSettings {
+            provider: p,
+            base_url,
+            api_key_env,
+            request_timeout,
+            max_retries,
+            max_tokens,
+            refusal_fallbacks: t.refusal_fallbacks.unwrap_or(self.claude.refusal_fallbacks),
+            app_url: t.app_url.clone(),
+            app_title: t.app_title.clone(),
+            num_ctx,
+        }
+    }
+
+    /// Provider, model and effort for a profile (`None`: the defaults).
+    ///
+    /// Model: the profile's, then `[llm.<provider>].model`, then `[llm].model`
+    /// if the provider is the default, then (Anthropic) `[claude].model`.
+    /// Providers other than Anthropic have no built-in model.
+    pub fn profile_llm(&self, profile: Option<&ProfileConfig>) -> Result<LlmChoice> {
+        let provider = profile
+            .and_then(|p| p.provider)
+            .unwrap_or_else(|| self.default_provider());
+        let t = self.llm.table(provider);
+        let is_default = provider == self.default_provider();
+        let anthropic = provider == Provider::Anthropic;
+        let model = profile
+            .and_then(|p| p.model.clone())
+            .or_else(|| t.model.clone())
+            .or_else(|| self.llm.model.clone().filter(|_| is_default))
+            .or_else(|| anthropic.then(|| self.claude.model.clone()))
+            .filter(|m| !m.trim().is_empty());
+        let Some(model) = model else {
+            bail!(
+                "no model for provider {provider:?}: set `model` in the profile,                  [llm.{provider}] or [llm] (only Anthropic has a default)"
+            );
+        };
+        let effort = profile
+            .and_then(|p| p.effort.clone())
+            .or_else(|| t.effort.clone())
+            .or_else(|| self.llm.effort.clone().filter(|_| is_default))
+            .or_else(|| anthropic.then(|| self.claude.effort.clone()))
+            .unwrap_or_default();
+        Ok(LlmChoice {
+            provider,
+            model,
+            effort,
+        })
+    }
+
+    /// Model calls per job: the profile's, `[llm]`, then `[claude]`.
+    pub fn max_iterations(&self, profile: &ProfileConfig) -> u32 {
+        profile
+            .max_iterations
+            .or(self.llm.max_iterations)
+            .unwrap_or(self.claude.max_iterations)
+    }
+
+    /// Providers that jobs can start with: every profile's, or the default
+    /// one when there are no profiles.
+    pub fn used_providers(&self) -> std::collections::BTreeSet<Provider> {
+        let mut used: std::collections::BTreeSet<Provider> = self
+            .profiles
+            .values()
+            .map(|p| p.provider.unwrap_or_else(|| self.default_provider()))
+            .collect();
+        if used.is_empty() {
+            used.insert(self.default_provider());
+        }
+        used
+    }
+
+    fn validate_llm(&self) -> Result<()> {
+        let check = |p: Provider, e: &str, what: &str| -> Result<()> {
+            if !p.efforts().contains(&e) {
+                bail!(
+                    "{what}: unknown effort {e:?} for {p} ({})",
+                    p.efforts().join("|")
+                );
+            }
+            Ok(())
+        };
+        if self.profiles.is_empty() {
+            let c = self.profile_llm(None)?;
+            if !c.effort.is_empty() {
+                check(c.provider, &c.effort, "llm")?;
+            }
+        }
+        for (name, profile) in &self.profiles {
+            let c = self
+                .profile_llm(Some(profile))
+                .with_context(|| format!("profile {name}"))?;
+            if !c.effort.is_empty() {
+                check(c.provider, &c.effort, &format!("profile {name}"))?;
+            }
+        }
+        for p in Provider::ALL {
+            let t = self.llm.table(p);
+            let s = self.provider_settings(p);
+            match url::Url::parse(&s.base_url) {
+                Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
+                _ => bail!("{p} base_url {:?} is not an http(s) URL", s.base_url),
+            }
+            if let Some(m) = &t.model
+                && m.trim().is_empty()
+            {
+                bail!("[llm.{p}] model is empty");
+            }
+            if t.refusal_fallbacks.is_some() && p != Provider::Anthropic {
+                bail!("[llm.{p}] refusal_fallbacks only applies to anthropic");
+            }
+            if (t.app_url.is_some() || t.app_title.is_some()) && p != Provider::OpenRouter {
+                bail!("[llm.{p}] app_url/app_title only apply to openrouter");
+            }
+            if t.num_ctx.is_some() && p != Provider::Ollama {
+                bail!("[llm.{p}] num_ctx only applies to ollama");
+            }
+            if let Some(u) = &t.app_url {
+                url::Url::parse(u).with_context(|| format!("[llm.{p}] app_url {u:?}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Drop `[[mcp_servers]]` entries that cannot work, recording why. One
@@ -580,11 +891,9 @@ impl Config {
                 globset::Glob::new(g)
                     .with_context(|| format!("profile {name} tools glob {g:?}"))?;
             }
-            if let Some(e) = &p.effort {
-                check_effort(e)?;
-            }
         }
         check_effort(&self.claude.effort)?;
+        self.validate_llm()?;
         for u in [&self.stt.primary_url, &self.stt.fallback_url]
             .into_iter()
             .flatten()
@@ -610,8 +919,18 @@ impl Config {
         {
             bail!("{ENV_WEBHOOK_SECRET} must be at least 32 characters");
         }
-        if secrets.anthropic_api_key.is_none() {
-            bail!("{ENV_ANTHROPIC_API_KEY} is not set");
+        // Only providers that a profile (or the default) uses need a key.
+        for p in self.used_providers() {
+            let settings = self.provider_settings(p);
+            if p.needs_key() && !secrets.llm_keys.contains_key(&p) {
+                bail!(
+                    "{} is not set (needed for provider {p})",
+                    settings
+                        .api_key_env
+                        .as_deref()
+                        .unwrap_or(ENV_ANTHROPIC_API_KEY)
+                );
+            }
         }
         if self.notify.ntfy.is_some() && self.server.public_base_url.is_none() {
             tracing::warn!(
@@ -758,5 +1077,170 @@ basic_auth = { username = "x", password_env = "UNSET" }
     #[test]
     fn bad_effort_rejected() {
         assert!(Config::from_toml("[claude]\neffort = \"turbo\"\n").is_err());
+        // Valid for Claude, not for Mistral.
+        let e = Config::from_toml(
+            "[llm]\nprovider = \"mistral\"\nmodel = \"mistral-small-latest\"\neffort = \"turbo\"\n",
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("effort"), "{e:#}");
+    }
+
+    const PROFILE: &str = "[profiles.p]\ntriggers = [\"t\"]\nsystem_prompt = \"x\"\n";
+
+    #[test]
+    fn legacy_claude_section_maps_to_anthropic() {
+        let cfg = Config::from_toml(&format!(
+            "[claude]\napi_base = \"https://proxy.example\"\nmodel = \"claude-haiku-5-5\"\neffort = \"medium\"\n\
+             max_tokens = 4000\nmax_iterations = 3\nrefusal_fallbacks = \"off\"\nrequest_timeout_secs = 30\nmax_retries = 2\n{PROFILE}"
+        ))
+        .unwrap();
+        let p = &cfg.profiles["p"];
+        assert_eq!(
+            cfg.profile_llm(Some(p)).unwrap(),
+            LlmChoice {
+                provider: Provider::Anthropic,
+                model: "claude-haiku-5-5".into(),
+                effort: "medium".into()
+            }
+        );
+        assert_eq!(cfg.max_iterations(p), 3);
+        let s = cfg.provider_settings(Provider::Anthropic);
+        assert_eq!(s.base_url, "https://proxy.example");
+        assert_eq!(s.max_tokens, Some(4000));
+        assert_eq!(s.refusal_fallbacks, FallbackMode::Off);
+        assert_eq!(s.request_timeout.as_secs(), 30);
+        assert_eq!(s.max_retries, 2);
+        assert_eq!(s.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(
+            cfg.used_providers().into_iter().collect::<Vec<_>>(),
+            [Provider::Anthropic]
+        );
+
+        // No config at all: Claude Opus 5.5 at low effort, as before.
+        let cfg = Config::from_toml("").unwrap();
+        let c = cfg.profile_llm(None).unwrap();
+        assert_eq!(
+            (c.provider, c.model.as_str(), c.effort.as_str()),
+            (Provider::Anthropic, "claude-opus-5-5", "low")
+        );
+        assert_eq!(
+            cfg.provider_settings(Provider::Anthropic).max_tokens,
+            Some(16000)
+        );
+    }
+
+    #[test]
+    fn llm_section_wins_over_claude() {
+        let cfg = Config::from_toml(
+            "[claude]\nmodel = \"claude-haiku-5-5\"\nmax_iterations = 3\n\
+             [llm]\nmodel = \"claude-sonnet-5-5\"\nmax_iterations = 5\nbase_url = \"https://a.example\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.profile_llm(None).unwrap().model, "claude-sonnet-5-5");
+        assert_eq!(
+            cfg.provider_settings(Provider::Anthropic).base_url,
+            "https://a.example"
+        );
+        assert_eq!(cfg.llm.max_iterations, Some(5));
+    }
+
+    #[test]
+    fn unknown_provider_rejected() {
+        let e = Config::from_toml("[llm]\nprovider = \"gemini\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown variant"), "{e:#}");
+        let e = Config::from_toml(&format!("{PROFILE}provider = \"chatgpt\"\n")).unwrap_err();
+        assert!(format!("{e:#}").contains("unknown variant"), "{e:#}");
+    }
+
+    #[test]
+    fn model_required_for_providers_without_default() {
+        for p in ["openai", "mistral", "openrouter", "ollama"] {
+            let e = Config::from_toml(&format!("[llm]\nprovider = \"{p}\"\n")).unwrap_err();
+            assert!(format!("{e:#}").contains("no model"), "{p}: {e:#}");
+            let e = Config::from_toml(&format!("{PROFILE}provider = \"{p}\"\n")).unwrap_err();
+            assert!(format!("{e:#}").contains("profile p"), "{p}: {e:#}");
+        }
+        // A Claude model under [llm] does not leak into another provider.
+        let e = Config::from_toml(&format!(
+            "[llm]\nmodel = \"claude-sonnet-5-5\"\n{PROFILE}provider = \"ollama\"\n"
+        ))
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("no model"), "{e:#}");
+        // The provider table's model is used.
+        let cfg = Config::from_toml(&format!(
+            "[llm.ollama]\nmodel = \"qwen3:8b\"\n{PROFILE}provider = \"ollama\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.profile_llm(Some(&cfg.profiles["p"])).unwrap().model,
+            "qwen3:8b"
+        );
+    }
+
+    #[test]
+    fn per_profile_provider_and_settings() {
+        let cfg = Config::from_toml(&format!(
+            "[llm]\nprovider = \"anthropic\"\nrequest_timeout_secs = 60\n\
+             [llm.ollama]\nbase_url = \"http://m1.lan:11434\"\nnum_ctx = 16384\n\
+             {PROFILE}provider = \"ollama\"\nmodel = \"qwen3:8b\"\neffort = \"high\"\n\
+             [profiles.q]\ntriggers = [\"u\"]\nsystem_prompt = \"y\"\n"
+        ))
+        .unwrap();
+        let c = cfg.profile_llm(Some(&cfg.profiles["p"])).unwrap();
+        assert_eq!((c.provider, c.effort.as_str()), (Provider::Ollama, "high"));
+        let c = cfg.profile_llm(Some(&cfg.profiles["q"])).unwrap();
+        assert_eq!(
+            (c.provider, c.effort.as_str()),
+            (Provider::Anthropic, "low")
+        );
+        let o = cfg.provider_settings(Provider::Ollama);
+        assert_eq!(o.base_url, "http://m1.lan:11434");
+        assert_eq!(o.num_ctx, Some(16384));
+        assert_eq!(o.api_key_env, None);
+        // [llm] timeout is for the default provider; Ollama keeps its own.
+        assert_eq!(o.request_timeout.as_secs(), 600);
+        assert_eq!(
+            cfg.provider_settings(Provider::Anthropic)
+                .request_timeout
+                .as_secs(),
+            60
+        );
+        assert_eq!(
+            cfg.used_providers().into_iter().collect::<Vec<_>>(),
+            [Provider::Anthropic, Provider::Ollama]
+        );
+        // Unused providers keep built-in defaults.
+        let m = cfg.provider_settings(Provider::Mistral);
+        assert_eq!(m.base_url, "https://api.mistral.ai");
+        assert_eq!(m.api_key_env.as_deref(), Some("MISTRAL_API_KEY"));
+        assert_eq!(m.max_tokens, None);
+    }
+
+    #[test]
+    fn provider_specific_keys_checked() {
+        assert!(Config::from_toml("[llm.openai]\nnum_ctx = 4096\n").is_err());
+        assert!(Config::from_toml("[llm.ollama]\napp_title = \"x\"\n").is_err());
+        assert!(Config::from_toml("[llm.mistral]\nrefusal_fallbacks = \"on\"\n").is_err());
+        assert!(Config::from_toml("[llm.ollama]\nbase_url = \"m1.lan:11434\"\n").is_err());
+        assert!(Config::from_toml("[llm.ollama]\nnum_ctx = 0\n").is_ok());
+    }
+
+    #[test]
+    fn keys_read_only_matter_for_used_providers() {
+        let cfg = Config::from_toml(&format!(
+            "[llm]\nprovider = \"ollama\"\nmodel = \"qwen3:8b\"\n{PROFILE}"
+        ))
+        .unwrap();
+        let secrets = Secrets {
+            webhook_secret: Some("x".repeat(32)),
+            ..Default::default()
+        };
+        cfg.validate_runtime(&secrets).expect("Ollama needs no key");
+        let cfg = Config::from_toml(&format!(
+            "[llm]\nprovider = \"openrouter\"\nmodel = \"openai/gpt-6.1-sol\"\napi_key_env = \"OR_KEY\"\n{PROFILE}"
+        ))
+        .unwrap();
+        let e = cfg.validate_runtime(&secrets).unwrap_err().to_string();
+        assert!(e.contains("OR_KEY"), "{e}");
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! One tokio process: the webhook receiver persists recordings and jobs in
 //! SQLite and answers at once; the worker transcribes (whisper.cpp on a Mac),
-//! runs a Claude agent over MCP tools, and reports back through ntfy.
+//! runs an LLM agent (Claude, or another provider) over MCP tools, and
+//! reports back through ntfy.
 
 pub mod agent;
 pub mod audio;
@@ -11,6 +12,7 @@ pub mod config;
 pub mod confirm;
 pub mod db;
 pub mod http;
+pub mod llm;
 pub mod notify;
 pub mod policy;
 pub mod signature;
@@ -28,9 +30,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
-use crate::claude::ClaudeClient;
 use crate::config::{Config, Secrets};
 use crate::db::Db;
+use crate::llm::Llms;
 use crate::notify::{LogNotifier, Notifier, NtfyNotifier};
 use crate::stt::Transcriber;
 use crate::tools::{McpBackend, ToolBackend};
@@ -65,12 +67,7 @@ pub async fn serve(config_path: &Path) -> Result<()> {
         Some(n) => Arc::new(NtfyNotifier::new(n, secrets.ntfy_token.clone())?),
         None => Arc::new(LogNotifier),
     };
-    let claude = ClaudeClient::new(
-        &config.claude.api_base,
-        secrets.anthropic_api_key.clone().unwrap_or_default(),
-        Duration::from_secs(config.claude.request_timeout_secs),
-        config.claude.max_retries,
-    )?;
+    let llms = Llms::new(&config, &secrets.llm_keys)?;
     let tools: Arc<dyn ToolBackend> = Arc::new(McpBackend::new(
         config.mcp_servers.clone(),
         secrets.mcp_headers.clone(),
@@ -79,7 +76,7 @@ pub async fn serve(config_path: &Path) -> Result<()> {
     let agent = Arc::new(Agent::new(
         config.clone(),
         db.clone(),
-        claude,
+        llms,
         tools,
         notifier.clone(),
     )?);

@@ -1,7 +1,11 @@
 # Ringmaster configuration.
 #
 # Secrets are NOT set here. They come from the environment (or <NAME>_FILE):
-#   ANTHROPIC_API_KEY            Claude API key
+#   ANTHROPIC_API_KEY            Claude API key (if a profile uses anthropic)
+#   OPENAI_API_KEY               OpenAI API key (if a profile uses openai)
+#   MISTRAL_API_KEY              Mistral API key (if a profile uses mistral)
+#   OPENROUTER_API_KEY           OpenRouter API key (if a profile uses openrouter)
+#                                (Ollama needs no key)
 #   RINGMASTER_WEBHOOK_SECRET    the ring app's signing secret (>= 32 chars)
 #   NTFY_TOKEN                   ntfy access token (optional)
 #   <token_env of an MCP server> bearer token for that server (optional)
@@ -34,16 +38,61 @@ vocabulary = [
 use_phone_transcription = true
 timeout_secs = 120
 
-[claude]
-# claude-opus-5-5 (default), claude-sonnet-5-5 or claude-haiku-5-5.
+# ------------------------------------------------------------------------ LLM
+# Keys directly under [llm] describe the default provider; [llm.<provider>]
+# tables configure one provider (and win over [llm]). Profiles can pick a
+# different provider and model (see [profiles.capture] below).
+#
+# Everything except a local Ollama sends the transcript, the tool definitions
+# and every tool result to that provider.
+#
+# The old [claude] section still works: it is the Anthropic configuration
+# (api_base, model, effort, max_tokens, max_iterations, refusal_fallbacks,
+# request_timeout_secs, max_retries), and [llm] settings take precedence.
+
+[llm]
+# anthropic (default) | openai | mistral | openrouter | ollama
+provider = "anthropic"
+# Required for every provider except anthropic (default claude-opus-5-5).
+# Claude: claude-opus-5-5, claude-sonnet-5-5 or claude-haiku-5-5.
 model = "claude-opus-5-5"
-# low | medium | high | xhigh | max. Short home-automation commands do well on low.
+# Claude: low | medium | high | xhigh | max. Short home-automation commands do
+# well on low. For other providers effort is only sent when set.
 effort = "low"
+# Output limit, thinking included (Claude default 16000; others: provider default).
 max_tokens = 16000
+# Model calls per job, whatever the provider.
 max_iterations = 8
+max_retries = 4
+
+[llm.anthropic]
 # auto = on for Opus/Sonnet, off for Haiku (which has no server-side fallback).
 refusal_fallbacks = "auto"
-max_retries = 4
+
+# OpenAI (Chat Completions). Use a model that does function calling on Chat
+# Completions, e.g. gpt-6.2-sol or gpt-5.4-mini (some GPT-6 models only call
+# tools through the Responses API). effort -> reasoning_effort.
+# [llm.openai]
+# model = "gpt-6.2-sol"
+# effort = "low"            # none | minimal | low | medium | high | xhigh | max (per model)
+
+# Mistral. effort -> reasoning_effort; Mistral Small 4 accepts none or high.
+# [llm.mistral]
+# model = "mistral-small-latest"   # or mistral-large-latest
+
+# OpenRouter: any of its tool-capable models. effort -> reasoning.effort.
+# [llm.openrouter]
+# model = "anthropic/claude-sonnet-5.5"   # or openai/gpt-6.1-sol, mistralai/mistral-medium-3-5
+# app_url = "https://github.com/lazzurs/ringmaster"   # optional attribution
+# app_title = "Ringmaster"
+
+# Ollama on a Mac on the LAN (OLLAMA_HOST=0.0.0.0:11434 on the Mac). No key.
+# Use a model with tool support. effort -> think (none turns thinking off).
+# [llm.ollama]
+# base_url = "http://m1-mac.lan:11434"
+# model = "qwen3:8b"                # or llama3.1:8b, qwen2.5:7b
+# num_ctx = 8192                    # context window; Ollama's own default is 4096 on 16 GB
+# request_timeout_secs = 600        # local models are slow
 
 [agent]
 timezone = "Europe/Dublin"
@@ -132,6 +181,10 @@ policy = "confirm"
 
 [profiles.capture]
 triggers = ["single-click-hold"]
+# Run this profile on another provider, e.g. a local model (it then needs a
+# model here or in [llm.ollama]):
+# provider = "ollama"
+# model = "qwen3:8b"
 tools = [
   "nextcloud/deck_get_boards",
   "nextcloud/deck_get_stacks",

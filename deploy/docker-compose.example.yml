@@ -5,8 +5,11 @@
 #     .env                 <- secrets (chmod 600, never commit)
 #     ringmaster/config.toml
 #
-# .env:
+# .env (only the key of each LLM provider you use is needed; Ollama needs none):
 #   ANTHROPIC_API_KEY=sk-ant-...
+#   OPENAI_API_KEY=sk-...                   (provider "openai")
+#   MISTRAL_API_KEY=...                     (provider "mistral")
+#   OPENROUTER_API_KEY=sk-or-...            (provider "openrouter")
 #   RINGMASTER_WEBHOOK_SECRET=<openssl rand -hex 32>
 #   NTFY_TOKEN=tk_...                       (if your ntfy topic needs auth)
 #   TUNNEL_TOKEN=<Cloudflare Tunnel token>
@@ -16,8 +19,8 @@
 #   HOMEY_MCP_TOKEN=...                     (if the Homey MCP server needs one)
 #
 # Networks:
-#   edge  - cloudflared <-> ringmaster, with internet access (Claude API, ntfy,
-#           the Mac on the LAN).
+#   edge  - cloudflared <-> ringmaster, with internet access (LLM APIs, ntfy,
+#           the Mac on the LAN for whisper and Ollama).
 #   mcp   - internal only: ringmaster <-> MCP servers. Nothing is published and
 #           cloudflared cannot reach the MCP servers.
 #   egress - outbound access for MCP servers that must reach Nextcloud/Homey.
@@ -32,7 +35,12 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?}
+      # Ringmaster refuses to start if a provider that a profile uses has no
+      # key, so these can all be optional here.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       RINGMASTER_WEBHOOK_SECRET: ${RINGMASTER_WEBHOOK_SECRET:?}
       NTFY_TOKEN: ${NTFY_TOKEN:-}
       HOMEY_MCP_TOKEN: ${HOMEY_MCP_TOKEN:-}
