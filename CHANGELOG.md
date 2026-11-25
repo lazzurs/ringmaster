@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5](https://github.com/lazzurs/ringmaster/compare/v0.1.4...v0.1.5) (2026-11-25)
+
+
+### Bug Fixes
+
+* ensure one stuck job cannot hold up the whole queue ([#16](https://github.com/lazzurs/ringmaster/issues/16)) ([c2923c7](https://github.com/lazzurs/ringmaster/commit/c2923c73b1c4ae3add4bd4bd8854fcb8ae15d4e7))
+* mark LLM credentials sensitive and keep secrets out of logs and errors ([#15](https://github.com/lazzurs/ringmaster/issues/15)) ([67858f4](https://github.com/lazzurs/ringmaster/commit/67858f4909303a4f3e63d68a3608b7ff39088383))
+
 ## [0.1.4](https://github.com/lazzurs/ringmaster/compare/v0.1.3...v0.1.4) (2026-11-25)
 
 
