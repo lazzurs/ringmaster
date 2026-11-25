@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audio;
+pub mod classifier;
 pub mod claude;
 pub mod config;
 pub mod confirm;
@@ -109,13 +110,21 @@ pub async fn serve(config_path: &Path) -> Result<()> {
         secrets.mcp_headers.clone(),
         Duration::from_secs(config.agent.tool_timeout_secs),
     ));
-    let agent = Arc::new(Agent::new(
-        config.clone(),
-        db.clone(),
-        llms,
-        tools,
-        notifier.clone(),
-    )?);
+    let classifier = classifier::Classifier::from_config(&config, secrets.classifier_key.clone())?
+        .map(|c| Arc::new(c.with_health(health.clone())));
+    if let Some(base) = &config.approval.base_url
+        && classifier.is_some()
+    {
+        tracing::info!(
+            mode = config.approval.mode.as_str(),
+            url = %config::display_url(base),
+            "approval classifier configured"
+        );
+    }
+    let agent = Arc::new(
+        Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone())?
+            .with_classifier(classifier),
+    );
     let wake = Arc::new(Notify::new());
     let worker = Arc::new(Worker {
         config: config.clone(),

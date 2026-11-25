@@ -50,10 +50,11 @@ pub enum Condition {
     JobOverrun,
     JobsFailing,
     BlockingStuck,
+    ClassifierFailing,
 }
 
 impl Condition {
-    pub const ALL: [Condition; 7] = [
+    pub const ALL: [Condition; 8] = [
         Condition::DatabaseCorrupt,
         Condition::DatabaseFailing,
         Condition::WorkerStalled,
@@ -61,6 +62,7 @@ impl Condition {
         Condition::JobOverrun,
         Condition::JobsFailing,
         Condition::BlockingStuck,
+        Condition::ClassifierFailing,
     ];
 
     pub fn key(self) -> &'static str {
@@ -72,6 +74,7 @@ impl Condition {
             Condition::JobOverrun => "job_overrun",
             Condition::JobsFailing => "jobs_failing",
             Condition::BlockingStuck => "blocking_stuck",
+            Condition::ClassifierFailing => "classifier_failing",
         }
     }
 
@@ -84,6 +87,7 @@ impl Condition {
             Condition::JobOverrun => "job past its deadline",
             Condition::JobsFailing => "jobs failing",
             Condition::BlockingStuck => "blocking work stuck",
+            Condition::ClassifierFailing => "approval classifier failing",
         }
     }
 }
@@ -179,6 +183,21 @@ pub struct Health {
     pub io_permits: Arc<tokio::sync::Semaphore>,
     queue: Mutex<Option<QueueStats>>,
     active: Mutex<Vec<Condition>>,
+    /// Approval classifier failures in a row (alert after
+    /// `approval.alert_after_failures`).
+    classifier: Mutex<ClassifierStatus>,
+    classifier_alert_after: u32,
+}
+
+/// What the watchdog knows about the approval classifier.
+#[derive(Debug, Default, Clone)]
+struct ClassifierStatus {
+    failures: u32,
+    /// When the current run of failures started.
+    since: i64,
+    /// Kind of the last failure (`timeout`, `unavailable`, ...): never the
+    /// server's text.
+    last: &'static str,
 }
 
 /// Blocking audio writes the webhook may have running at once.
@@ -199,7 +218,25 @@ impl Health {
             io_permits: Arc::new(tokio::sync::Semaphore::new(IO_PERMITS)),
             queue: Mutex::default(),
             active: Mutex::default(),
+            classifier: Mutex::default(),
+            classifier_alert_after: config.approval.alert_after_failures.max(1),
         }
+    }
+
+    /// The approval classifier gave a verdict.
+    pub fn classifier_ok(&self) {
+        *lock(&self.classifier) = ClassifierStatus::default();
+    }
+
+    /// The approval classifier gave no verdict; `kind` is a fixed word
+    /// (`timeout`, `unavailable`, `rejected`, `malformed`).
+    pub fn classifier_failed(&self, kind: &'static str, now: i64) {
+        let mut c = lock(&self.classifier);
+        if c.failures == 0 {
+            c.since = now;
+        }
+        c.failures = c.failures.saturating_add(1);
+        c.last = kind;
     }
 
     pub fn config(&self) -> &AlertsConfig {
@@ -443,6 +480,24 @@ impl Health {
             }
         }
 
+        {
+            let c = lock(&self.classifier).clone();
+            if c.failures >= self.classifier_alert_after {
+                out.insert(
+                    Condition::ClassifierFailing,
+                    format!(
+                        "The approval classifier failed {} times in a row over {} (last: {}). \
+                         Nothing runs without approval: the actions it would have checked are \
+                         sent to you to approve instead. Check the classifier server \
+                         (approval.base_url).",
+                        c.failures,
+                        human(now - c.since),
+                        c.last
+                    ),
+                );
+            }
+        }
+
         let stuck: Vec<BlockingEntry> = self
             .blocking
             .snapshot()
@@ -488,6 +543,8 @@ impl Health {
             gauge!("ringmaster_oldest_due_job_age_seconds")
                 .set(q.oldest_due.map_or(0, |(_, due)| (now - due).max(0)) as f64);
         }
+        gauge!("ringmaster_classifier_failures_in_a_row")
+            .set(lock(&self.classifier).failures as f64);
         let active = self.active_alerts();
         gauge!("ringmaster_alerts_active").set(active.len() as f64);
         for c in Condition::ALL {
@@ -881,6 +938,33 @@ mod tests {
         h.beat_worker(1700);
         let c = h.conditions(1700, &db);
         assert!(c[&Condition::QueueStalled].starts_with("Job 9 has been due for 11 min"));
+    }
+
+    #[test]
+    fn classifier_failures_in_a_row_alert_and_clear() {
+        let h = health("[approval]\nalert_after_failures = 2\n");
+        let db = DbHealth::default();
+        h.classifier_failed("timeout", 1000);
+        assert!(
+            !h.conditions(1000, &db)
+                .contains_key(&Condition::ClassifierFailing)
+        );
+        h.classifier_failed("unavailable", 1300);
+        let c = h.conditions(1300, &db);
+        let text = &c[&Condition::ClassifierFailing];
+        assert!(
+            text.contains("failed 2 times in a row over 5 min (last: unavailable)"),
+            "{text}"
+        );
+        // Not the container's fault: never on /healthz.
+        h.beat_worker(1300);
+        h.beat_watchdog(1300);
+        assert!(h.unhealthy(1300, &db).is_empty());
+        h.classifier_ok();
+        assert!(
+            !h.conditions(1300, &db)
+                .contains_key(&Condition::ClassifierFailing)
+        );
     }
 
     #[test]

@@ -20,7 +20,8 @@ use super::{LlmError, Provider};
 #[derive(Debug, Clone)]
 pub struct Transport {
     http: reqwest::Client,
-    provider: Provider,
+    /// `provider` label on metrics and logs (a provider, or `classifier`).
+    label: &'static str,
     max_retries: u32,
     /// Upper bound for a single back-off sleep.
     max_backoff: Duration,
@@ -28,6 +29,12 @@ pub struct Transport {
 
 impl Transport {
     pub fn new(provider: Provider, timeout: Duration, max_retries: u32) -> Result<Self> {
+        Self::named(provider.as_str(), timeout, max_retries)
+    }
+
+    /// A transport for a service that is not an LLM provider (the approval
+    /// classifier); `label` is its `provider` label on metrics and logs.
+    pub fn named(label: &'static str, timeout: Duration, max_retries: u32) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
@@ -39,7 +46,7 @@ impl Transport {
             .build()?;
         Ok(Self {
             http,
-            provider,
+            label,
             max_retries,
             max_backoff: Duration::from_secs(60),
         })
@@ -74,7 +81,7 @@ impl Transport {
                 base + Duration::from_millis(rand::random::<u64>() % 250)
             });
             let backoff = backoff.min(self.max_backoff);
-            tracing::warn!(provider = self.provider.as_str(), attempt, ?backoff, error = %err, "retrying LLM request");
+            tracing::warn!(provider = self.label, attempt, ?backoff, error = %err, "retrying LLM request");
             tokio::time::sleep(backoff).await;
             attempt += 1;
         }
@@ -115,7 +122,7 @@ impl Transport {
         headers: &HeaderMap,
         body: &Value,
     ) -> Result<Value, Failure> {
-        let provider = self.provider.as_str();
+        let provider = self.label;
         let req = self
             .request(url, headers, body)
             .map_err(|e| Failure::Permanent(format!("building the request: {e}")))?;

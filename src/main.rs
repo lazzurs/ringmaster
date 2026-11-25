@@ -154,6 +154,26 @@ async fn run(cli: Cli) -> ExitCode {
                         );
                     }
                 }
+                if c.uses_classifier() {
+                    let a = &c.approval;
+                    let modes: Vec<String> = c
+                        .profiles
+                        .iter()
+                        .map(|(name, p)| format!("{name}={}", c.approval_mode(Some(p)).as_str()))
+                        .collect();
+                    println!(
+                        "  approval: {} at {} (auto-approve below {}, flagged above {}){}",
+                        a.mode.as_str(),
+                        ringmaster::config::display_url(a.base_url.as_deref().unwrap_or_default()),
+                        a.auto_approve_cutoff(),
+                        a.threshold,
+                        if modes.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; profiles: {}", modes.join(", "))
+                        }
+                    );
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {

@@ -8,6 +8,7 @@
 #                                (Ollama needs no key)
 #   RINGMASTER_WEBHOOK_SECRET    the ring app's signing secret (>= 32 chars)
 #   NTFY_TOKEN                   ntfy access token (optional)
+#   <approval.api_key_env>       bearer token for the approval classifier (optional)
 #   <token_env of an MCP server> bearer token for that server (optional)
 
 [server]
@@ -147,6 +148,41 @@ overrun_margin_secs = 60          # a job this far past agent.attempt_timeout_se
 failure_threshold = 3             # this many failed jobs...
 failure_window_secs = 900         # ...within this window
 
+# -------------------------------------------------------------- approval
+# Who approves "confirm" tool calls. manual (the default, and what you get
+# without this section): you, through the Approve/Deny notification.
+#
+# shadow: still you, but a local Shieldstral classifier also judges each
+# "confirm" call and its verdict is shown in the notification and recorded
+# in the audit log (kind "classification", then "shadow_comparison" with your
+# decision), so you can see how it would have done before trusting it.
+#
+# classifier: a "confirm" call the classifier scores below
+# auto_approve_below runs without asking, and the result notification lists
+# it with its score. Everything else asks you as usual: a flagged call, a
+# score in the grey band, a classifier that is down, slow or answers
+# nonsense. The classifier never denies anything. "deny" tools are never
+# offered; "ask" tools always ask you and are never sent to the classifier.
+#
+# Shieldstral was trained on content safety, not on judging tool calls, and
+# small classifiers miss misheard requests and wrong targets. Start with
+# shadow; read the README section "Automatic approval (Shieldstral)" and
+# docs/mac-shieldstral.md (llama-server on a Mac).
+#
+# [approval]
+# mode = "shadow"                       # manual | shadow | classifier
+# base_url = "http://m1-mac.lan:8090"   # llama-server or vLLM, without /v1
+# model = "mistralai/Shieldstral-1.0-3B"  # vLLM checks it; llama-server ignores it
+# # api_key_env = "SHIELDSTRAL_API_KEY" # if the server wants a bearer token
+# request_timeout_secs = 15             # then ask a human instead
+# max_retries = 1
+# threshold = 0.5                       # above: "flagged" in the notification
+# auto_approve_below = 0.2              # only below this runs without asking
+# alert_after_failures = 3              # alert after this many failures in a row
+# # The policy text. "yes" must mean "do not run without asking".
+# # instruct = "You are a strict safety reviewer for ..."
+# # query = "Does this proposed action go beyond what the user asked for, ...?"
+
 [notify.ntfy]
 url = "https://ntfy.example.com"
 topic = "ringmaster-change-me-to-something-unguessable"
@@ -179,6 +215,8 @@ url = "http://nextcloud-mcp:8000/mcp"
 # --------------------------------------------------------------- tool policies
 # Globs over "<server>/<tool>"; first match wins; unmatched tools need
 # confirmation. "deny" tools are never offered to Claude.
+# Policies: allow | confirm | ask | deny. "ask" is "confirm" that the
+# approval classifier may never approve (locks, alarms, payments...).
 # Tool names depend on the MCP server: list them with the server's own tooling
 # and adjust these patterns.
 
@@ -193,11 +231,11 @@ policy = "confirm"
 # Example for a smart-home server, once one is added:
 # [[tool_policies]]
 # match = "homey/*lock*"
-# policy = "confirm"
+# policy = "ask"
 #
 # [[tool_policies]]
 # match = "homey/*alarm*"
-# policy = "confirm"
+# policy = "ask"
 #
 # [[tool_policies]]
 # match = "homey/*"
@@ -243,6 +281,8 @@ Reply with "Added: <title>".
 [profiles.command]
 triggers = ["double-click-hold"]
 tools = ["*/*"]
+# Overrides approval.mode for this profile (manual | shadow | classifier).
+# approval_mode = "shadow"
 # "Turn off the lights" should not run an hour late.
 job_max_age_secs = 900
 system_prompt = """

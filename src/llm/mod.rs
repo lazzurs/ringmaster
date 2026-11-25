@@ -204,8 +204,15 @@ pub trait ChatModel: Send + Sync {
     /// Tool calls in a stored assistant message.
     fn tool_calls(&self, message: &Value) -> Vec<ToolCall>;
 
+    /// The text of a stored assistant message, trimmed; empty if it has
+    /// none (a turn that only calls tools).
+    fn reply_text(&self, message: &Value) -> String;
+
     /// The answer text of a stored assistant message ("Done." if empty).
-    fn final_text(&self, message: &Value) -> String;
+    fn final_text(&self, message: &Value) -> String {
+        let t = self.reply_text(message);
+        if t.is_empty() { "Done.".into() } else { t }
+    }
 
     /// Messages carrying the results of one turn's tool calls.
     fn tool_results(&self, results: &[ToolResult]) -> Vec<Value>;

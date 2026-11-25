@@ -12,7 +12,8 @@ from a smart ring into actions:
 POST /webhook (HMAC-signed multipart) -> SQLite job queue -> worker
   -> whisper.cpp /inference (primary, fallback, then the phone's transcript)
   -> LLM agent loop (Anthropic native; OpenAI/Mistral/OpenRouter chat completions; Ollama /api/chat)
-  -> MCP tools over streamable HTTP, gated by allow/confirm/deny policies
+  -> MCP tools over streamable HTTP, gated by allow/confirm/ask/deny policies
+     (optionally: a local Shieldstral classifier approves clear `confirm` passes)
   -> ntfy notification (result, problem, or Approve/Deny buttons)
 ```
 
@@ -35,7 +36,8 @@ outages and pending confirmations resume where they stopped.
 | `src/stt.rs` | whisper-server client and fallback chain | transcription |
 | `src/audio.rs` | M4A (AAC-LC) to 16 kHz mono WAV in pure Rust (symphonia + hound); `Budget` (deadline and duration checked in the decode loop) and `Decoder` (size cap, semaphore, timeout; `with_fn` for tests) | audio decoding |
 | `src/agent.rs` | provider-neutral agent loop, `AgentState`, tool discovery, planning, confirmations, tool execution | agent behaviour |
-| `src/policy.rs` | `Policies` (allow/confirm/deny) and per-profile `ToolFilter` globs | tool policy rules |
+| `src/policy.rs` | `Policies` (allow/confirm/ask/deny) and per-profile `ToolFilter` globs | tool policy rules |
+| `src/classifier.rs` | Shieldstral approval classifier: `Classifier` (request body, bounded `classify`, health reporting), `document`, `score_from_response`, `Verdict` | automatic approval |
 | `src/tools.rs` | `ToolBackend` trait (`housekeeping`), `McpBackend` (rmcp client; sessions closed when idle `MCP_SESSION_IDLE` or dead, bounded close), `to_defs` (sorted, sanitised names), `check_schema` | MCP integration |
 | `src/confirm.rs` | `GET /confirm/{token}` page, `POST /confirm/{token}/{approve,deny}` | confirmation UX |
 | `src/notify.rs` | `Notifier` trait, ntfy client (`with_topic` for alerts), `Kind` (incl. `Alert`, `Recovered`), `LogNotifier` | notifications |
@@ -48,6 +50,7 @@ outages and pending confirmations resume where they stopped.
 | `tests/fixtures/tone-1s.m4a` | real AAC-LC recording for decoder tests | |
 | `deploy/docker-compose.example.yml` | reference deployment (ringmaster, cloudflared, MCP servers on an internal network) | deployment changes |
 | `docs/mac-transcription.md` | whisper.cpp setup on the Mac | STT setup |
+| `docs/mac-shieldstral.md` | llama.cpp `llama-server` with Shieldstral on the Mac | classifier setup |
 | `config.example.toml` | complete commented example config | every config change |
 
 ## Setup and checks
@@ -222,6 +225,33 @@ outages and pending confirmations resume where they stopped.
       `spawn_blocking` needs a bound like these, and blocking work should be
       registered with `Health::blocking` so the watchdog sees it stuck.
 
+11. **The approval classifier can approve but never deny, and fails over to
+    the human** (`src/classifier.rs`, `Agent::judge` and
+    `Agent::handle_tool_turn` in `src/agent.rs`).
+    - Only `confirm` calls are classified, and only in `shadow` or
+      `classifier` mode (`approval.mode`, profile `approval_mode`; default
+      `manual` = no classifier at all). `deny` calls are never offered or
+      classified; `ask` calls always go to the human and are never sent to
+      the classifier (nor, in classifier mode, are the other calls of their
+      turn).
+    - A turn runs without asking only when every `confirm` call in it scored
+      below `approval.auto_approve_below` (`Judged::Safe`); anything else
+      parks the turn for Approve/Deny exactly as in manual mode. No verdict
+      (down, timeout, error status, no `yes`/`no` logprobs, a call too long
+      to send whole) is `Judged::Unavailable` and asks the human: it never
+      runs a call, never fails a job and never denies.
+    - `classify` is bounded by `approval.request_timeout_secs` (retries
+      included); calls of a turn are judged concurrently.
+    - Every classification is audited (`classification`), counted
+      (`ringmaster_classifications_total`, `ringmaster_classifier_score`),
+      and every auto-approved call is kept in `AgentState::auto_approved`
+      and listed at the end of the job's final text
+      (`with_auto_approved_note`). Repeated failures raise
+      `Condition::ClassifierFailing`; it never affects `/healthz`.
+    - New persisted fields (`AgentState::auto_approved`,
+      `PendingTurn::approval_mode`/`judgements`) are `serde(default)` and
+      skipped when empty, so manual-mode states keep their old shape.
+
 Other behaviour to keep: `GET /confirm/*` never changes state; confirmation
 tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
 `confirmation_ttl_secs` (no answer counts as deny). Jobs older than
@@ -273,7 +303,8 @@ tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
   `check-config`.
 - `deploy/docker-compose.example.yml`: new environment variables, secrets,
   volumes or services.
-- `docs/mac-transcription.md` for anything about the whisper-server contract.
+- `docs/mac-transcription.md` for anything about the whisper-server contract,
+  `docs/mac-shieldstral.md` for the classifier server contract.
 
 ## Contributing and releases
 

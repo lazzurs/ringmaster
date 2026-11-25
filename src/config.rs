@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::llm::Provider;
 use crate::policy::Policy;
@@ -57,6 +57,10 @@ pub struct Config {
     /// behind them.
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// How `confirm` tool calls get approved: by you (default), or by a
+    /// local Shieldstral classifier with you as the fallback.
+    #[serde(default)]
+    pub approval: ApprovalConfig,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
@@ -482,6 +486,126 @@ pub const WORKER_LOOP_MAX_WAIT_SECS: u64 = 30;
 /// Upper bound for `stt.decode_concurrency`.
 pub const MAX_DECODE_CONCURRENCY: usize = 8;
 
+/// `approval.mode` (and a profile's `approval_mode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Every `confirm` call waits for your Approve/Deny (the behaviour
+    /// before the classifier existed).
+    #[default]
+    Manual,
+    /// As `manual`, and the classifier's verdict on each `confirm` call is
+    /// recorded next to your decision, to compare before trusting it.
+    Shadow,
+    /// `confirm` calls the classifier judges safe run without asking;
+    /// everything else (flagged, uncertain, classifier down) asks you.
+    Classifier,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalMode::Manual => "manual",
+            ApprovalMode::Shadow => "shadow",
+            ApprovalMode::Classifier => "classifier",
+        }
+    }
+}
+
+/// Default `<Instruct>` for the approval classifier: the context and the
+/// strictness. Constant, so it never carries per-request data.
+pub const DEFAULT_APPROVAL_INSTRUCT: &str = "\
+You are a strict safety reviewer for a voice assistant that controls a smart home and personal \
+task boards. The Document holds a spoken request (an automatic transcript that may contain \
+recognition errors) and one tool call the assistant proposes to carry it out. Judge the proposed \
+action against the request. Watch for: doing more than was asked, acting on a different device, \
+room, board, card or person than the one named, harm to people or property, deleting or \
+overwriting data, security (locks, alarms, doors, access), privacy, and anything the user would \
+not expect. Apply a low tolerance threshold: if the action does not clearly match the request, \
+answer yes.";
+
+/// Default `<Query>`: "yes" means unsafe (escalate to a human).
+pub const DEFAULT_APPROVAL_QUERY: &str = "\
+Does this proposed action go beyond what the user asked for, or could it cause harm, data loss, \
+a security or privacy risk, or an action the user would not expect?";
+
+/// `[approval]`: automatic approval of `confirm` tool calls by a local
+/// Shieldstral classifier (an OpenAI-compatible `/v1/chat/completions`
+/// server: llama.cpp `llama-server`, vLLM, SGLang). The classifier can
+/// approve but never deny: anything it does not clearly pass, and any
+/// failure to get a verdict, goes to the normal Approve/Deny notification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ApprovalConfig {
+    /// `manual` (default), `shadow` or `classifier`; profiles may override
+    /// it with `approval_mode`.
+    pub mode: ApprovalMode,
+    /// Classifier server, without the `/v1` path, e.g.
+    /// `http://m1-mac.lan:8090`. Required unless every mode is `manual`.
+    pub base_url: Option<String>,
+    /// Model name sent in the request (vLLM checks it; llama-server
+    /// ignores it).
+    pub model: String,
+    /// Environment variable holding a bearer token for the server, if it
+    /// needs one.
+    pub api_key_env: Option<String>,
+    /// How long to wait for a verdict, retries included, before asking a
+    /// human instead.
+    pub request_timeout_secs: u64,
+    /// Retries for connection errors, 429 and 5xx (within the timeout).
+    pub max_retries: u32,
+    /// A score above this is "flagged" (the model card's default is 0.5).
+    pub threshold: f64,
+    /// Only scores below this run without asking; scores from here up to
+    /// `threshold` are a grey band that asks a human. Unset: `threshold`.
+    pub auto_approve_below: Option<f64>,
+    /// Replaces [`DEFAULT_APPROVAL_INSTRUCT`].
+    pub instruct: Option<String>,
+    /// Replaces [`DEFAULT_APPROVAL_QUERY`]. Phrase it so "yes" means unsafe.
+    pub query: Option<String>,
+    /// Alert after this many classifier failures in a row.
+    pub alert_after_failures: u32,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApprovalMode::Manual,
+            base_url: None,
+            model: "mistralai/Shieldstral-1.0-3B".into(),
+            api_key_env: None,
+            request_timeout_secs: 15,
+            max_retries: 1,
+            threshold: 0.5,
+            auto_approve_below: None,
+            instruct: None,
+            query: None,
+            alert_after_failures: 3,
+        }
+    }
+}
+
+impl ApprovalConfig {
+    /// Scores below this are approved automatically.
+    pub fn auto_approve_cutoff(&self) -> f64 {
+        self.auto_approve_below.unwrap_or(self.threshold)
+    }
+
+    pub fn instruct(&self) -> &str {
+        self.instruct
+            .as_deref()
+            .unwrap_or(DEFAULT_APPROVAL_INSTRUCT)
+    }
+
+    pub fn query(&self) -> &str {
+        self.query.as_deref().unwrap_or(DEFAULT_APPROVAL_QUERY)
+    }
+}
+
+/// Upper bound for `approval.request_timeout_secs`: the verdict is awaited
+/// inside a job attempt.
+pub const MAX_APPROVAL_TIMEOUT_SECS: u64 = 120;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifyConfig {
@@ -651,6 +775,9 @@ pub struct ProfileConfig {
     pub max_iterations: Option<u32>,
     #[serde(default)]
     pub job_max_age_secs: Option<u64>,
+    /// Overrides `approval.mode` for this profile.
+    #[serde(default)]
+    pub approval_mode: Option<ApprovalMode>,
 }
 
 /// Secrets read from the environment.
@@ -660,6 +787,8 @@ pub struct Secrets {
     pub llm_keys: BTreeMap<Provider, String>,
     pub webhook_secret: Option<String>,
     pub ntfy_token: Option<String>,
+    /// Bearer token for the approval classifier (`approval.api_key_env`).
+    pub classifier_key: Option<String>,
     /// MCP server name -> request headers (credentials included).
     pub mcp_headers: McpHeaders,
     /// MCP token problems; the server is still tried without a token.
@@ -672,6 +801,7 @@ impl std::fmt::Debug for Secrets {
             .field("llm_keys", &self.llm_keys.keys().collect::<Vec<_>>())
             .field("webhook_secret", &self.webhook_secret.is_some())
             .field("ntfy_token", &self.ntfy_token.is_some())
+            .field("classifier_key", &self.classifier_key.is_some())
             .field("mcp_auth", &self.mcp_headers.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -758,10 +888,28 @@ impl Secrets {
                 Err(e) => warnings.push(format!("{p}: {e:#}")),
             }
         }
+        // A missing or unreadable classifier key only costs the classifier:
+        // its requests fail and every call goes to a human, as when it is
+        // down.
+        let mut classifier_key = None;
+        if let Some(var) = &config.approval.api_key_env
+            && config.uses_classifier()
+        {
+            match secret_from_env(var) {
+                Ok(Some(k)) => classifier_key = Some(k),
+                Ok(None) => warnings.push(format!(
+                    "approval: {var} is not set; calling the classifier without a key"
+                )),
+                Err(e) => warnings.push(format!(
+                    "approval: {e:#}; calling the classifier without a key"
+                )),
+            }
+        }
         Ok(Self {
             llm_keys,
             webhook_secret: secret_from_env(ENV_WEBHOOK_SECRET)?,
             ntfy_token: secret_from_env(ENV_NTFY_TOKEN)?,
+            classifier_key,
             mcp_headers,
             warnings,
         })
@@ -900,6 +1048,64 @@ impl Config {
             model,
             effort,
         })
+    }
+
+    /// The approval mode for a profile: its own `approval_mode`, else
+    /// `approval.mode`.
+    pub fn approval_mode(&self, profile: Option<&ProfileConfig>) -> ApprovalMode {
+        profile
+            .and_then(|p| p.approval_mode)
+            .unwrap_or(self.approval.mode)
+    }
+
+    /// Whether any profile (or the default) asks the classifier.
+    pub fn uses_classifier(&self) -> bool {
+        self.approval.mode != ApprovalMode::Manual
+            || self
+                .profiles
+                .values()
+                .any(|p| self.approval_mode(Some(p)) != ApprovalMode::Manual)
+    }
+
+    fn validate_approval(&self) -> Result<()> {
+        let a = &self.approval;
+        if self.uses_classifier() {
+            let Some(u) = &a.base_url else {
+                bail!("approval.base_url is required for shadow or classifier approval");
+            };
+            match url::Url::parse(u) {
+                Ok(p) if p.scheme() == "http" || p.scheme() == "https" => {}
+                _ => bail!(
+                    "approval.base_url {:?} is not an http(s) URL",
+                    display_url(u)
+                ),
+            }
+        }
+        if !(a.threshold > 0.0 && a.threshold < 1.0) {
+            bail!("approval.threshold must be between 0 and 1 (exclusive)");
+        }
+        if let Some(b) = a.auto_approve_below
+            && !(b > 0.0 && b <= a.threshold)
+        {
+            bail!("approval.auto_approve_below must be above 0 and at most approval.threshold");
+        }
+        if !(1..=MAX_APPROVAL_TIMEOUT_SECS).contains(&a.request_timeout_secs) {
+            bail!(
+                "approval.request_timeout_secs must be between 1 and {MAX_APPROVAL_TIMEOUT_SECS}"
+            );
+        }
+        if a.alert_after_failures == 0 {
+            bail!("approval.alert_after_failures must be at least 1");
+        }
+        if a.model.trim().is_empty() {
+            bail!("approval.model must not be empty");
+        }
+        for (key, v) in [("instruct", &a.instruct), ("query", &a.query)] {
+            if v.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                bail!("approval.{key} must not be empty (leave it out for the default)");
+            }
+        }
+        Ok(())
     }
 
     /// Model calls per job: the profile's, `[llm]`, then `[claude]`.
@@ -1082,6 +1288,7 @@ impl Config {
         }
         check_effort(&self.claude.effort)?;
         self.validate_llm()?;
+        self.validate_approval()?;
         for u in [&self.stt.primary_url, &self.stt.fallback_url]
             .into_iter()
             .flatten()
@@ -1154,6 +1361,78 @@ mod tests {
         );
         assert_eq!(cfg.profile_for_trigger("test-event"), None);
         assert!(cfg.stt.initial_prompt().unwrap().contains("Inbox"));
+    }
+
+    #[test]
+    fn approval_defaults_to_manual_and_is_validated() {
+        // Old configs have no [approval]: manual, no classifier needed.
+        let cfg =
+            Config::from_toml("[profiles.a]\ntriggers = [\"x\"]\nsystem_prompt = \"a\"\n").unwrap();
+        assert_eq!(cfg.approval.mode, ApprovalMode::Manual);
+        assert_eq!(
+            cfg.approval_mode(cfg.profiles.get("a")),
+            ApprovalMode::Manual
+        );
+        assert!(!cfg.uses_classifier());
+        assert_eq!(cfg.approval.auto_approve_cutoff(), 0.5);
+        assert!(
+            cfg.approval
+                .query()
+                .contains("go beyond what the user asked for")
+        );
+
+        for bad in [
+            "[approval]\nmode = \"classifier\"",
+            "[approval]\nmode = \"shadow\"\nbase_url = \"ftp://m1.lan\"",
+            "[approval]\nmode = \"automatic\"\nbase_url = \"http://m1.lan:8090\"",
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\nthreshold = 1.0",
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\nauto_approve_below = 0.6",
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\nauto_approve_below = 0.0",
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\nrequest_timeout_secs = 0",
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\nquery = \" \"",
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\nunknown = 1",
+            // A profile asking for the classifier needs the server too.
+            "[profiles.a]\ntriggers = [\"x\"]\nsystem_prompt = \"a\"\napproval_mode = \"classifier\"",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
+
+        let cfg = Config::from_toml(
+            r#"
+            [approval]
+            mode = "classifier"
+            base_url = "http://m1.lan:8090"
+            auto_approve_below = 0.2
+            query = "Is this unsafe?"
+            [profiles.a]
+            triggers = ["x"]
+            system_prompt = "a"
+            [profiles.b]
+            triggers = ["y"]
+            system_prompt = "b"
+            approval_mode = "manual"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.uses_classifier());
+        assert_eq!(
+            cfg.approval_mode(cfg.profiles.get("a")),
+            ApprovalMode::Classifier
+        );
+        assert_eq!(
+            cfg.approval_mode(cfg.profiles.get("b")),
+            ApprovalMode::Manual
+        );
+        assert_eq!(cfg.approval.auto_approve_cutoff(), 0.2);
+        assert_eq!(cfg.approval.query(), "Is this unsafe?");
+        assert_eq!(cfg.approval.instruct(), DEFAULT_APPROVAL_INSTRUCT);
+
+        // Only one profile on shadow is enough to need the server.
+        let cfg = Config::from_toml(
+            "[approval]\nbase_url = \"http://m1.lan:8090\"\n[profiles.a]\ntriggers = [\"x\"]\nsystem_prompt = \"a\"\napproval_mode = \"shadow\"\n",
+        )
+        .unwrap();
+        assert!(cfg.uses_classifier());
     }
 
     #[test]
