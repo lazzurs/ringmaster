@@ -60,6 +60,9 @@ pub trait ToolBackend: Send + Sync {
         args: Map<String, Value>,
     ) -> Result<ToolOutput, ToolError>;
     fn server_names(&self) -> Vec<String>;
+    /// Periodic clean-up (the worker calls it on every housekeeping pass):
+    /// close sessions that are idle or dead.
+    async fn housekeeping(&self) {}
 }
 
 /// A tool definition frozen into a job when its conversation starts, so the
@@ -169,14 +172,41 @@ pub fn check_schema(schema: &Map<String, Value>) -> Result<(), String> {
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
-/// MCP servers over streamable HTTP. Sessions are opened lazily, kept, and
-/// re-opened once if a call fails on a dead session.
+/// MCP sessions unused for this long are closed by housekeeping; the next
+/// call opens a new one. Commands come a few times a day, so this keeps no
+/// session (and its rmcp worker task and SSE stream) open for weeks against
+/// a server that may have restarted.
+pub const MCP_SESSION_IDLE: Duration = Duration::from_secs(600);
+
+/// Longest a session may take to close (rmcp also sends the server a
+/// session DELETE); after that it is dropped, which cancels its tasks.
+const CLOSE_LIMIT: Duration = Duration::from_secs(5);
+
+struct Session {
+    client: Arc<Client>,
+    last_used: std::time::Instant,
+}
+
+/// MCP servers over streamable HTTP. Sessions are opened lazily, kept while
+/// in use, re-opened once if a call fails on a dead session, and closed when
+/// idle for [`MCP_SESSION_IDLE`] or dead. Each session owns rmcp tasks (a
+/// service loop and a transport worker) that end when it is closed or the
+/// last `Arc` to it is dropped (rmcp's drop guard cancels them).
 pub struct McpBackend {
     servers: Vec<McpServerConfig>,
     /// Per-server request headers (credentials included), already validated.
     headers: HashMap<String, HashMap<HeaderName, HeaderValue>>,
     timeout: Duration,
-    clients: Mutex<HashMap<String, Arc<Client>>>,
+    clients: Mutex<HashMap<String, Session>>,
+}
+
+/// Close a session within [`CLOSE_LIMIT`]. If a job still holds it, it is
+/// closed when that job lets go of it (the drop cancels it).
+async fn close_session(client: Arc<Client>) {
+    if let Ok(client) = Arc::try_unwrap(client) {
+        // Best effort; the session may already be gone.
+        let _ = tokio::time::timeout(CLOSE_LIMIT, client.cancel()).await;
+    }
 }
 
 impl McpBackend {
@@ -234,18 +264,59 @@ impl McpBackend {
 
     async fn client(&self, name: &str, fresh: bool) -> Result<Arc<Client>> {
         let mut clients = self.clients.lock().await;
-        if !fresh && let Some(c) = clients.get(name) {
-            return Ok(c.clone());
+        if !fresh && let Some(s) = clients.get_mut(name) {
+            s.last_used = std::time::Instant::now();
+            return Ok(s.client.clone());
         }
-        if let Some(old) = clients.remove(name) {
-            // Best effort; the session may already be gone.
-            if let Ok(old) = Arc::try_unwrap(old) {
-                let _ = old.cancel().await;
-            }
+        let old = clients.remove(name);
+        // Bounded by `timeout`; holding the lock avoids two sessions at once.
+        let c = self.connect(name).await;
+        if let Ok(c) = &c {
+            clients.insert(
+                name.to_string(),
+                Session {
+                    client: c.clone(),
+                    last_used: std::time::Instant::now(),
+                },
+            );
         }
-        let c = self.connect(name).await?;
-        clients.insert(name.to_string(), c.clone());
-        Ok(c)
+        self.set_gauge(clients.len());
+        drop(clients);
+        if let Some(old) = old {
+            close_session(old.client).await;
+        }
+        c
+    }
+
+    fn set_gauge(&self, n: usize) {
+        metrics::gauge!("ringmaster_mcp_sessions").set(n as f64);
+    }
+
+    /// Open sessions.
+    pub async fn sessions(&self) -> usize {
+        self.clients.lock().await.len()
+    }
+
+    /// Close sessions idle for longer than `max_idle`, and dead ones.
+    /// Returns how many were closed.
+    pub async fn close_idle(&self, max_idle: Duration) -> usize {
+        let stale: Vec<Session> = {
+            let mut clients = self.clients.lock().await;
+            let names: Vec<String> = clients
+                .iter()
+                .filter(|(_, s)| s.last_used.elapsed() >= max_idle || s.client.is_closed())
+                .map(|(n, _)| n.clone())
+                .collect();
+            let stale = names.iter().filter_map(|n| clients.remove(n)).collect();
+            self.set_gauge(clients.len());
+            stale
+        };
+        let n = stale.len();
+        futures_util::future::join_all(stale.into_iter().map(|s| close_session(s.client))).await;
+        if n > 0 {
+            tracing::debug!(sessions = n, "closed idle MCP sessions");
+        }
+        n
     }
 
     /// `text` with this server's credential header values redacted (rmcp
@@ -358,6 +429,10 @@ impl ToolBackend for McpBackend {
 
     fn server_names(&self) -> Vec<String> {
         self.servers.iter().map(|s| s.name.clone()).collect()
+    }
+
+    async fn housekeeping(&self) {
+        self.close_idle(MCP_SESSION_IDLE).await;
     }
 }
 

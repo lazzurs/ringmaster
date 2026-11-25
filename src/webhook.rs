@@ -116,7 +116,19 @@ fn valid_delivery_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
+/// Longest the webhook spends storing a delivery. Past it the app gets 503
+/// and retries; if the store did finish meanwhile, the retry is answered as
+/// a duplicate.
+pub const STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
+    match tokio::time::timeout(STORE_TIMEOUT, handle_inner(app, headers, body)).await {
+        Ok(r) => r,
+        Err(_) => reject(StatusCode::SERVICE_UNAVAILABLE, "storage timed out"),
+    }
+}
+
+async fn handle_inner(app: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let cfg = &app.config;
 
     // 1. Version.
@@ -163,6 +175,13 @@ pub async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
             StatusCode::INTERNAL_SERVER_ERROR,
             "signing secret not configured",
         );
+    }
+
+    // A corrupt database may still take the insert, but nothing stored in
+    // it is safe: let the app keep the recording and retry.
+    if let Some(why) = app.db.status().refuse_writes() {
+        tracing::error!(reason = %why, "refusing a delivery: the database is corrupt");
+        return reject(StatusCode::SERVICE_UNAVAILABLE, "storage unavailable");
     }
 
     // 3. Dedupe: a repeat delivery is acknowledged and dropped.
@@ -231,10 +250,14 @@ pub async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
                         ),
                         kind: Kind::Info,
                     };
-                    // Do not hold up the response on ntfy.
+                    // Do not hold up the response on ntfy. The task ends
+                    // within 20 s whatever the notifier does.
                     tokio::spawn(async move {
-                        if let Err(e) = notifier.send(&n).await {
-                            tracing::warn!(error = %e, "test notification failed");
+                        let send = notifier.send(&n);
+                        match tokio::time::timeout(std::time::Duration::from_secs(20), send).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!(error = %e, "test notification failed"),
+                            Err(_) => tracing::warn!("test notification timed out"),
                         }
                     });
                 }
@@ -284,8 +307,18 @@ pub async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
         let final_path = dir.join(&name);
         let tmp = dir.join(format!(".{name}.{}.tmp", rand::random::<u64>()));
         let data = audio.clone();
+        // A hung disk ties up at most a few threads (the request itself is
+        // bounded by STORE_TIMEOUT).
+        let Ok(permit) = app.health.io_permits.clone().acquire_owned().await else {
+            return reject(StatusCode::SERVICE_UNAVAILABLE, "storage unavailable");
+        };
+        let guard = app
+            .health
+            .blocking
+            .start("audio_write", STORE_TIMEOUT.as_secs());
         let write = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             use std::io::Write;
+            let _held = (permit, guard);
             std::fs::create_dir_all(&dir)?;
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&data)?;

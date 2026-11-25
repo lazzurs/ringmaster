@@ -24,8 +24,10 @@ use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use ringmaster::agent::Agent;
+use ringmaster::audio::Decoder;
 use ringmaster::config::{Config, McpServerConfig};
 use ringmaster::db::{Db, JobStatus};
+use ringmaster::health::{AlertBook, Alerter, Health, Watchdog};
 use ringmaster::http::{AppState, router};
 use ringmaster::llm::{Llms, Provider};
 use ringmaster::notify::{Kind, Notification, Notifier};
@@ -215,6 +217,9 @@ impl Recorder {
 struct Harness {
     app: axum::Router,
     worker: Arc<Worker>,
+    health: Arc<Health>,
+    /// Sends its alerts to `notes` too.
+    watchdog: Arc<Watchdog>,
     db: Db,
     notes: Arc<Recorder>,
     claude_seen: Arc<Mutex<Vec<Value>>>,
@@ -297,6 +302,9 @@ async fn harness_config(
     harness_full(config_text, turns, whisper_text, servers, |t| t).await
 }
 
+/// Builds the decoder; tests can swap in a misbehaving one.
+type MakeDecoder = Box<dyn FnOnce(&Config, &Health) -> Decoder>;
+
 /// `harness_config`, with the MCP backend wrapped by `wrap_tools`.
 async fn harness_full(
     config_text: &str,
@@ -304,6 +312,25 @@ async fn harness_full(
     whisper_text: Option<&str>,
     servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
     wrap_tools: impl FnOnce(Arc<dyn ToolBackend>) -> Arc<dyn ToolBackend>,
+) -> Harness {
+    harness_decoder(
+        config_text,
+        turns,
+        whisper_text,
+        servers,
+        wrap_tools,
+        Box::new(|c: &Config, h: &Health| Decoder::new(&c.stt, h.blocking.clone())),
+    )
+    .await
+}
+
+async fn harness_decoder(
+    config_text: &str,
+    turns: Vec<Value>,
+    whisper_text: Option<&str>,
+    servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
+    wrap_tools: impl FnOnce(Arc<dyn ToolBackend>) -> Arc<dyn ToolBackend>,
+    make_decoder: MakeDecoder,
 ) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (mcp_url, mcp_calls, mcp_stop) = start_mcp().await;
@@ -379,6 +406,7 @@ async fn harness_full(
     let agent =
         Arc::new(Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone()).unwrap());
     let wake = Arc::new(Notify::new());
+    let health = Arc::new(Health::new(&config, now()));
     let worker = Arc::new(Worker {
         config: config.clone(),
         db: db.clone(),
@@ -387,7 +415,14 @@ async fn harness_full(
         notifier: notifier.clone(),
         wake: wake.clone(),
         data_dir: dir.path().to_path_buf(),
+        health: health.clone(),
+        decoder: make_decoder(&config, &health),
     });
+    let watchdog = Arc::new(Watchdog::new(
+        health.clone(),
+        db.clone(),
+        Alerter::new(notifier.clone(), &config.alerts, AlertBook::load(None)),
+    ));
     let state = Arc::new(AppState {
         config: config.clone(),
         db: db.clone(),
@@ -396,10 +431,13 @@ async fn harness_full(
         data_dir: dir.path().to_path_buf(),
         webhook_secret: Some(SECRET.into()),
         metrics: None,
+        health: health.clone(),
     });
     Harness {
         app: router(state),
         worker,
+        health,
+        watchdog,
         db,
         notes,
         claude_seen: seen,
@@ -2076,4 +2114,478 @@ async fn started_job_is_not_resumed_long_after_its_max_age() {
     let notes = h.notes.take();
     assert_eq!(notes.len(), 1);
     assert!(notes[0].body.contains("turn the heating off"), "{notes:?}");
+}
+
+// ------------------------------------------------- health, alerts, shutdown
+
+async fn healthz(h: &Harness) -> (StatusCode, String) {
+    send(h, Request::get("/healthz").body(Body::empty()).unwrap()).await
+}
+
+/// Alert and recovery notifications, leaving the others.
+fn alerts(h: &Harness) -> Vec<Notification> {
+    h.notes
+        .take()
+        .into_iter()
+        .filter(|n| matches!(n.kind, Kind::Alert { .. } | Kind::Recovered))
+        .collect()
+}
+
+/// The gauges as `/metrics` would render them right now.
+fn gauges(h: &Harness) -> String {
+    let rec = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = rec.handle();
+    metrics::with_local_recorder(&rec, || h.health.export(now(), &h.db.status().snapshot()));
+    handle.render()
+}
+
+#[tokio::test]
+async fn corrupt_database_alerts_once_refuses_webhooks_and_recovers_once() {
+    let h = harness(vec![final_turn("Done.")], None).await;
+    queue_command(&h, "before-1", "turn on the kitchen lights").await;
+    h.watchdog.check(now()).await;
+    assert!(alerts(&h).is_empty());
+    assert_eq!(healthz(&h).await.0, StatusCode::OK);
+    assert!(gauges(&h).contains("ringmaster_db_healthy 1"));
+
+    // Damage the file on disk (its header), as a failing disk would.
+    rusqlite::Connection::open(&h.db_path)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let good = std::fs::read(&h.db_path).unwrap();
+    let mut bad = good.clone();
+    bad[..100].fill(0xA5);
+    std::fs::write(&h.db_path, &bad).unwrap();
+
+    h.watchdog.check(now()).await;
+    h.watchdog.check(now()).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1, "one alert, debounced: {sent:?}");
+    assert_eq!(sent[0].title, "Ringmaster alert: database corrupt");
+    assert_eq!(sent[0].kind, Kind::Alert { reminder: false });
+    assert!(sent[0].body.contains("SQLITE_NOTADB"), "{}", sent[0].body);
+    assert!(
+        sent[0].body.contains("may not be stored or processed"),
+        "{}",
+        sent[0].body
+    );
+    let (status, body) = healthz(&h).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("database corrupt"), "{body}");
+    let g = gauges(&h);
+    assert!(g.contains("ringmaster_db_healthy 0"), "{g}");
+    assert!(g.contains("ringmaster_alerts_active 1"), "{g}");
+    assert!(
+        g.contains("ringmaster_alert_active{condition=\"database_corrupt\"} 1"),
+        "{g}"
+    );
+
+    // The phone is told to retry rather than given a 2xx for data that is
+    // not safely stored.
+    let (ct, body) = multipart(Some(TONE), Some("add milk"), false);
+    let req = signed_request("during-2", "double-click-hold", false, &ct, body, now());
+    let (status, text) = send(&h, req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+
+    // Restored from a backup.
+    std::fs::write(&h.db_path, &good).unwrap();
+    h.watchdog.check(now()).await;
+    h.watchdog.check(now()).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1, "one recovery message: {sent:?}");
+    assert_eq!(sent[0].title, "Ringmaster recovered: database corrupt");
+    assert_eq!(sent[0].kind, Kind::Recovered);
+    assert_eq!(healthz(&h).await.0, StatusCode::OK);
+    assert!(gauges(&h).contains("ringmaster_db_healthy 1"));
+    let (ct, body) = multipart(Some(TONE), Some("add milk"), false);
+    let req = signed_request("during-2", "double-click-hold", false, &ct, body, now());
+    assert_eq!(send(&h, req).await.0, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn stalled_worker_and_queue_alert_once_and_recover() {
+    let h = harness(vec![final_turn("Kitchen lights on.")], None).await;
+    // The worker loop stops beating (stuck), with a job waiting.
+    queue_command(&h, "wait-1", "turn on the kitchen lights").await;
+    let t = now();
+    h.health.beat_worker(t - 300);
+    {
+        let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+        conn.execute("UPDATE jobs SET next_attempt_at = ?1", [t - 1000])
+            .unwrap();
+    }
+    for _ in 0..3 {
+        h.watchdog.check(t).await;
+    }
+    let sent = alerts(&h);
+    let titles: Vec<&str> = sent.iter().map(|n| n.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Ringmaster alert: worker stalled",
+            "Ringmaster alert: queue stalled"
+        ],
+        "{sent:?}"
+    );
+    assert!(
+        sent[0].body.contains("has not run for 5 min"),
+        "{}",
+        sent[0].body
+    );
+    assert!(
+        sent[1].body.starts_with("Job 1 has been due for 16 min"),
+        "{}",
+        sent[1].body
+    );
+    let (status, body) = healthz(&h).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("worker loop stalled"), "{body}");
+    assert!(gauges(&h).contains("ringmaster_oldest_due_job_age_seconds 1000"));
+
+    // A reminder after an hour, not before.
+    h.watchdog.check(t + 3599).await;
+    assert!(alerts(&h).is_empty());
+    h.watchdog.check(t + 3600).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[1].title, "Ringmaster alert (ongoing): queue stalled");
+    assert_eq!(sent[1].kind, Kind::Alert { reminder: true });
+    assert!(
+        sent[1].body.ends_with("Ongoing for 60 min."),
+        "{}",
+        sent[1].body
+    );
+
+    // The loop runs again and the job goes through: one recovery each.
+    tick(&h).await;
+    let t = now();
+    h.health.beat_worker(t);
+    h.watchdog.check(t).await;
+    h.watchdog.check(t).await;
+    let sent = alerts(&h);
+    let titles: Vec<&str> = sent.iter().map(|n| n.title.as_str()).collect();
+    assert_eq!(
+        titles,
+        [
+            "Ringmaster recovered: worker stalled",
+            "Ringmaster recovered: queue stalled"
+        ]
+    );
+    assert!(sent.iter().all(|n| n.kind == Kind::Recovered));
+    assert_eq!(healthz(&h).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn job_past_its_deadline_alerts_and_recovers() {
+    let h = harness(vec![], None).await;
+    // A job whose attempt deadline did not fire (e.g. blocking code that
+    // never yields): its task has run far past attempt_timeout_secs.
+    let t = now();
+    h.health.job_started(42, t - 2000);
+    h.watchdog.check(t).await;
+    h.watchdog.check(t + 30).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].title, "Ringmaster alert: job past its deadline");
+    assert!(
+        sent[0].body.starts_with("Job 42 running for up to 33 min"),
+        "{}",
+        sent[0].body
+    );
+    // Not a reason to restart the container.
+    assert_eq!(healthz(&h).await.0, StatusCode::OK);
+    h.health.job_finished(42);
+    h.watchdog.check(t + 60).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].title, "Ringmaster recovered: job past its deadline");
+}
+
+#[tokio::test]
+async fn alerts_never_carry_transcripts_or_secrets() {
+    let h = harness(vec![], Some("unlock the garden shed")).await;
+    for (i, text) in ["the pin is 4321", "tell Anna her code", "open sesame"]
+        .iter()
+        .enumerate()
+    {
+        queue_command(&h, &format!("bad-{i}"), text).await;
+    }
+    {
+        let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+        conn.execute(
+            "UPDATE jobs SET agent_state = '{broken', transcript = 'unlock the garden shed'",
+            [],
+        )
+        .unwrap();
+    }
+    tick(&h).await; // three quarantined jobs
+    // The database file turns read-only: the write probe fails.
+    set_read_only(&h.db_path, true);
+    h.health.beat_worker(now() - 600);
+    h.watchdog.check(now()).await;
+    let sent = alerts(&h);
+    let kinds: Vec<&str> = sent.iter().map(|n| n.title.as_str()).collect();
+    assert!(
+        kinds.contains(&"Ringmaster alert: jobs failing"),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"Ringmaster alert: database failing"),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"Ringmaster alert: worker stalled"),
+        "{kinds:?}"
+    );
+    let failing = sent
+        .iter()
+        .find(|n| n.title.ends_with("jobs failing"))
+        .unwrap();
+    assert!(failing.body.contains("quarantined 3"), "{}", failing.body);
+    for n in &sent {
+        let text = format!("{} {}", n.title, n.body);
+        for secret in [
+            "unlock the garden shed",
+            "4321",
+            "Anna",
+            "sesame",
+            SECRET,
+            "sk-test",
+            "sk-openai-test",
+        ] {
+            assert!(!text.contains(secret), "{secret:?} leaked into {text}");
+        }
+    }
+    set_read_only(&h.db_path, false);
+}
+
+/// The database file and its write-ahead log read-only (or writable again),
+/// as after a read-only remount.
+fn set_read_only(path: &std::path::Path, ro: bool) {
+    let wal = path.with_extension("db-wal");
+    for p in [path, wal.as_path()] {
+        if let Ok(m) = std::fs::metadata(p) {
+            let mut perms = m.permissions();
+            perms.set_readonly(ro);
+            std::fs::set_permissions(p, perms).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn read_only_database_alerts_and_recovers() {
+    let h = harness(vec![], None).await;
+    set_read_only(&h.db_path, true);
+    h.watchdog.check(now()).await;
+    h.watchdog.check(now()).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].title, "Ringmaster alert: database failing");
+    assert!(
+        sent[0]
+            .body
+            .starts_with("Database writes fail: database is read-only (SQLITE_READONLY)."),
+        "{}",
+        sent[0].body
+    );
+    assert!(sent[0].body.contains("may not be stored or processed"));
+    let (status, body) = healthz(&h).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("SQLITE_READONLY"), "{body}");
+    assert!(gauges(&h).contains("ringmaster_db_healthy 0"));
+
+    set_read_only(&h.db_path, false);
+    h.watchdog.check(now()).await;
+    h.watchdog.check(now()).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].title, "Ringmaster recovered: database failing");
+    assert_eq!(healthz(&h).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stuck_decoder_never_holds_up_jobs_or_piles_up_threads() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (l, p) = (live.clone(), peak.clone());
+    // A decoder that ignores its deadline, as a hang inside the codec would.
+    let hang: ringmaster::audio::DecodeFn =
+        Arc::new(move |_: &[u8], _: &ringmaster::audio::Budget| {
+            let n = l.fetch_add(1, Ordering::SeqCst) + 1;
+            p.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(4));
+            l.fetch_sub(1, Ordering::SeqCst);
+            anyhow::bail!("gave up")
+        });
+    let config = CONFIG.replace(
+        "vocabulary = [\"kitchen\"]\n",
+        "vocabulary = [\"kitchen\"]\ndecode_timeout_secs = 1\ndecode_concurrency = 1\n",
+    ) + "\n[alerts]\noverrun_margin_secs = 0\n";
+    let config = config.replace(
+        "tool_discovery_timeout_secs = 2\n",
+        "tool_discovery_timeout_secs = 2\nworker_concurrency = 3\n",
+    );
+    let h = harness_decoder(
+        &config,
+        vec![final_turn("One."), final_turn("Two."), final_turn("Three.")],
+        Some("never used"),
+        |home| vec![home],
+        |t| t,
+        Box::new(move |c: &Config, health: &Health| {
+            Decoder::with_fn(&c.stt, health.blocking.clone(), hang)
+        }),
+    )
+    .await;
+    for i in 0..3 {
+        queue_command(&h, &format!("rec-{i}"), "what time is it").await;
+    }
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(4), tick(&h))
+        .await
+        .expect("a stuck decoder must not hold the jobs up");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    for id in 1..=3 {
+        let job = h.db.get_job(id).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Done);
+        assert_eq!(job.transcript_source.as_deref(), Some("phone"));
+    }
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "never more than decode_concurrency threads"
+    );
+    assert_eq!(h.health.blocking.count("decode"), 1);
+    let audit = h.db.audit_entries(1).await.unwrap();
+    assert!(
+        audit.iter().any(|(k, _)| k == "audio_decode_failed"),
+        "{audit:?}"
+    );
+
+    // The stuck thread is visible to the watchdog until it returns.
+    h.notes.take();
+    h.watchdog.check(now() + 3).await;
+    let sent = alerts(&h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].title, "Ringmaster alert: blocking work stuck");
+    assert!(sent[0].body.contains("1 decode"), "{}", sent[0].body);
+    assert!(gauges(&h).contains("ringmaster_blocking_tasks{kind=\"decode\"} 1"));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(h.health.blocking.count("decode"), 0);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn shutdown_ends_within_the_grace_period_and_requeues_the_running_job() {
+    let h = harness_config(
+        &config_agent("attempt_timeout_secs = 300"),
+        vec![],
+        None,
+        |home| vec![home],
+    )
+    .await;
+    hang_requests_containing(&h, "please hang").await;
+    queue_command(&h, "hang-1", "please hang forever").await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let service = tokio::spawn(ringmaster::run_service(
+        listener,
+        h.app.clone(),
+        h.worker.clone(),
+        h.watchdog.clone(),
+        stop.clone(),
+        Duration::from_secs(2),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while h.db.get_job(1).await.unwrap().unwrap().status != JobStatus::Running {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the job starts");
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{addr}/healthz");
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+
+    let started = std::time::Instant::now();
+    stop.cancel();
+    let report = tokio::time::timeout(Duration::from_secs(5), service)
+        .await
+        .expect("shutdown is bounded")
+        .unwrap()
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(2),
+        "waited for the job: {took:?}"
+    );
+    assert!(took < Duration::from_millis(3500), "{took:?}");
+    assert_eq!(report.jobs_left, vec![1]);
+
+    // Nothing is listening any more, and the job is left for the next start.
+    assert!(client.get(&url).send().await.is_err());
+    assert_eq!(job_row(&h, 1).0, "running");
+    assert_eq!(h.db.requeue_running(now(), &[]).await.unwrap(), 1);
+    assert_eq!(job_row(&h, 1).0, "queued");
+}
+
+#[tokio::test]
+async fn idle_mcp_sessions_are_closed_and_their_tasks_end() {
+    let (url, _calls, _stop) = start_mcp().await;
+    let backend = McpBackend::new(
+        vec![McpServerConfig {
+            name: "home".into(),
+            url,
+            ..Default::default()
+        }],
+        Default::default(),
+        Duration::from_secs(5),
+    );
+    let alive = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    // Tasks still alive a moment after the session is closed.
+    async fn settle(alive: &impl Fn() -> usize) -> usize {
+        let mut last = alive();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let n = alive();
+            if n == last && n < 5 {
+                break;
+            }
+            last = n;
+        }
+        alive()
+    }
+    let mut after_close = Vec::new();
+    for round in 0..3 {
+        assert_eq!(backend.list_tools(&["home".into()]).await.unwrap().len(), 3);
+        assert_eq!(backend.sessions().await, 1);
+        let open = alive();
+        // Recently used: kept.
+        assert_eq!(
+            backend.close_idle(Duration::from_secs(600)).await,
+            0,
+            "round {round}"
+        );
+        assert_eq!(backend.close_idle(Duration::ZERO).await, 1);
+        assert_eq!(backend.sessions().await, 0);
+        let left = settle(&alive).await;
+        assert!(
+            left + 5 <= open,
+            "the session's tasks end: {left} of {open}"
+        );
+        after_close.push(left);
+    }
+    // Sessions opened and closed over and over leave nothing behind.
+    assert!(
+        after_close.windows(2).all(|w| w[1] <= w[0]),
+        "{after_close:?}"
+    );
 }

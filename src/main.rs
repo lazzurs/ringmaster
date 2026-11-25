@@ -61,9 +61,26 @@ fn init_logging() {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let cli = Cli::parse();
+fn main() -> ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("cannot start the runtime: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = rt.block_on(run(Cli::parse()));
+    // Dropping a runtime waits for every blocking thread. One that never
+    // returns (a stuck decode or disk write) must not keep the process
+    // alive until Docker's SIGKILL.
+    rt.shutdown_timeout(Duration::from_secs(1));
+    code
+}
+
+async fn run(cli: Cli) -> ExitCode {
     let command = cli.command.unwrap_or(Command::Serve {
         config: std::env::var_os("RINGMASTER_CONFIG")
             .map(PathBuf::from)
@@ -92,7 +109,13 @@ async fn main() -> ExitCode {
             match client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => ExitCode::SUCCESS,
                 Ok(r) => {
-                    eprintln!("unhealthy: HTTP {}", r.status());
+                    // Docker keeps this output in `docker inspect`.
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    eprintln!(
+                        "HTTP {status}: {}",
+                        body.chars().take(500).collect::<String>()
+                    );
                     ExitCode::FAILURE
                 }
                 Err(e) => {

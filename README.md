@@ -54,6 +54,10 @@ Docker Compose.
 Jobs are durable: a restart, a sleeping Mac, an API outage or a pending
 confirmation all resume from the last saved step.
 
+Nothing runs for ever: every job attempt, decode, model, MCP and ntfy call
+has a deadline, idle MCP sessions are closed after 10 minutes, and shutdown
+is bounded. See [Health and alerts](#health-and-alerts) for what is watched.
+
 One job never holds up the others. Up to `agent.worker_concurrency` jobs (2)
 run at once, each attempt has a deadline (`agent.attempt_timeout_secs`, 15
 minutes) after which it is retried with back-off like an outage, a crash
@@ -273,6 +277,7 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `server.public_base_url` | none | external URL (tunnel hostname) for the Approve/Deny links; without it confirmations have no buttons |
 | `server.data_dir` | `/data` | SQLite database and recordings |
 | `server.max_body_bytes` | 25 MiB | webhook body limit |
+| `server.shutdown_grace_secs` | `8` | on SIGTERM, how long in-flight requests and jobs get to finish; keep it below the container's stop timeout (Docker: 10 s, or `stop_grace_period`) |
 | `webhook.path` | `/webhook` | webhook path |
 | `webhook.require_signature` | `true` | reject unsigned requests |
 | `webhook.timestamp_tolerance_secs` | `300` | allowed clock skew |
@@ -284,6 +289,9 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `stt.prompt` | built from vocabulary | explicit initial prompt |
 | `stt.use_phone_transcription` | `true` | last-resort fallback |
 | `stt.connect_timeout_secs` / `stt.timeout_secs` | `5` / `120` | |
+| `stt.max_audio_bytes` / `stt.max_audio_secs` | 25 MiB / `600` | larger or longer recordings are not decoded; the phone's transcription is used |
+| `stt.decode_timeout_secs` | `60` | wall-clock limit for decoding one recording (checked inside the decode loop) |
+| `stt.decode_concurrency` | `1` | decoder threads at once (1-8); also the most threads a hung decoder can tie up |
 | `llm.provider` | `anthropic` | default provider: `anthropic` `openai` `mistral` `openrouter` `ollama` |
 | `llm.model` | `claude-opus-5-5` for Anthropic, otherwise required | default provider's model |
 | `llm.effort` | `low` for Anthropic, otherwise unset | Anthropic: `low` `medium` `high` `xhigh` `max`; OpenAI/OpenRouter: `none` `minimal` `low` `medium` `high` `xhigh` `max`; Mistral: `none` `high`; Ollama: `none` `low` `medium` `high` `max` |
@@ -308,6 +316,16 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `agent.attempt_timeout_secs` | `900` | wall-clock limit for one attempt at a job; an attempt that runs over is retried with back-off until the job's max age |
 | `agent.worker_concurrency` | `2` | jobs processed at once (1-16), so one slow or stuck job does not hold up the queue; with more than 1, jobs can finish out of order |
 | `retention.audio_days` | `30` | delete recordings after this (0 keeps them) |
+| `alerts.enabled` | `true` | send operational alerts (they are always logged and on `/healthz`, `/metrics`) |
+| `alerts.ntfy_topic` | `notify.ntfy.topic` | separate ntfy topic for alerts (same server and token) |
+| `alerts.check_interval_secs` | `30` | how often the watchdog checks |
+| `alerts.reminder_secs` | `3600` | repeat an alert this often while it lasts (0 = never) |
+| `alerts.db_check_interval_secs` | `300` | `PRAGMA quick_check` and a write probe; also run at once after a database error |
+| `alerts.db_error_threshold` | `3` | statements (or job claims) failing in a row before an alert; corruption, read-only, full and I/O errors alert at once |
+| `alerts.worker_stall_secs` | `120` | the worker loop has not run for this long (it runs at least every 30 s; minimum 60) |
+| `alerts.queue_stall_secs` | `600` | a due job has waited this long to start |
+| `alerts.overrun_margin_secs` | `60` | a job (or a decode) this far past its deadline |
+| `alerts.failure_threshold` / `alerts.failure_window_secs` | `3` / `900` | this many jobs failed, expired, quarantined or panicked within the window |
 | `notify.ntfy.url` / `.topic` | `https://ntfy.sh` / required | |
 | `notify.ntfy.action_headers` | `{}` | headers the phone sends with Approve/Deny |
 | `[[mcp_servers]]` `name`, `url`, `token_env` | | streamable HTTP MCP servers; `token_env` sends `Authorization: Bearer` |
@@ -388,6 +406,10 @@ do not use an open public topic. Notifications:
 | approve? | 5 | a `confirm` tool is waiting; `Approve` / `Deny` buttons (`http` actions that `POST` to `/confirm/<token>/approve|deny`) and a `Details` link |
 | problem | 4 | errors, refusals, give-ups, and the first delay of a job |
 | info | 2 | test events, empty recordings |
+| alert | 5 (reminders 4) | operational problems (see [Health and alerts](#health-and-alerts)); tags `rotating_light`, `ringmaster-alert`; title `Ringmaster alert: ...` |
+| recovered | 3 | an alerted problem has cleared; tags `heavy_check_mark`, `ringmaster-alert` |
+
+Set `alerts.ntfy_topic` to send alerts to their own topic.
 
 ## Transcription on the Mac
 
@@ -416,7 +438,7 @@ a named volume needs `chown 65532:65532`.
 | `POST /webhook` | ring app deliveries |
 | `GET /confirm/<token>` | shows a pending action with Approve/Deny buttons (GET changes nothing) |
 | `POST /confirm/<token>/approve`, `/deny` | records the decision once |
-| `GET /healthz` | `200 ok` when the database answers |
+| `GET /healthz` | `200 ok`, or `503 unhealthy: <reasons>` (see [Health and alerts](#health-and-alerts)) |
 | `GET /metrics` | Prometheus metrics |
 
 `ringmaster healthcheck` probes `/healthz` for the Docker `HEALTHCHECK`
@@ -435,6 +457,75 @@ cache_write; up to 0.1.2 these were `ringmaster_claude_*` without a provider
 label), `ringmaster_tool_calls_total{outcome}`,
 `ringmaster_confirmations_total{decision}` and
 `ringmaster_notifications_total{status}`.
+
+Health gauges (refreshed by the watchdog and on every scrape):
+`ringmaster_db_healthy` (0/1), `ringmaster_db_errors_total{class}`,
+`ringmaster_jobs_running`, `ringmaster_jobs_due`,
+`ringmaster_oldest_due_job_age_seconds`,
+`ringmaster_worker_heartbeat_age_seconds`,
+`ringmaster_watchdog_heartbeat_age_seconds`, `ringmaster_alerts_active`,
+`ringmaster_alert_active{condition}`, `ringmaster_blocking_tasks{kind}`
+(decodes and audio writes in progress), `ringmaster_mcp_sessions` and
+`ringmaster_tokio_alive_tasks`. A steady rise in the last three is a leak.
+
+### Health and alerts
+
+A watchdog task, independent of the worker, checks every
+`alerts.check_interval_secs` (30 s) and alerts you through the notifier:
+
+| Alert | When |
+|---|---|
+| database corrupt | a statement fails with `SQLITE_CORRUPT`/`SQLITE_NOTADB`, or `PRAGMA quick_check` (on a fresh connection, every `db_check_interval_secs`) finds problems |
+| database failing | writes fail with `SQLITE_FULL`, `SQLITE_READONLY` or an I/O error (a write probe confirms; alerts at once), `db_error_threshold` statements or job claims fail in a row, or the database stops answering |
+| worker stalled | the worker loop has not run for `worker_stall_secs` |
+| queue stalled | a due job has not started for `queue_stall_secs` |
+| job past its deadline | a job has run `overrun_margin_secs` past `agent.attempt_timeout_secs` (the deadline did not fire) |
+| jobs failing | `failure_threshold` jobs failed, expired, were quarantined or panicked within `failure_window_secs` |
+| blocking work stuck | a decode (or an audio write) has not returned `overrun_margin_secs` after its limit |
+
+Each problem gets one alert when it starts, a reminder every `reminder_secs`
+while it lasts and one "recovered" message when it clears. Alerts carry
+counts, job ids, ages and error classes, never what you said or a secret.
+Example:
+
+> **Ringmaster alert: database failing**
+> Database writes fail: disk is full (SQLITE_FULL). New recordings may not
+> be stored or processed; the webhook answers 503 so the phone retries (up
+> to 10 times, a minute apart).
+
+Alerts are always logged. If ntfy is down the alert is logged and retried
+a minute later; sending never blocks or stops anything. The alert state is
+kept in `/data/alerts.json`, so a restart that fixes a problem still sends
+"recovered", and a restart does not repeat an alert.
+
+While the database is corrupt the webhook answers `503` before storing
+anything (as it already did for any storage error), so the phone keeps the
+recording and retries rather than getting a `2xx` for data that was not
+safely stored. If the database cannot be opened at start-up, Ringmaster
+alerts and retries every 30 s instead of exiting, so the container does not
+restart in a loop.
+
+`/healthz` returns `503` with the reasons only when recordings cannot be
+stored or processed at all: the database is corrupt, read-only, full,
+failing I/O or not answering (a 2 s `SELECT 1`), or the worker loop or the
+watchdog has stopped. It reads in-memory state and never runs the
+expensive checks itself. Slow or failing jobs, a stalled queue, a sleeping
+Mac or a down MCP server are alerted on but keep it `200`: restarting does
+not fix them. Docker's `HEALTHCHECK` only marks the container unhealthy;
+Compose's `restart: unless-stopped` acts on exits, not health, so an
+unhealthy Ringmaster is never restarted in a loop. If you add an autoheal
+tool, a restart is safe: shutdown is graceful, jobs resume, and webhooks
+refused meanwhile are retried by the phone.
+
+### Shutdown
+
+On SIGTERM the listener closes (new webhooks are refused and retried by the
+phone), in-flight requests and jobs get `server.shutdown_grace_secs` to
+finish, the watchdog and housekeeping stop, and the process exits. A job
+still running then stays `running` and is requeued at the next start. Set
+the container's stop timeout above the grace period
+(`stop_grace_period: 30s` with `shutdown_grace_secs = 25` in the compose
+example).
 
 ### Audit log
 

@@ -16,6 +16,11 @@ listen = "0.0.0.0:8080"
 public_base_url = "https://ring.example.com"
 data_dir = "/data"
 max_body_bytes = 26214400
+# On SIGTERM, in-flight requests and jobs get this long to finish; jobs still
+# running are requeued at the next start. Keep it below the container's stop
+# timeout (Docker's default is 10 s; the compose example sets
+# stop_grace_period: 30s for 25 here).
+shutdown_grace_secs = 8
 
 [webhook]
 path = "/webhook"
@@ -37,6 +42,14 @@ vocabulary = [
 # Use the phone's transcription (Pebble app "Both" mode) if no whisper server answers.
 use_phone_transcription = true
 timeout_secs = 120
+# Decoding the M4A is bounded: recordings over max_audio_bytes or longer than
+# max_audio_secs are not decoded, and decoding stops after decode_timeout_secs.
+# In each case the phone's transcription is used instead. decode_concurrency
+# caps the decoder threads (a decoder that hangs keeps its thread).
+max_audio_bytes = 26214400
+max_audio_secs = 600
+decode_timeout_secs = 60
+decode_concurrency = 1
 
 # ------------------------------------------------------------------------ LLM
 # Keys directly under [llm] describe the default provider; [llm.<provider>]
@@ -114,6 +127,25 @@ worker_concurrency = 2
 
 [retention]
 audio_days = 30
+
+# Operational alerts to you (database corrupt, read-only or full; stalled
+# worker or queue; jobs past their deadline; runs of failed jobs; stuck
+# decoders). One alert when a problem starts, a reminder every reminder_secs
+# while it lasts, one "recovered" message when it clears. Alerts never carry
+# transcripts or secrets.
+[alerts]
+enabled = true
+# A separate ntfy topic for alerts; defaults to notify.ntfy.topic.
+# ntfy_topic = "ringmaster-ops-change-me"
+check_interval_secs = 30
+reminder_secs = 3600              # 0 = no reminders
+db_check_interval_secs = 300      # PRAGMA quick_check + write probe
+db_error_threshold = 3            # failed statements in a row before alerting
+worker_stall_secs = 120           # worker loop silent this long (it runs every 30 s)
+queue_stall_secs = 600            # a due job waiting this long to start
+overrun_margin_secs = 60          # a job this far past agent.attempt_timeout_secs
+failure_threshold = 3             # this many failed jobs...
+failure_window_secs = 900         # ...within this window
 
 [notify.ntfy]
 url = "https://ntfy.example.com"

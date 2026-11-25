@@ -53,6 +53,10 @@ pub struct Config {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// Operational alerts (database, stalled queue) and the health checks
+    /// behind them.
+    #[serde(default)]
+    pub alerts: AlertsConfig,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
@@ -78,6 +82,11 @@ pub struct ServerConfig {
     pub data_dir: PathBuf,
     /// Maximum accepted webhook body size in bytes.
     pub max_body_bytes: usize,
+    /// On SIGTERM: how long in-flight requests and jobs get to finish before
+    /// the process exits anyway (unfinished jobs are requeued at the next
+    /// start). Keep it below the container's stop timeout (Docker: 10 s
+    /// unless `stop_grace_period` says otherwise).
+    pub shutdown_grace_secs: u64,
 }
 
 impl Default for ServerConfig {
@@ -87,6 +96,7 @@ impl Default for ServerConfig {
             public_base_url: None,
             data_dir: PathBuf::from("/data"),
             max_body_bytes: 25 * 1024 * 1024,
+            shutdown_grace_secs: 8,
         }
     }
 }
@@ -136,6 +146,18 @@ pub struct SttConfig {
     pub use_phone_transcription: bool,
     pub connect_timeout_secs: u64,
     pub timeout_secs: u64,
+    /// Recordings larger than this are not decoded (the phone's
+    /// transcription is used instead).
+    pub max_audio_bytes: u64,
+    /// Decoding stops (and the phone's transcription is used) once a
+    /// recording turns out to be longer than this.
+    pub max_audio_secs: u64,
+    /// Wall-clock limit for decoding one recording.
+    pub decode_timeout_secs: u64,
+    /// Recordings decoded at once. Decoding runs on a blocking thread that
+    /// cannot be cancelled, so this also caps how many threads a decoder
+    /// that never returns can tie up.
+    pub decode_concurrency: usize,
 }
 
 impl Default for SttConfig {
@@ -150,6 +172,10 @@ impl Default for SttConfig {
             use_phone_transcription: true,
             connect_timeout_secs: 5,
             timeout_secs: 120,
+            max_audio_bytes: 25 * 1024 * 1024,
+            max_audio_secs: 600,
+            decode_timeout_secs: 60,
+            decode_concurrency: 1,
         }
     }
 }
@@ -396,6 +422,65 @@ impl Default for RetentionConfig {
         Self { audio_days: 30 }
     }
 }
+
+/// `[alerts]`: operational alerts sent to the operator through the notifier.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AlertsConfig {
+    /// Send alerts (they are always logged and shown on `/healthz` and
+    /// `/metrics`).
+    pub enabled: bool,
+    /// ntfy topic for alerts; the normal `notify.ntfy.topic` when unset.
+    pub ntfy_topic: Option<String>,
+    /// How often the watchdog looks at the queue, the worker and the
+    /// database.
+    pub check_interval_secs: u64,
+    /// While a problem lasts, repeat its alert this often (0 = never).
+    pub reminder_secs: u64,
+    /// How often to run `PRAGMA quick_check` and a write probe on the
+    /// database (also run at once after a corruption or storage error).
+    pub db_check_interval_secs: u64,
+    /// Database statements failing in a row before an alert. Corruption,
+    /// a full disk, a read-only database and I/O errors alert at once.
+    pub db_error_threshold: u32,
+    /// Alert when the worker loop has not run for this long (it runs at
+    /// least every 30 s).
+    pub worker_stall_secs: u64,
+    /// Alert when a due job has waited this long without being started.
+    pub queue_stall_secs: u64,
+    /// Alert when a job runs this long past `agent.attempt_timeout_secs`
+    /// (its deadline did not fire).
+    pub overrun_margin_secs: u64,
+    /// Alert when this many jobs fail (failed, expired, quarantined or
+    /// panicked) within `failure_window_secs`.
+    pub failure_threshold: usize,
+    pub failure_window_secs: u64,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ntfy_topic: None,
+            check_interval_secs: 30,
+            reminder_secs: 3600,
+            db_check_interval_secs: 300,
+            db_error_threshold: 3,
+            worker_stall_secs: 120,
+            queue_stall_secs: 600,
+            overrun_margin_secs: 60,
+            failure_threshold: 3,
+            failure_window_secs: 900,
+        }
+    }
+}
+
+/// The worker loop runs at least this often; `alerts.worker_stall_secs`
+/// must leave room for it.
+pub const WORKER_LOOP_MAX_WAIT_SECS: u64 = 30;
+
+/// Upper bound for `stt.decode_concurrency`.
+pub const MAX_DECODE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -950,6 +1035,35 @@ impl Config {
         if !(1..=MAX_WORKER_CONCURRENCY).contains(&self.agent.worker_concurrency) {
             bail!("agent.worker_concurrency must be between 1 and {MAX_WORKER_CONCURRENCY}");
         }
+        if self.server.shutdown_grace_secs == 0 {
+            bail!("server.shutdown_grace_secs must be at least 1");
+        }
+        if !(1..=MAX_DECODE_CONCURRENCY).contains(&self.stt.decode_concurrency) {
+            bail!("stt.decode_concurrency must be between 1 and {MAX_DECODE_CONCURRENCY}");
+        }
+        if self.stt.decode_timeout_secs == 0 || self.stt.max_audio_secs == 0 {
+            bail!("stt.decode_timeout_secs and stt.max_audio_secs must be at least 1");
+        }
+        let a = &self.alerts;
+        if a.check_interval_secs == 0 || a.db_check_interval_secs == 0 {
+            bail!(
+                "alerts.check_interval_secs and alerts.db_check_interval_secs must be at least 1"
+            );
+        }
+        if a.worker_stall_secs < 2 * WORKER_LOOP_MAX_WAIT_SECS {
+            bail!(
+                "alerts.worker_stall_secs must be at least {} (the worker loop runs every {WORKER_LOOP_MAX_WAIT_SECS} s)",
+                2 * WORKER_LOOP_MAX_WAIT_SECS
+            );
+        }
+        if a.db_error_threshold == 0 || a.failure_threshold == 0 || a.failure_window_secs == 0 {
+            bail!(
+                "alerts.db_error_threshold, alerts.failure_threshold and alerts.failure_window_secs must be at least 1"
+            );
+        }
+        if a.ntfy_topic.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            bail!("alerts.ntfy_topic must not be empty (leave it out to use notify.ntfy.topic)");
+        }
         for r in &self.tool_policies {
             globset::Glob::new(&r.pattern)
                 .with_context(|| format!("tool_policies match {:?}", r.pattern))?;
@@ -1070,6 +1184,32 @@ mod tests {
         let cfg = Config::from_toml("[agent]\nworker_concurrency = 1\nattempt_timeout_secs = 60")
             .unwrap();
         assert_eq!(cfg.agent.worker_concurrency, 1);
+    }
+
+    #[test]
+    fn alert_and_shutdown_settings_are_checked() {
+        let cfg = Config::from_toml("").unwrap();
+        assert!(cfg.alerts.enabled);
+        assert_eq!(cfg.alerts.ntfy_topic, None);
+        assert_eq!(cfg.alerts.worker_stall_secs, 120);
+        assert_eq!(cfg.server.shutdown_grace_secs, 8);
+        assert_eq!(cfg.stt.decode_concurrency, 1);
+        for bad in [
+            "[alerts]\nworker_stall_secs = 30",
+            "[alerts]\ncheck_interval_secs = 0",
+            "[alerts]\nfailure_threshold = 0",
+            "[alerts]\nntfy_topic = \" \"",
+            "[alerts]\nunknown = 1",
+            "[server]\nshutdown_grace_secs = 0",
+            "[stt]\ndecode_concurrency = 0",
+            "[stt]\ndecode_concurrency = 9",
+            "[stt]\ndecode_timeout_secs = 0",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
+        let cfg = Config::from_toml("[alerts]\nenabled = false\nntfy_topic = \"ops\"").unwrap();
+        assert!(!cfg.alerts.enabled);
+        assert_eq!(cfg.alerts.ntfy_topic.as_deref(), Some("ops"));
     }
 
     #[test]

@@ -3,8 +3,15 @@
 //!
 //! One connection behind a mutex, used from `spawn_blocking`. Ringmaster sees a
 //! handful of requests a day, so there is nothing to gain from a pool.
+//!
+//! The mutex is taken asynchronously *before* a blocking thread is used, so a
+//! statement that never returns (a hung disk) ties up one blocking thread,
+//! not one per caller; the callers wait in async code, where they can time
+//! out. Every statement's outcome is classified into [`DbStatus`], which the
+//! watchdog, `/healthz` and the webhook read.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -182,23 +189,245 @@ pub enum DecideOutcome {
     Unknown,
 }
 
+/// What kind of failure a SQLite error is, for alerts and metrics. Only the
+/// class (and SQLite's fixed description of it) is ever reported, never the
+/// statement or the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DbErrorClass {
+    /// `SQLITE_CORRUPT`
+    Corrupt,
+    /// `SQLITE_NOTADB`
+    NotADatabase,
+    /// `SQLITE_FULL`
+    Full,
+    /// `SQLITE_READONLY`
+    ReadOnly,
+    /// `SQLITE_IOERR`
+    Io,
+    /// `SQLITE_CANTOPEN`
+    CantOpen,
+    /// `SQLITE_BUSY` / `SQLITE_LOCKED`
+    Busy,
+    /// A statement did not return in time.
+    Unresponsive,
+    /// Any other SQLite error code.
+    Other,
+}
+
+impl DbErrorClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DbErrorClass::Corrupt => "SQLITE_CORRUPT",
+            DbErrorClass::NotADatabase => "SQLITE_NOTADB",
+            DbErrorClass::Full => "SQLITE_FULL",
+            DbErrorClass::ReadOnly => "SQLITE_READONLY",
+            DbErrorClass::Io => "SQLITE_IOERR",
+            DbErrorClass::CantOpen => "SQLITE_CANTOPEN",
+            DbErrorClass::Busy => "SQLITE_BUSY",
+            DbErrorClass::Unresponsive => "unresponsive",
+            DbErrorClass::Other => "other",
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            DbErrorClass::Corrupt => "database disk image is malformed",
+            DbErrorClass::NotADatabase => "file is not a database",
+            DbErrorClass::Full => "disk is full",
+            DbErrorClass::ReadOnly => "database is read-only",
+            DbErrorClass::Io => "disk I/O error",
+            DbErrorClass::CantOpen => "database file cannot be opened",
+            DbErrorClass::Busy => "database is locked",
+            DbErrorClass::Unresponsive => "database did not answer in time",
+            DbErrorClass::Other => "database error",
+        }
+    }
+
+    /// The file itself is damaged.
+    pub fn is_corruption(self) -> bool {
+        matches!(self, DbErrorClass::Corrupt | DbErrorClass::NotADatabase)
+    }
+
+    /// Writes cannot succeed until someone fixes the disk or the mount.
+    pub fn is_storage(self) -> bool {
+        matches!(
+            self,
+            DbErrorClass::Full | DbErrorClass::ReadOnly | DbErrorClass::Io | DbErrorClass::CantOpen
+        )
+    }
+
+    fn from_code(code: rusqlite::ErrorCode) -> Self {
+        use rusqlite::ErrorCode as C;
+        match code {
+            C::DatabaseCorrupt => DbErrorClass::Corrupt,
+            C::NotADatabase => DbErrorClass::NotADatabase,
+            C::DiskFull => DbErrorClass::Full,
+            C::ReadOnly => DbErrorClass::ReadOnly,
+            C::SystemIoFailure => DbErrorClass::Io,
+            C::CannotOpen => DbErrorClass::CantOpen,
+            C::DatabaseBusy | C::DatabaseLocked => DbErrorClass::Busy,
+            _ => DbErrorClass::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for DbErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.describe(), self.as_str())
+    }
+}
+
+/// The SQLite error class of `e`, if it is (or wraps) a SQLite failure.
+/// Errors that are about the data (a column of the wrong type, bad JSON) or
+/// the code are not database health problems and give `None`.
+pub fn classify(e: &anyhow::Error) -> Option<DbErrorClass> {
+    e.chain()
+        .find_map(|c| match c.downcast_ref::<rusqlite::Error>()? {
+            rusqlite::Error::SqliteFailure(f, _) => Some(DbErrorClass::from_code(f.code)),
+            _ => None,
+        })
+}
+
+/// What the service currently knows about the database's health.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbHealth {
+    /// Why the database is considered corrupt: a corruption error from a
+    /// statement, or `PRAGMA quick_check` problems. Cleared only by a clean
+    /// check.
+    pub corrupt: Option<String>,
+    /// A full disk, read-only database or I/O error; cleared only by a
+    /// successful write probe.
+    pub storage: Option<DbErrorClass>,
+    /// Statements that failed in a row (any statement succeeding resets it).
+    pub consecutive_failures: u32,
+    pub last_error: Option<DbErrorClass>,
+    /// The last health check did not finish in time.
+    pub unresponsive: bool,
+    /// When the last health check finished (unix seconds).
+    pub last_check: Option<i64>,
+}
+
+/// Shared, in-memory record of database errors, fed by every statement.
+#[derive(Default)]
+pub struct DbStatus {
+    inner: Mutex<StatusInner>,
+    /// Wakes the watchdog after a corruption or storage error so it checks
+    /// (and alerts) at once.
+    pub wake: tokio::sync::Notify,
+    /// A health check is running (they are never started twice, so a hung
+    /// disk cannot pile up blocking threads).
+    checking: AtomicBool,
+}
+
+#[derive(Default)]
+struct StatusInner {
+    health: DbHealth,
+    /// Bumped on every corruption error, so a check that started before one
+    /// does not clear it.
+    corruption_seen: u64,
+}
+
+impl DbStatus {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StatusInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn snapshot(&self) -> DbHealth {
+        self.lock().health.clone()
+    }
+
+    /// Why new data must not be accepted right now, if it must not.
+    pub fn refuse_writes(&self) -> Option<String> {
+        self.lock().health.corrupt.clone()
+    }
+
+    fn record_ok(&self) {
+        let mut s = self.lock();
+        s.health.consecutive_failures = 0;
+    }
+
+    /// Record a failed statement.
+    pub fn record_error(&self, class: DbErrorClass) {
+        metrics::counter!("ringmaster_db_errors_total", "class" => class.as_str()).increment(1);
+        let mut s = self.lock();
+        s.health.consecutive_failures = s.health.consecutive_failures.saturating_add(1);
+        s.health.last_error = Some(class);
+        if class == DbErrorClass::Unresponsive {
+            s.health.unresponsive = true;
+        }
+        // Wake the watchdog only for news: while a problem lasts, its own
+        // checks keep failing and must not turn into a busy loop.
+        let urgent = if class.is_corruption() {
+            s.corruption_seen += 1;
+            let new = s.health.corrupt.is_none();
+            if new {
+                s.health.corrupt = Some(class.to_string());
+            }
+            new
+        } else if class.is_storage() {
+            let new = s.health.storage != Some(class);
+            s.health.storage = Some(class);
+            new
+        } else {
+            false
+        };
+        drop(s);
+        if urgent {
+            self.wake.notify_one();
+        }
+    }
+
+    fn set_unresponsive(&self, value: bool) {
+        self.lock().health.unresponsive = value;
+    }
+}
+
+/// Outcome of [`Db::health_check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// `quick_check` passed and a write went through.
+    Healthy,
+    /// `quick_check` found problems (their count).
+    Corrupt(usize),
+    /// A statement of the check failed.
+    Failed(DbErrorClass),
+    /// The previous check has not finished yet.
+    StillRunning,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueStats {
+    /// The job that has been due the longest and its due time.
+    pub oldest_due: Option<(i64, i64)>,
+    /// Queued jobs that are due.
+    pub due: i64,
+    pub running: i64,
+}
+
 #[derive(Clone)]
 pub struct Db {
-    conn: Arc<Mutex<Connection>>,
+    conn: Arc<tokio::sync::Mutex<Connection>>,
+    path: Option<PathBuf>,
+    status: Arc<DbStatus>,
 }
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
-        Self::init(conn)
+        Self::init(conn, Some(path.to_path_buf()))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    /// The shared health record.
+    pub fn status(&self) -> &Arc<DbStatus> {
+        &self.status
+    }
+
+    fn init(conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL for concurrent readers; FULL sync because a 2xx tells the phone
         // it can forget the recording.
@@ -211,7 +440,9 @@ impl Db {
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: Arc::new(tokio::sync::Mutex::new(conn)),
+            path,
+            status: Arc::default(),
         })
     }
 
@@ -220,13 +451,109 @@ impl Db {
         F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        // Waiting for the connection happens here, not on a blocking thread.
+        let mut guard = self.conn.clone().lock_owned().await;
+        let result = tokio::task::spawn_blocking(move || f(&mut guard))
+            .await
+            .context("database task panicked")?;
+        match &result {
+            Ok(_) => self.status.record_ok(),
+            Err(e) => {
+                if let Some(class) = classify(e) {
+                    self.status.record_error(class);
+                }
+            }
+        }
+        result
+    }
+
+    /// Check the database file: `PRAGMA quick_check` on a fresh connection
+    /// (so the main connection's page cache cannot hide damage on disk) and
+    /// a one-page write probe (a full disk or read-only mount fails it).
+    /// Updates [`DbStatus`]. Never runs twice at once; bounded by `limit`.
+    pub async fn health_check(&self, now: i64, limit: std::time::Duration) -> CheckOutcome {
+        if self.status.checking.swap(true, Ordering::SeqCst) {
+            self.status.set_unresponsive(true);
+            return CheckOutcome::StillRunning;
+        }
+        let seen_before = self.status.lock().corruption_seen;
+        let path = self.path.clone();
+        let status = self.status.clone();
         let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-            f(&mut guard)
+        // The main connection is held while the check runs: the probe's
+        // write on a second connection would otherwise make the main
+        // connection's deferred transactions fail with SQLITE_BUSY (WAL
+        // cannot wait to upgrade a read to a write).
+        let task = tokio::spawn(async move {
+            let mut guard = conn.lock_owned().await;
+            let out = tokio::task::spawn_blocking(move || match path {
+                Some(path) => check_file(&path),
+                // In memory (tests): the main connection is all there is.
+                None => check_conn(&mut guard),
+            })
+            .await
+            .unwrap_or(CheckOutcome::Failed(DbErrorClass::Other));
+            status.checking.store(false, Ordering::SeqCst);
+            out
+        });
+        let outcome = match tokio::time::timeout(limit, task).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => CheckOutcome::Failed(DbErrorClass::Other),
+            Err(_) => {
+                // The task is left to finish on its own; `checking` stays
+                // set until it does, so no second one is started.
+                self.status.set_unresponsive(true);
+                return CheckOutcome::Failed(DbErrorClass::Unresponsive);
+            }
+        };
+        {
+            let mut s = self.status.lock();
+            s.health.unresponsive = false;
+            s.health.last_check = Some(now);
+            match &outcome {
+                CheckOutcome::Healthy => {
+                    if s.corruption_seen == seen_before {
+                        s.health.corrupt = None;
+                    }
+                    s.health.storage = None;
+                    s.health.consecutive_failures = 0;
+                }
+                CheckOutcome::Corrupt(n) => {
+                    s.health.corrupt = Some(format!("PRAGMA quick_check found {n} problem(s)"));
+                }
+                CheckOutcome::Failed(_) | CheckOutcome::StillRunning => {}
+            }
+        }
+        if let CheckOutcome::Failed(class) = outcome {
+            self.status.record_error(class);
+        }
+        outcome
+    }
+
+    /// Due and running jobs, for the stalled-queue check.
+    pub async fn queue_stats(&self, now: i64) -> Result<QueueStats> {
+        self.call(move |c| {
+            let oldest_due = c
+                .query_row(
+                    "SELECT id, next_attempt_at FROM jobs WHERE status = 'queued' \
+                     AND next_attempt_at <= ?1 ORDER BY next_attempt_at, id LIMIT 1",
+                    [now],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let (due, running) = c.query_row(
+                "SELECT COALESCE(SUM(status = 'queued' AND next_attempt_at <= ?1), 0), \
+                 COALESCE(SUM(status = 'running'), 0) FROM jobs WHERE status IN ('queued', 'running')",
+                [now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok(QueueStats {
+                oldest_due,
+                due,
+                running,
+            })
         })
         .await
-        .context("database task panicked")?
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -752,6 +1079,53 @@ pub fn now() -> i64 {
     jiff::Timestamp::now().as_second()
 }
 
+fn check_file(path: &Path) -> CheckOutcome {
+    use rusqlite::OpenFlags;
+    // Never create a missing file: that would hide a deleted database.
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut conn = match Connection::open_with_flags(path, flags) {
+        Ok(c) => c,
+        Err(e) => return CheckOutcome::Failed(class_of(&e)),
+    };
+    if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+        return CheckOutcome::Failed(class_of(&e));
+    }
+    check_conn(&mut conn)
+}
+
+fn check_conn(conn: &mut Connection) -> CheckOutcome {
+    let problems = (|| -> rusqlite::Result<Vec<String>> {
+        let mut st = conn.prepare("PRAGMA quick_check")?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })();
+    let problems = match problems {
+        Ok(rows) => rows,
+        Err(e) => return CheckOutcome::Failed(class_of(&e)),
+    };
+    if problems.len() != 1 || problems[0] != "ok" {
+        // The details go to the log only (they name pages and indexes).
+        tracing::error!(problems = ?problems.iter().take(10).collect::<Vec<_>>(), "PRAGMA quick_check failed");
+        return CheckOutcome::Corrupt(problems.len());
+    }
+    // Rewrites the header page: a full disk or a read-only file fails here.
+    let probe = format!("BEGIN IMMEDIATE; PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;");
+    if let Err(e) = conn.execute_batch(&probe) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return CheckOutcome::Failed(class_of(&e));
+    }
+    CheckOutcome::Healthy
+}
+
+fn class_of(e: &rusqlite::Error) -> DbErrorClass {
+    match e {
+        rusqlite::Error::SqliteFailure(f, _) => DbErrorClass::from_code(f.code),
+        _ => DbErrorClass::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,6 +1352,140 @@ mod tests {
             db.get_job(job_id).await.unwrap().unwrap().status,
             JobStatus::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn corruption_on_disk_is_found_and_cleared_by_a_clean_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let db = Db::open(&path).unwrap();
+        db.insert_delivery(delivery("a", Some("command")), true)
+            .await
+            .unwrap();
+        let limit = std::time::Duration::from_secs(10);
+        assert_eq!(db.health_check(1, limit).await, CheckOutcome::Healthy);
+        assert_eq!(db.status().snapshot().last_check, Some(1));
+
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let good = std::fs::read(&path).unwrap();
+        let mut bad = good.clone();
+        bad[..16].copy_from_slice(b"not a database!!");
+        std::fs::write(&path, &bad).unwrap();
+
+        assert_eq!(
+            db.health_check(2, limit).await,
+            CheckOutcome::Failed(DbErrorClass::NotADatabase)
+        );
+        let h = db.status().snapshot();
+        assert!(
+            h.corrupt.as_deref().unwrap().contains("SQLITE_NOTADB"),
+            "{h:?}"
+        );
+        assert!(db.status().refuse_writes().is_some());
+
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(db.health_check(3, limit).await, CheckOutcome::Healthy);
+        assert_eq!(db.status().snapshot().corrupt, None);
+        assert!(db.status().refuse_writes().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn health_checks_never_make_other_statements_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("c.db")).unwrap();
+        db.insert_delivery(delivery("a", Some("command")), true)
+            .await
+            .unwrap();
+        let checker = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for i in 0..100 {
+                    let out = db.health_check(i, std::time::Duration::from_secs(10)).await;
+                    assert!(
+                        matches!(out, CheckOutcome::Healthy | CheckOutcome::StillRunning),
+                        "{out:?}"
+                    );
+                }
+            })
+        };
+        // Read-then-write transactions, as the sweeps and `decide` run.
+        for i in 0..300 {
+            db.take_expired_audio(0).await.unwrap();
+            db.expire_confirmations(i).await.unwrap();
+        }
+        checker.await.unwrap();
+        assert_eq!(db.status().snapshot().consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn failing_statements_are_classified_and_a_write_probe_clears_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("r.db")).unwrap();
+        // Writes on this connection now fail with SQLITE_READONLY.
+        db.call(|c| Ok(c.pragma_update(None, "query_only", true)?))
+            .await
+            .unwrap();
+        for id in ["a", "b", "c"] {
+            assert!(
+                db.insert_delivery(delivery(id, Some("command")), true)
+                    .await
+                    .is_err()
+            );
+        }
+        let h = db.status().snapshot();
+        assert_eq!(h.storage, Some(DbErrorClass::ReadOnly));
+        assert_eq!(h.consecutive_failures, 3);
+        assert_eq!(h.last_error, Some(DbErrorClass::ReadOnly));
+        // A read does not prove writes work again...
+        db.queue_depth().await.unwrap();
+        assert_eq!(db.status().snapshot().consecutive_failures, 0);
+        assert_eq!(db.status().snapshot().storage, Some(DbErrorClass::ReadOnly));
+        // ...a write probe does.
+        db.call(|c| Ok(c.pragma_update(None, "query_only", false)?))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.health_check(5, std::time::Duration::from_secs(10)).await,
+            CheckOutcome::Healthy
+        );
+        assert_eq!(db.status().snapshot().storage, None);
+        // Errors about the data are not database health problems.
+        let data = anyhow::Error::new(rusqlite::Error::InvalidColumnType(
+            0,
+            "x".into(),
+            rusqlite::types::Type::Null,
+        ));
+        assert_eq!(classify(&data), None);
+        let full = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        ))
+        .context("inserting");
+        assert_eq!(classify(&full), Some(DbErrorClass::Full));
+    }
+
+    #[tokio::test]
+    async fn queue_stats_report_the_oldest_due_job() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["a", "b"] {
+            db.insert_delivery(delivery(id, Some("command")), true)
+                .await
+                .unwrap();
+        }
+        let job = ready(db.claim_next_job(1000, &[]).await.unwrap());
+        let s = db.queue_stats(1600).await.unwrap();
+        assert_eq!(
+            s,
+            QueueStats {
+                oldest_due: Some((job.id + 1, 1000)),
+                due: 1,
+                running: 1
+            }
+        );
+        assert_eq!(db.queue_stats(999).await.unwrap().due, 0);
     }
 
     #[tokio::test]

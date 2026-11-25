@@ -24,7 +24,15 @@ pub enum Kind {
     },
     /// Informational (e.g. test event received).
     Info,
+    /// An operational alert for the operator (database, stalled queue);
+    /// `reminder` while a problem lasts.
+    Alert { reminder: bool },
+    /// An operational problem has cleared.
+    Recovered,
 }
+
+/// ntfy tag on every operational alert and recovery, to filter on.
+pub const ALERT_TAG: &str = "ringmaster-alert";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
@@ -58,6 +66,14 @@ pub struct NtfyNotifier {
 }
 
 impl NtfyNotifier {
+    /// The same server and token, publishing to `topic` (alerts may have
+    /// their own topic).
+    pub fn with_topic(cfg: &NtfyConfig, topic: &str, token: Option<String>) -> Result<Self> {
+        let mut n = Self::new(cfg, token)?;
+        n.topic = topic.to_string();
+        Ok(n)
+    }
+
     pub fn new(cfg: &NtfyConfig, token: Option<String>) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -78,6 +94,9 @@ impl NtfyNotifier {
             Kind::Error => (4, vec!["warning"]),
             Kind::Confirm { .. } => (5, vec!["question"]),
             Kind::Info => (2, vec!["information_source"]),
+            Kind::Alert { reminder: false } => (5, vec!["rotating_light", ALERT_TAG]),
+            Kind::Alert { reminder: true } => (4, vec!["rotating_light", ALERT_TAG]),
+            Kind::Recovered => (3, vec!["heavy_check_mark", ALERT_TAG]),
         };
         let mut body = json!({
             "topic": self.topic,
@@ -215,6 +234,45 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn alerts_have_their_own_topic_priority_and_tag() {
+        let server = MockServer::start().await;
+        for (title, priority, tag) in [
+            ("a", 5, "rotating_light"),
+            ("r", 4, "rotating_light"),
+            ("ok", 3, "heavy_check_mark"),
+        ] {
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({
+                    "topic": "ops", "title": title, "priority": priority,
+                    "tags": [tag, ALERT_TAG],
+                })))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let cfg = NtfyConfig {
+            url: server.uri(),
+            topic: "ring".into(),
+            action_headers: Default::default(),
+        };
+        let n = NtfyNotifier::with_topic(&cfg, "ops", None).unwrap();
+        for (title, kind) in [
+            ("a", Kind::Alert { reminder: false }),
+            ("r", Kind::Alert { reminder: true }),
+            ("ok", Kind::Recovered),
+        ] {
+            n.send(&Notification {
+                title: title.into(),
+                body: "b".into(),
+                kind,
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[tokio::test]
