@@ -248,6 +248,17 @@ impl McpBackend {
         Ok(c)
     }
 
+    /// `text` with this server's credential header values redacted (rmcp
+    /// errors can quote what the server sent back).
+    fn redact(&self, server: &str, text: &str) -> String {
+        match self.headers.get(server) {
+            Some(h) => {
+                crate::config::redact_credentials(text, h.values().filter_map(|v| v.to_str().ok()))
+            }
+            None => text.to_string(),
+        }
+    }
+
     async fn list_one(&self, name: &str) -> Result<Vec<DiscoveredTool>> {
         let mut last = None;
         for fresh in [false, true] {
@@ -283,10 +294,9 @@ impl ToolBackend for McpBackend {
     async fn list_tools(&self, servers: &[String]) -> Result<Vec<DiscoveredTool>, ToolError> {
         let mut all = Vec::new();
         for name in servers {
-            let tools = self
-                .list_one(name)
-                .await
-                .map_err(|e| ToolError::Unreachable(name.clone(), e.to_string()))?;
+            let tools = self.list_one(name).await.map_err(|e| {
+                ToolError::Unreachable(name.clone(), self.redact(name, &e.to_string()))
+            })?;
             all.extend(tools);
         }
         Ok(all)
@@ -306,7 +316,7 @@ impl ToolBackend for McpBackend {
             let client = match self.client(server, fresh).await {
                 Ok(c) => c,
                 Err(e) => {
-                    last = Some(e.to_string());
+                    last = Some(self.redact(server, &e.to_string()));
                     continue;
                 }
             };
@@ -319,7 +329,8 @@ impl ToolBackend for McpBackend {
                 }
                 Ok(Err(rmcp::ServiceError::McpError(e))) => {
                     return Ok(ToolOutput {
-                        text: format!("MCP error {}: {}", e.code.0, e.message),
+                        text: self
+                            .redact(server, &format!("MCP error {}: {}", e.code.0, e.message)),
                         is_error: true,
                     });
                 }
@@ -327,10 +338,10 @@ impl ToolBackend for McpBackend {
                 | Ok(Err(e @ rmcp::ServiceError::TransportSend(_)))
                     if !fresh =>
                 {
-                    last = Some(e.to_string());
+                    last = Some(self.redact(server, &e.to_string()));
                     continue;
                 }
-                Ok(Err(e)) => return Err(ToolError::Other(e.to_string())),
+                Ok(Err(e)) => return Err(ToolError::Other(self.redact(server, &e.to_string()))),
                 Err(_) => {
                     return Err(ToolError::Other(format!(
                         "timed out after {}s",
@@ -388,6 +399,32 @@ fn render_content<T: Serialize>(content: &[T], structured: Option<&Value>) -> St
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn mcp_errors_are_redacted_and_headers_sensitive() {
+        let b = McpBackend::new(
+            vec![],
+            [(
+                "home".to_string(),
+                vec![
+                    (
+                        "Authorization".to_string(),
+                        "Bearer mcp-tok-123456".to_string(),
+                    ),
+                    ("X-Api-Key".to_string(), "mcp-key-abcdef".to_string()),
+                ],
+            )]
+            .into(),
+            Duration::from_secs(1),
+        );
+        assert!(b.headers["home"].values().all(HeaderValue::is_sensitive));
+        assert!(!format!("{:?}", b.headers).contains("mcp-tok-123456"));
+        assert_eq!(
+            b.redact("home", "401: got Bearer mcp-tok-123456 and mcp-key-abcdef"),
+            "401: got [redacted] and [redacted]"
+        );
+        assert_eq!(b.redact("other", "mcp-key-abcdef"), "mcp-key-abcdef");
+    }
 
     fn tool(server: &str, name: &str) -> DiscoveredTool {
         DiscoveredTool {

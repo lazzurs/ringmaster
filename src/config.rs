@@ -597,6 +597,49 @@ pub fn secret_from_env(name: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// `value` as a request header carrying a credential: marked sensitive, so
+/// it prints as `Sensitive` in `Debug` output (requests, header maps, the
+/// clients holding it) and HTTP/2 never adds it to the HPACK table. `None`
+/// if it is not a valid header value; the value itself is never reported.
+pub fn credential_header(value: &str) -> Option<reqwest::header::HeaderValue> {
+    let mut v = reqwest::header::HeaderValue::from_str(value).ok()?;
+    v.set_sensitive(true);
+    Some(v)
+}
+
+/// `text` with every credential replaced by `[redacted]`, for error strings
+/// built from what a server sent back (a misbehaving proxy can echo request
+/// headers). A value with an auth scheme (`Bearer <token>`) also has the bare
+/// token removed. Values shorter than 4 characters are left alone.
+pub fn redact_credentials<'a>(
+    text: &str,
+    credentials: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut out = text.to_string();
+    for c in credentials {
+        let c = c.trim();
+        let token = c.split_once(' ').map_or(c, |(_, t)| t.trim());
+        for needle in [c, token] {
+            if needle.len() >= 4 && out.contains(needle) {
+                out = out.replace(needle, "[redacted]");
+            }
+        }
+    }
+    out
+}
+
+/// A URL for display (`check-config`, error messages) with any password in
+/// it replaced by `***`. Text that does not parse as a URL is returned as is.
+pub fn display_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut u) if u.password().is_some() => {
+            let _ = u.set_password(Some("***"));
+            u.to_string()
+        }
+        _ => raw.to_string(),
+    }
+}
+
 impl Secrets {
     pub fn from_env(config: &Config) -> Result<Self> {
         let (mcp_headers, mut warnings) = mcp_headers(&config.mcp_servers, secret_from_env);
@@ -811,7 +854,10 @@ impl Config {
             let s = self.provider_settings(p);
             match url::Url::parse(&s.base_url) {
                 Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
-                _ => bail!("{p} base_url {:?} is not an http(s) URL", s.base_url),
+                _ => bail!(
+                    "{p} base_url {:?} is not an http(s) URL",
+                    display_url(&s.base_url)
+                ),
             }
             if let Some(m) = &t.model
                 && m.trim().is_empty()
@@ -829,6 +875,14 @@ impl Config {
             }
             if let Some(u) = &t.app_url {
                 url::Url::parse(u).with_context(|| format!("[llm.{p}] app_url {u:?}"))?;
+                if reqwest::header::HeaderValue::from_str(u).is_err() {
+                    bail!("[llm.{p}] app_url {u:?} is not a valid HTTP header value");
+                }
+            }
+            if let Some(t) = &t.app_title
+                && reqwest::header::HeaderValue::from_str(t).is_err()
+            {
+                bail!("[llm.{p}] app_title {t:?} must be printable ASCII (it is sent as a header)");
             }
         }
         Ok(())
@@ -1214,6 +1268,45 @@ basic_auth = { username = "x", password_env = "UNSET" }
         assert_eq!(m.base_url, "https://api.mistral.ai");
         assert_eq!(m.api_key_env.as_deref(), Some("MISTRAL_API_KEY"));
         assert_eq!(m.max_tokens, None);
+    }
+
+    #[test]
+    fn credentials_are_redacted_from_text() {
+        let text =
+            "echo: Authorization: Bearer tok-123456; X-Api-Key: key-abcdef; Basic dXNlcjpwYXNz";
+        assert_eq!(
+            redact_credentials(
+                text,
+                [
+                    "Bearer tok-123456",
+                    "key-abcdef",
+                    "Basic dXNlcjpwYXNz",
+                    "ab",
+                    ""
+                ]
+            ),
+            "echo: Authorization: [redacted]; X-Api-Key: [redacted]; [redacted]"
+        );
+        assert_eq!(redact_credentials("Bearer x", None::<&str>), "Bearer x");
+    }
+
+    #[test]
+    fn display_url_hides_passwords() {
+        assert_eq!(
+            display_url("https://ring:s3cret-pw@ollama.example/"),
+            "https://ring:***@ollama.example/"
+        );
+        assert_eq!(display_url("http://m1.lan:11434"), "http://m1.lan:11434");
+        assert_eq!(display_url("not a url"), "not a url");
+        let e =
+            Config::from_toml("[llm.ollama]\nbase_url = \"ftp://u:s3cret-pw@host\"\n").unwrap_err();
+        assert!(!format!("{e:#}").contains("s3cret-pw"), "{e:#}");
+    }
+
+    #[test]
+    fn attribution_headers_must_be_valid_header_values() {
+        assert!(Config::from_toml("[llm.openrouter]\napp_title = \"Ringmaster\"\n").is_ok());
+        assert!(Config::from_toml("[llm.openrouter]\napp_title = \"Ring\\nmaster\"\n").is_err());
     }
 
     #[test]

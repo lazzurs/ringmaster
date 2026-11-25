@@ -103,7 +103,8 @@ timeouts, default model) whether it is the default or only used by some
 profiles, and wins over `[llm]`. A model must be given for every provider
 except Anthropic: Ringmaster does not guess model names. `check-config`
 fails on an unknown provider, a missing model, or an effort the provider
-does not accept, and prints each profile's provider, model and endpoint.
+does not accept, and prints each profile's provider, model and endpoint
+(with any password in the URL masked).
 
 Only the providers that are actually used (the default, if any profile
 relies on it, and every profile's `provider`) need their API key; the
@@ -174,6 +175,9 @@ back as results starting with `Error:`.
   even though they arrive as 429.
 * **Reasoning round trips**: Mistral's thinking chunks and OpenRouter's
   `reasoning_details` are echoed back unchanged on the next turn.
+* **Redirects are not followed**: a key header would go along to the new
+  address. A `base_url` that redirects fails with an error naming the
+  target; set `base_url` to that final address.
 * **OpenRouter attribution**: set `[llm.openrouter] app_url` and `app_title`
   to send `HTTP-Referer` and `X-OpenRouter-Title`. Both are optional.
 * **OpenAI models**: Ringmaster uses Chat Completions. Some current models

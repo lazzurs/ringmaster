@@ -124,11 +124,14 @@ outages and pending confirmations resume where they stopped.
 6. **Secrets come only from environment variables or `<NAME>_FILE`**
    (`config::secret_from_env`). Never add secret values to config structs,
    log lines, audit entries or `Debug` output (`Secrets` has a redacting
-   `Debug`). MCP credential headers are marked sensitive
-   (`HeaderValue::set_sensitive` in `McpBackend::new`); ntfy uses
-   `bearer_auth`. Note: LLM key headers built in `src/claude.rs` and
-   `src/llm/chat.rs` are passed as plain strings to `Transport`, which does
-   not mark them sensitive; do so if you touch that code.
+   `Debug`). Every credential header is a sensitive `HeaderValue`: LLM keys
+   via `config::credential_header` (held as such by `ClaudeClient` and
+   `ChatCompletions`), MCP headers in `McpBackend::new`, ntfy via
+   `bearer_auth`. Error text built from a server's reply goes through
+   `config::redact_credentials` (`transport::redact` for LLMs). The LLM
+   `Transport` never follows redirects (`x-api-key` would follow one to
+   another host). Request spans log the route template, not the path
+   (confirmation tokens). `tests/log_redaction.rs` checks the logs.
 7. **Persisted `AgentState` stays backwards compatible.** Jobs saved by older
    versions must still deserialise and resume: new fields get
    `#[serde(default)]` (see `provider`, `final_text`, `unavailable`), never

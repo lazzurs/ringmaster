@@ -1644,6 +1644,45 @@ async fn state_saved_before_providers_still_resumes() {
 }
 
 #[tokio::test]
+async fn provider_errors_echoing_the_key_are_redacted_everywhere() {
+    // A provider (or a proxy in front of it) that quotes the request's
+    // credentials in its error body.
+    for (config, key) in [
+        (CONFIG.to_string(), "sk-test"),
+        (
+            config_with("[llm]\nprovider = \"openai\"\nmodel = \"gpt-6.2-sol\"\nmax_retries = 0\n"),
+            "sk-openai-test",
+        ),
+    ] {
+        let h = harness_config(
+            &config,
+            vec![json!({"__status": 401, "__body": {"error": {
+                "type": "authentication_error",
+                "message": format!("invalid credentials: x-api-key={key}, Authorization: Bearer {key}"),
+            }}})],
+            Some("Turn on the kitchen lights."),
+            |home| vec![home],
+        )
+        .await;
+        run_command(&h, "redact-1", "double-click-hold").await;
+
+        let notes = h.notes.take();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].kind, Kind::Error);
+        assert!(notes[0].body.contains("[redacted]"), "{}", notes[0].body);
+        assert!(!format!("{notes:?}").contains(key), "{notes:?}");
+        let audit = format!("{:?}", h.db.audit_entries(1).await.unwrap());
+        assert!(audit.contains("[redacted]"), "{audit}");
+        assert!(!audit.contains(key), "{audit}");
+        let last_error: Option<String> = rusqlite::Connection::open(&h.db_path)
+            .unwrap()
+            .query_row("SELECT last_error FROM jobs WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(!last_error.unwrap_or_default().contains(key));
+    }
+}
+
+#[tokio::test]
 async fn missing_key_for_unused_provider_is_fine() {
     use ringmaster::config::Secrets;
     let config = Config::from_toml(&config_with(

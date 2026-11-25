@@ -135,10 +135,10 @@ impl Notifier for NtfyNotifier {
             .increment(1);
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            bail!(
-                "ntfy returned {status}: {}",
-                text.chars().take(200).collect::<String>()
-            );
+            let text: String = text.chars().take(200).collect();
+            // In case a proxy echoes the request back.
+            let text = crate::config::redact_credentials(&text, self.token.as_deref());
+            bail!("ntfy returned {status}: {text}");
         }
         Ok(())
     }
@@ -242,5 +242,38 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn errors_never_echo_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("bad token: Bearer tk_0123456789"),
+            )
+            .mount(&server)
+            .await;
+        let n = NtfyNotifier::new(
+            &NtfyConfig {
+                url: server.uri(),
+                topic: "ring".into(),
+                action_headers: Default::default(),
+            },
+            Some("tk_0123456789".into()),
+        )
+        .unwrap();
+        let err = n
+            .send(&Notification {
+                title: "t".into(),
+                body: "b".into(),
+                kind: Kind::Result,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("401") && !err.contains("tk_0123456789"),
+            "{err}"
+        );
     }
 }

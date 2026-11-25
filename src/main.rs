@@ -124,7 +124,7 @@ async fn main() -> ExitCode {
                             "  profile {name}: {} {} at {}{}",
                             choice.provider,
                             choice.model,
-                            s.base_url,
+                            ringmaster::config::display_url(&s.base_url),
                             s.api_key_env
                                 .map(|v| format!(" (key from {v})"))
                                 .unwrap_or_default()
