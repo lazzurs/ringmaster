@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
 use rmcp::service::RunningService;
 use rmcp::transport::StreamableHttpClientTransport;
@@ -172,7 +173,8 @@ type Client = RunningService<RoleClient, ClientConfig>;
 /// re-opened once if a call fails on a dead session.
 pub struct McpBackend {
     servers: Vec<McpServerConfig>,
-    tokens: HashMap<String, String>,
+    /// Per-server request headers (credentials included), already validated.
+    headers: HashMap<String, HashMap<HeaderName, HeaderValue>>,
     timeout: Duration,
     clients: Mutex<HashMap<String, Arc<Client>>>,
 }
@@ -180,12 +182,28 @@ pub struct McpBackend {
 impl McpBackend {
     pub fn new(
         servers: Vec<McpServerConfig>,
-        tokens: HashMap<String, String>,
+        headers: crate::config::McpHeaders,
         timeout: Duration,
     ) -> Self {
+        let headers = headers
+            .into_iter()
+            .map(|(server, list)| {
+                let map = list
+                    .into_iter()
+                    .filter_map(|(n, v)| {
+                        let name = HeaderName::from_bytes(n.as_bytes()).ok()?;
+                        let mut value = HeaderValue::from_str(&v).ok()?;
+                        // Keep credentials out of debug output.
+                        value.set_sensitive(true);
+                        Some((name, value))
+                    })
+                    .collect();
+                (server, map)
+            })
+            .collect();
         Self {
             servers,
-            tokens,
+            headers,
             timeout,
             clients: Mutex::new(HashMap::new()),
         }
@@ -199,8 +217,8 @@ impl McpBackend {
             .with_context(|| format!("unknown MCP server {name}"))?;
         let mut tcfg = StreamableHttpClientTransportConfig::with_uri(cfg.url.clone())
             .reinit_on_expired_session(true);
-        if let Some(tok) = self.tokens.get(name) {
-            tcfg = tcfg.auth_header(tok.clone());
+        if let Some(h) = self.headers.get(name) {
+            tcfg = tcfg.custom_headers(h.clone());
         }
         let transport = StreamableHttpClientTransport::from_config(tcfg);
         let info = ClientConfig::new(

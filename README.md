@@ -134,7 +134,9 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `retention.audio_days` | `30` | delete recordings after this (0 keeps them) |
 | `notify.ntfy.url` / `.topic` | `https://ntfy.sh` / required | |
 | `notify.ntfy.action_headers` | `{}` | headers the phone sends with Approve/Deny |
-| `[[mcp_servers]]` `name`, `url`, `token_env` | | streamable HTTP MCP servers |
+| `[[mcp_servers]]` `name`, `url`, `token_env` | | streamable HTTP MCP servers; `token_env` sends `Authorization: Bearer` |
+| `[[mcp_servers]]` `basic_auth` | | `{ username = "...", password_env = "VAR" }`: HTTP Basic, e.g. a Nextcloud app password; takes precedence over `token_env` |
+| `[[mcp_servers]]` `headers_env` | | `{ "X-Api-Key" = "VAR" }`: extra headers, values from environment variables |
 | `[[tool_policies]]` `match`, `policy` | | glob over `server/tool`; `allow` `confirm` `deny`; first match wins |
 | `[profiles.<name>]` `triggers`, `system_prompt`, `tools` | | gesture → prompt + tool allow-list (globs; `*/*` = all) |
 | `[profiles.<name>]` `model`, `effort`, `max_iterations`, `job_max_age_secs` | | per-profile overrides |

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use ringmaster::agent::Agent;
@@ -302,7 +302,7 @@ async fn harness_with(
     config.mcp_servers = servers(McpServerConfig {
         name: "home".into(),
         url: mcp_url,
-        token_env: None,
+        ..Default::default()
     });
     let config = Arc::new(config);
 
@@ -724,7 +724,7 @@ fn dead_server(name: &str) -> McpServerConfig {
     McpServerConfig {
         name: name.into(),
         url: format!("http://127.0.0.1:{port}/mcp"),
-        token_env: None,
+        ..Default::default()
     }
 }
 
@@ -871,7 +871,7 @@ async fn hung_server_is_skipped_quickly() {
             McpServerConfig {
                 name: "slow".into(),
                 url: format!("http://127.0.0.1:{port}/mcp"),
-                token_env: None,
+                ..Default::default()
             },
         ]
     })
@@ -896,6 +896,41 @@ async fn hung_server_is_skipped_quickly() {
         "{}",
         notes[0].body
     );
+}
+
+#[tokio::test]
+async fn mcp_requests_carry_configured_headers() {
+    use ringmaster::tools::ToolBackend;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("authorization", "Basic cm9iOmFwcC1wYXNz"))
+        .and(header("x-extra", "v"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let backend = McpBackend::new(
+        vec![McpServerConfig {
+            name: "nc".into(),
+            url: format!("{}/mcp", server.uri()),
+            ..Default::default()
+        }],
+        [(
+            "nc".to_string(),
+            vec![
+                (
+                    "Authorization".to_string(),
+                    "Basic cm9iOmFwcC1wYXNz".to_string(),
+                ),
+                ("X-Extra".to_string(), "v".to_string()),
+            ],
+        )]
+        .into(),
+        Duration::from_secs(5),
+    );
+    // The mock answers 503, so listing fails; what matters is what was sent.
+    assert!(backend.list_tools(&["nc".to_string()]).await.is_err());
+    server.verify().await;
 }
 
 #[tokio::test]

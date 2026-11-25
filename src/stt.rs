@@ -245,10 +245,15 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_server_is_transient() {
-        // Nothing listens on this port once the server is dropped.
-        let gone = MockServer::start().await;
-        let url = gone.uri();
-        drop(gone);
+        // Nothing listens on this port once the listener is dropped. (Not a
+        // dropped MockServer: wiremock pools those and hands them to other
+        // tests running at the same time.)
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
         let t = Transcriber::new(SttConfig {
             primary_url: Some(url),
             connect_timeout_secs: 1,
