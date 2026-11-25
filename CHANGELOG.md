@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/lazzurs/ringmaster/compare/v0.1.2...v0.1.3) (2026-11-25)
+
+
+### Features
+
+* support OpenAI, Mistral, OpenRouter and Ollama as LLM providers ([#11](https://github.com/lazzurs/ringmaster/issues/11)) ([25a3b9d](https://github.com/lazzurs/ringmaster/commit/25a3b9d488ee678aa639948690114d3f6b3f5c89))
+
 ## [0.1.2](https://github.com/lazzurs/ringmaster/compare/v0.1.1...v0.1.2) (2026-11-25)
 
 
