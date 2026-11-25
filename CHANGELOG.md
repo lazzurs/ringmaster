@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/lazzurs/ringmaster/compare/v0.1.1...v0.1.2) (2026-11-25)
+
+
+### Features
+
+* HTTP Basic auth and custom headers for MCP servers ([#9](https://github.com/lazzurs/ringmaster/issues/9)) ([40ac6e6](https://github.com/lazzurs/ringmaster/commit/40ac6e6c6c213fae635c4262f200cc2335a963c8))
+
 ## [0.1.1](https://github.com/lazzurs/ringmaster/compare/v0.1.0...v0.1.1) (2026-11-24)
 
 
