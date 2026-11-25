@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/lazzurs/ringmaster/compare/v0.1.3...v0.1.4) (2026-11-25)
+
+
+### Documentation
+
+* add AGENTS.md and relicense under GPL-3.0-or-later ([#13](https://github.com/lazzurs/ringmaster/issues/13)) ([6f80f02](https://github.com/lazzurs/ringmaster/commit/6f80f0221ee05cf2a2131adcc574d797b4992511))
+
 ## [0.1.3](https://github.com/lazzurs/ringmaster/compare/v0.1.2...v0.1.3) (2026-11-25)
 
 
