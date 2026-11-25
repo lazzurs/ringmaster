@@ -31,7 +31,7 @@ use ringmaster::llm::{Llms, Provider};
 use ringmaster::notify::{Kind, Notification, Notifier};
 use ringmaster::signature;
 use ringmaster::stt::Transcriber;
-use ringmaster::tools::McpBackend;
+use ringmaster::tools::{DiscoveredTool, McpBackend, ToolBackend, ToolError, ToolOutput};
 use ringmaster::worker::Worker;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef-test";
@@ -294,6 +294,17 @@ async fn harness_config(
     whisper_text: Option<&str>,
     servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
 ) -> Harness {
+    harness_full(config_text, turns, whisper_text, servers, |t| t).await
+}
+
+/// `harness_config`, with the MCP backend wrapped by `wrap_tools`.
+async fn harness_full(
+    config_text: &str,
+    turns: Vec<Value>,
+    whisper_text: Option<&str>,
+    servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
+    wrap_tools: impl FnOnce(Arc<dyn ToolBackend>) -> Arc<dyn ToolBackend>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (mcp_url, mcp_calls, mcp_stop) = start_mcp().await;
 
@@ -360,11 +371,11 @@ async fn harness_config(
     .map(|(p, k)| (p, k.to_string()))
     .collect();
     let llms = Llms::new(&config, &keys).unwrap();
-    let tools = Arc::new(McpBackend::new(
+    let tools = wrap_tools(Arc::new(McpBackend::new(
         config.mcp_servers.clone(),
         Default::default(),
         Duration::from_secs(10),
-    ));
+    )));
     let agent =
         Arc::new(Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone()).unwrap());
     let wake = Arc::new(Notify::new());
@@ -1673,4 +1684,357 @@ async fn missing_key_for_unused_provider_is_fine() {
     assert!(err.contains("OPENAI_API_KEY"), "{err}");
     secrets.llm_keys.insert(Provider::OpenAi, "sk".into());
     config.validate_runtime(&secrets).unwrap();
+}
+
+// ------------------------------------------------- one job never blocks the rest
+
+/// The test config with extra `[agent]` keys.
+fn config_agent(extra: &str) -> String {
+    let anchor = "tool_discovery_timeout_secs = 2\n";
+    assert!(CONFIG.contains(anchor));
+    CONFIG.replace(anchor, &format!("{anchor}{extra}\n"))
+}
+
+async fn queue_command(h: &Harness, delivery: &str, phone_text: &str) {
+    let (ct, body) = multipart(Some(TONE), Some(phone_text), false);
+    let (status, text) = send(
+        h,
+        signed_request(delivery, "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+}
+
+fn job_row(h: &Harness, id: i64) -> (String, Option<String>) {
+    let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+    conn.query_row(
+        "SELECT status, last_error FROM jobs WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// Model requests whose body contains `marker` never get an answer.
+async fn hang_requests_containing(h: &Harness, marker: &str) {
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::body_string_contains(marker))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(600)))
+        .with_priority(1)
+        .mount(&h._servers[1])
+        .await;
+}
+
+#[tokio::test]
+async fn unreadable_job_at_the_head_is_quarantined_and_the_queue_moves_on() {
+    // Whisper is down, so each job's transcript is its phone transcription.
+    let h = harness(vec![final_turn("Hall light on.")], None).await;
+    queue_command(&h, "bad-1", "add milk to the shopping list").await;
+    queue_command(&h, "good-2", "turn on the hall light").await;
+    {
+        // A state no version of Ringmaster can read, at the head of the queue.
+        let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+        conn.execute(
+            "UPDATE jobs SET agent_state = '{\"messages\": 42, garbage' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    }
+
+    tick(&h).await;
+
+    let good = h.db.get_job(2).await.unwrap().unwrap();
+    assert_eq!(good.status, JobStatus::Done);
+    let (status, error) = job_row(&h, 1);
+    assert_eq!(status, "failed");
+    let error = error.unwrap();
+    assert!(error.contains("quarantined"), "{error}");
+    assert!(error.contains("decoding agent state"), "{error}");
+
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    let failed = notes
+        .iter()
+        .find(|n| n.title == "Ringmaster: failed")
+        .expect("the quarantined job is reported");
+    assert_eq!(failed.kind, Kind::Error);
+    assert!(failed.body.contains("could not be read"), "{}", failed.body);
+    // The request is not lost: what the user said is in the notification.
+    assert!(
+        failed.body.contains("add milk to the shopping list"),
+        "{}",
+        failed.body
+    );
+    assert!(notes.iter().any(|n| n.body == "Hall light on."));
+
+    let kinds: Vec<String> =
+        h.db.audit_entries(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+    assert!(kinds.iter().any(|k| k == "job_quarantined"), "{kinds:?}");
+
+    // Never picked up again, even after a restart's recovery sweep.
+    h.db.requeue_running(now(), &[]).await.unwrap();
+    tick(&h).await;
+    tick(&h).await;
+    assert!(h.notes.take().is_empty());
+    assert_eq!(h.claude_seen.lock().unwrap().len(), 1);
+    assert_eq!(job_row(&h, 1).0, "failed");
+}
+
+async fn hung_job_scenario(concurrency: usize) {
+    let h = harness_config(
+        &config_agent(&format!(
+            "attempt_timeout_secs = 2\nworker_concurrency = {concurrency}"
+        )),
+        vec![final_turn("Kitchen lights on.")],
+        None,
+        |home| vec![home],
+    )
+    .await;
+    hang_requests_containing(&h, "please hang").await;
+    queue_command(&h, "hang-1", "please hang forever").await;
+    queue_command(&h, "ok-2", "turn on the kitchen lights").await;
+
+    // The old worker waited for the hung request (120 s) before job 2.
+    tokio::time::timeout(Duration::from_secs(30), tick(&h))
+        .await
+        .expect("a hung job must not stall the worker");
+
+    assert_eq!(
+        h.db.get_job(2).await.unwrap().unwrap().status,
+        JobStatus::Done
+    );
+    // The hung attempt hit its deadline and is retried later, like an outage.
+    let (status, error) = job_row(&h, 1);
+    assert_eq!(status, "queued");
+    assert!(
+        error.as_deref().unwrap().contains("attempt_timeout_secs"),
+        "{error:?}"
+    );
+    let notes = h.notes.take();
+    assert!(
+        notes.iter().any(|n| n.body == "Kitchen lights on."),
+        "{notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.title == "Ringmaster: delayed" && n.body.contains("keep trying")),
+        "{notes:?}"
+    );
+    let audit: Vec<(String, Value)> = h.db.audit_entries(1).await.unwrap();
+    assert!(
+        audit.iter().any(|(k, d)| k == "retry_scheduled"
+            && d["error"].as_str().unwrap().contains("no result within 2s")),
+        "{audit:?}"
+    );
+}
+
+#[tokio::test]
+async fn hung_job_does_not_stop_others_with_concurrency() {
+    hung_job_scenario(2).await;
+}
+
+#[tokio::test]
+async fn hung_job_does_not_stop_others_one_at_a_time() {
+    hung_job_scenario(1).await;
+}
+
+#[tokio::test]
+async fn slow_job_does_not_delay_the_next_one() {
+    // The deadline is far away: only concurrency lets job 2 through.
+    let h = harness_config(
+        &config_agent("attempt_timeout_secs = 300\nworker_concurrency = 2"),
+        vec![final_turn("Kitchen lights on.")],
+        None,
+        |home| vec![home],
+    )
+    .await;
+    hang_requests_containing(&h, "slow request").await;
+    queue_command(&h, "slow-1", "a slow request").await;
+    queue_command(&h, "fast-2", "turn on the kitchen lights").await;
+
+    let stop = CancellationToken::new();
+    let worker = tokio::spawn(h.worker.clone().run(stop.clone()));
+    let done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if h.db.get_job(2).await.unwrap().unwrap().status == JobStatus::Done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    // Still working on job 1 meanwhile.
+    let slow = h.db.get_job(1).await.unwrap().unwrap().status;
+    worker.abort();
+    done.expect("job 2 finishes while job 1 is still running");
+    assert_eq!(slow, JobStatus::Running);
+}
+
+/// Panics when a tool is called.
+struct PanickingTools(Arc<dyn ToolBackend>);
+
+#[async_trait]
+impl ToolBackend for PanickingTools {
+    async fn list_tools(&self, servers: &[String]) -> Result<Vec<DiscoveredTool>, ToolError> {
+        self.0.list_tools(servers).await
+    }
+    async fn call_tool(
+        &self,
+        _server: &str,
+        tool: &str,
+        _args: serde_json::Map<String, Value>,
+    ) -> Result<ToolOutput, ToolError> {
+        panic!("injected panic in {tool}");
+    }
+    fn server_names(&self) -> Vec<String> {
+        self.0.server_names()
+    }
+}
+
+#[tokio::test]
+async fn panic_in_one_job_fails_only_that_job() {
+    let h = harness_full(
+        &config_agent("worker_concurrency = 1"),
+        vec![
+            tool_use_turn(
+                "toolu_p",
+                "home__set_light",
+                json!({"name": "porch", "on": true}),
+            ),
+            final_turn("Noted."),
+        ],
+        None,
+        |home| vec![home],
+        |tools| Arc::new(PanickingTools(tools)),
+    )
+    .await;
+    queue_command(&h, "boom-1", "turn on the porch light").await;
+    queue_command(&h, "ok-2", "remember to buy milk").await;
+
+    tick(&h).await;
+
+    let (status, error) = job_row(&h, 1);
+    assert_eq!(status, "failed");
+    assert!(
+        error
+            .as_deref()
+            .unwrap()
+            .contains("injected panic in set_light"),
+        "{error:?}"
+    );
+    assert_eq!(
+        h.db.get_job(2).await.unwrap().unwrap().status,
+        JobStatus::Done
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].body.contains("turn on the porch light"),
+        "{notes:?}"
+    );
+    assert_eq!(notes[1].body, "Noted.");
+    // Not retried, and not left claimed.
+    tick(&h).await;
+    assert_eq!(h.claude_seen.lock().unwrap().len(), 2);
+    assert_eq!(job_row(&h, 1).0, "failed");
+}
+
+#[tokio::test]
+async fn job_awaiting_confirmation_does_not_block_others() {
+    let h = harness_config(
+        &config_agent("worker_concurrency = 1"),
+        vec![
+            tool_use_turn("toolu_c", "home__unlock_door", json!({"door": "front"})),
+            final_turn("Kitchen lights on."),
+            final_turn("It is noon."),
+        ],
+        None,
+        |home| vec![home],
+    )
+    .await;
+    queue_command(&h, "confirm-1", "unlock the front door").await;
+    queue_command(&h, "after-2", "turn on the kitchen lights").await;
+
+    tick(&h).await;
+
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::AwaitingConfirmation
+    );
+    assert_eq!(
+        h.db.get_job(2).await.unwrap().unwrap().status,
+        JobStatus::Done
+    );
+    let notes = h.notes.take();
+    assert!(matches!(notes[0].kind, Kind::Confirm { .. }), "{notes:?}");
+    assert_eq!(notes[1].body, "Kitchen lights on.");
+
+    // A third request is not held up by the pending one either, and the
+    // pending job is not claimed while it waits.
+    queue_command(&h, "later-3", "what time is it").await;
+    tick(&h).await;
+    assert_eq!(
+        h.db.get_job(3).await.unwrap().unwrap().status,
+        JobStatus::Done
+    );
+    assert_eq!(h.notes.take()[0].body, "It is noon.");
+    assert_eq!(h.claude_seen.lock().unwrap().len(), 3);
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::AwaitingConfirmation
+    );
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn started_job_is_not_resumed_long_after_its_max_age() {
+    let h = harness(
+        vec![
+            json!({"__status": 503, "__body": {"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}}),
+            final_turn("Heating off."),
+        ],
+        None,
+    )
+    .await;
+    queue_command(&h, "late-1", "turn the heating off").await;
+    tick(&h).await;
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Queued);
+    assert!(job.agent_state.is_some(), "the conversation was started");
+    h.notes.take();
+
+    // The service was down (or kept crashing on this job) for a day; the
+    // job comes back through the restart sweep, not a scheduled retry.
+    {
+        let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+        let day_ago = now() - 86_400;
+        conn.execute(
+            "UPDATE jobs SET status = 'running', created_at = ?1 WHERE id = 1",
+            [day_ago],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE deliveries SET recorded_at_ms = ?1",
+            [day_ago * 1000],
+        )
+        .unwrap();
+    }
+    tick(&h).await;
+
+    let (status, error) = job_row(&h, 1);
+    assert_eq!(status, "failed");
+    assert!(
+        error.as_deref().unwrap().contains("too old to resume"),
+        "{error:?}"
+    );
+    assert_eq!(h.claude_seen.lock().unwrap().len(), 1, "not resumed");
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].body.contains("turn the heating off"), "{notes:?}");
 }

@@ -351,6 +351,14 @@ pub struct AgentConfig {
     pub tool_discovery_timeout_secs: u64,
     /// Tool output longer than this is truncated before it goes to Claude.
     pub max_tool_result_chars: usize,
+    /// Wall-clock limit for one processing attempt of a job (transcription,
+    /// model calls and tool calls together). An attempt that runs over is
+    /// treated like an outage: the job backs off and is retried until its
+    /// max age.
+    pub attempt_timeout_secs: u64,
+    /// Jobs processed at the same time, so one slow or hung job does not
+    /// hold up the rest of the queue.
+    pub worker_concurrency: usize,
 }
 
 impl Default for AgentConfig {
@@ -366,9 +374,15 @@ impl Default for AgentConfig {
             tool_timeout_secs: 60,
             tool_discovery_timeout_secs: 10,
             max_tool_result_chars: 20_000,
+            attempt_timeout_secs: 900,
+            worker_concurrency: 2,
         }
     }
 }
+
+/// Upper bound for `agent.worker_concurrency`: one SQLite connection and a
+/// single host do not gain from more.
+pub const MAX_WORKER_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -876,6 +890,12 @@ impl Config {
         if !self.webhook.path.starts_with('/') {
             bail!("webhook.path must start with '/'");
         }
+        if self.agent.attempt_timeout_secs == 0 {
+            bail!("agent.attempt_timeout_secs must be at least 1");
+        }
+        if !(1..=MAX_WORKER_CONCURRENCY).contains(&self.agent.worker_concurrency) {
+            bail!("agent.worker_concurrency must be between 1 and {MAX_WORKER_CONCURRENCY}");
+        }
         for r in &self.tool_policies {
             globset::Glob::new(&r.pattern)
                 .with_context(|| format!("tool_policies match {:?}", r.pattern))?;
@@ -979,6 +999,23 @@ mod tests {
             system_prompt = "b"
         "#;
         assert!(Config::from_toml(text).is_err());
+    }
+
+    #[test]
+    fn worker_limits_have_safe_defaults_and_are_checked() {
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.agent.worker_concurrency, 2);
+        assert_eq!(cfg.agent.attempt_timeout_secs, 900);
+        for bad in [
+            "[agent]\nworker_concurrency = 0",
+            "[agent]\nworker_concurrency = 17",
+            "[agent]\nattempt_timeout_secs = 0",
+        ] {
+            assert!(Config::from_toml(bad).is_err(), "{bad}");
+        }
+        let cfg = Config::from_toml("[agent]\nworker_concurrency = 1\nattempt_timeout_secs = 60")
+            .unwrap();
+        assert_eq!(cfg.agent.worker_concurrency, 1);
     }
 
     #[test]

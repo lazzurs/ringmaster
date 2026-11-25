@@ -29,8 +29,8 @@ outages and pending confirmations resume where they stopped.
 | `src/http.rs` | axum router: webhook, `/confirm/*`, `/healthz`, `/metrics` | routes |
 | `src/webhook.rs` | webhook handler: version, signature, dedupe, multipart, audio write, delivery + job insert | webhook behaviour |
 | `src/signature.rs` | HMAC-SHA256 signing string and constant-time verify | signature format |
-| `src/db.rs` | SQLite schema (`MIGRATION_1`, `SCHEMA_VERSION`), queue, confirmations, audit log, retention | persistence, migrations |
-| `src/worker.rs` | job loop: claim, max age, transcribe, run agent, retry with back-off, notify, audio retention | job lifecycle |
+| `src/db.rs` | SQLite schema (`MIGRATION_1`, `SCHEMA_VERSION`), queue (atomic claim, quarantine of unreadable jobs, requeue of orphaned `running` jobs), confirmations, audit log, retention | persistence, migrations |
+| `src/worker.rs` | job loop: one task per job (`InFlight`, up to `worker_concurrency`), attempt deadline, panic isolation, max age, transcribe, run agent, retry with back-off, notify, audio retention | job lifecycle |
 | `src/stt.rs` | whisper-server client and fallback chain | transcription |
 | `src/audio.rs` | M4A (AAC-LC) to 16 kHz mono WAV in pure Rust (symphonia + hound) | audio decoding |
 | `src/agent.rs` | provider-neutral agent loop, `AgentState`, tool discovery, planning, confirmations, tool execution | agent behaviour |
@@ -134,11 +134,11 @@ outages and pending confirmations resume where they stopped.
    `#[serde(default)]` (see `provider`, `final_text`, `unavailable`), never
    rename or remove fields, and a state without `provider` means Anthropic
    (tests: `old_states_without_provider_are_anthropic`,
-   `state_saved_before_providers_still_resumes`). This matters more than it
-   looks: a state that no longer decodes makes `Db::claim_next_job` error
-   ("decoding agent state") and roll back on every tick, so that job stays
-   queued and blocks the whole queue. Schema changes go in a new migration
-   with a bumped `SCHEMA_VERSION`; never edit `MIGRATION_1`.
+   `state_saved_before_providers_still_resumes`). A state that no longer
+   decodes no longer blocks the queue (invariant 9), but the job is
+   quarantined and the user's request is dropped, so this still matters.
+   Schema changes go in a new migration with a bumped `SCHEMA_VERSION`;
+   never edit `MIGRATION_1`.
 8. **Webhook verification and dedupe** (`src/webhook.rs`, `src/signature.rs`):
    - Version header must be `1`; the HMAC covers
      `v1\n{timestamp}\n{delivery_id}\n{trigger}\n{1|0}\n` + raw body, is
@@ -154,6 +154,37 @@ outages and pending confirmations resume where they stopped.
      Accepted jobs get `202`. Test events are recorded and never run the agent.
    - Requests the app should not retry get 4xx; storage problems get 503 so
      the app retries.
+
+9. **One job never holds up the queue** (`src/worker.rs`, `src/db.rs`).
+   - Each claimed job runs in its own task; up to `agent.worker_concurrency`
+     (default 2, max 16) at once. The loop keeps claiming while a slot is
+     free and never awaits a single job. Jobs may finish out of order.
+   - Claiming is one `UPDATE ... RETURNING` in an `IMMEDIATE` transaction
+     and skips jobs this process already has in flight, so no job is ever
+     run by two tasks (`concurrent_claims_never_take_the_same_job`).
+   - A job whose row no longer loads (`load_job` returns
+     `LoadError::Unreadable`: bad `AgentState` JSON, a column of the wrong
+     type, a missing delivery) is quarantined inside the claim transaction:
+     `failed`, `last_error` "quarantined, not retried: ...", a
+     `job_quarantined` audit row, and a notification carrying the transcript
+     or phone transcription. Claiming then moves on. Database errors
+     (`LoadError::Db`) still roll back and retry.
+   - Each attempt (`Worker::attempt`) is bounded by
+     `agent.attempt_timeout_secs` (default 900); running over is a transient
+     error, so the normal back-off, "delayed" notification and max-age expiry
+     apply.
+   - A panic in a job is caught (`catch_unwind` in `Worker::handle`) and
+     fails that job only. Jobs left `running` with no task (restart, crash,
+     a lost task) are requeued by `Db::requeue_running` on every
+     housekeeping pass, skipping the jobs in flight. This assumes one
+     Ringmaster process per database.
+   - Started jobs are not resumed more than `retry_max_secs` +
+     `confirmation_ttl_secs` past their max age (unless the answer is already
+     in `final_text`), so a job that keeps crashing the service, or comes
+     back after a long outage, is stopped rather than retried for ever.
+     Transient failures stop at the max age (`retry_later`); a decoder panic
+     falls back to the phone transcription instead of retrying.
+   - Jobs in `awaiting_confirmation` are never claimed; they take no slot.
 
 Other behaviour to keep: `GET /confirm/*` never changes state; confirmation
 tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
@@ -175,6 +206,14 @@ tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
   API error with `{"__status": 400, "__body": {...}}`. Inspect request bodies
   via `claude_seen` and paths/headers via `meta(&h)`.
 - Drive the flow with `signed_request`, `send`, `tick` and `run_command`.
+  `tick` processes every job due when it starts (concurrently, up to
+  `worker_concurrency`) and waits for all of them; retries scheduled during
+  the tick wait for the next one. Script order is per request, so tests that
+  depend on which job gets which turn set `worker_concurrency = 1`
+  (`config_agent`), or match on the request body
+  (`hang_requests_containing`). `queue_command` queues a job with a phone
+  transcription; `harness_full` wraps the tool backend (see
+  `PanickingTools`).
 - **wiremock pooling gotcha:** a dropped `MockServer` goes back to a pool and
   is handed to tests running at the same time, so it is not "unreachable".
   For a dead endpoint, bind `std::net::TcpListener` to `127.0.0.1:0`, take

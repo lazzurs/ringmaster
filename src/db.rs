@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 
 use crate::agent::AgentState;
@@ -146,6 +146,26 @@ pub struct Job {
     pub phone_transcription: Option<String>,
 }
 
+/// What [`Db::claim_next_job`] took off the queue.
+#[derive(Debug)]
+pub enum Claim {
+    /// A job, now marked `running`.
+    Ready(Box<Job>),
+    /// A job whose stored data no longer loads. It has been marked `failed`
+    /// (and audited as `job_quarantined`) so it is never claimed again.
+    Quarantined(Quarantined),
+}
+
+/// What could be salvaged from a job that no longer loads.
+#[derive(Debug, Clone)]
+pub struct Quarantined {
+    pub id: i64,
+    pub delivery_id: Option<String>,
+    /// The job's transcript, else the phone's transcription, if readable.
+    pub heard: Option<String>,
+    pub error: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Confirmation {
     pub job_id: i64,
@@ -277,45 +297,72 @@ impl Db {
         .await
     }
 
-    /// Jobs left `running` by a crash or restart go back to the queue.
-    pub async fn requeue_running(&self, now: i64) -> Result<usize> {
+    /// Jobs left `running` by a crash, a restart or a lost worker task go
+    /// back to the queue. `in_flight` are the jobs this process is working on
+    /// right now; they are left alone.
+    pub async fn requeue_running(&self, now: i64, in_flight: &[i64]) -> Result<usize> {
+        let in_flight = serde_json::to_string(in_flight)?;
         self.call(move |c| {
             Ok(c.execute(
-                "UPDATE jobs SET status = 'queued', next_attempt_at = ?1, updated_at = ?1 WHERE status = 'running'",
-                [now],
+                "UPDATE jobs SET status = 'queued', next_attempt_at = ?1, updated_at = ?1 \
+                 WHERE status = 'running' AND id NOT IN (SELECT value FROM json_each(?2))",
+                params![now, in_flight],
             )?)
         })
         .await
     }
 
-    /// Claim the oldest ready job, marking it running.
-    pub async fn claim_next_job(&self, now: i64) -> Result<Option<Job>> {
+    /// Claim the oldest ready job that is not in `in_flight`, marking it
+    /// running. Claiming is one `UPDATE ... RETURNING` in an immediate
+    /// transaction, so two workers (even on separate connections) never take
+    /// the same job.
+    ///
+    /// A job whose stored data no longer loads (an `AgentState` from an
+    /// incompatible version, a corrupted column, a missing delivery) is
+    /// quarantined in the same transaction instead of being left at the head
+    /// of the queue, where it would block every job behind it.
+    pub async fn claim_next_job(&self, now: i64, in_flight: &[i64]) -> Result<Option<Claim>> {
+        let in_flight = serde_json::to_string(in_flight)?;
         self.call(move |c| {
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let id: Option<i64> = tx
                 .query_row(
-                    "SELECT id FROM jobs WHERE status = 'queued' AND next_attempt_at <= ?1 \
-                     ORDER BY next_attempt_at, id LIMIT 1",
-                    [now],
+                    "UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ?1 \
+                     WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND next_attempt_at <= ?1 \
+                                 AND id NOT IN (SELECT value FROM json_each(?2)) \
+                                 ORDER BY next_attempt_at, id LIMIT 1) \
+                     AND status = 'queued' RETURNING id",
+                    params![now, in_flight],
                     |r| r.get(0),
                 )
                 .optional()?;
             let Some(id) = id else {
                 return Ok(None);
             };
-            tx.execute(
-                "UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ?2 WHERE id = ?1",
-                params![id, now],
-            )?;
-            let job = load_job(&tx, id)?;
+            let reason = match load_job(&tx, id) {
+                Ok(Some(job)) => {
+                    tx.commit()?;
+                    return Ok(Some(Claim::Ready(Box::new(job))));
+                }
+                Ok(None) => "its delivery record is missing".to_string(),
+                Err(LoadError::Unreadable(why)) => why,
+                Err(LoadError::Db(e)) => return Err(e),
+            };
+            let q = quarantine(&tx, id, now, reason)?;
             tx.commit()?;
-            Ok(job)
+            Ok(Some(Claim::Quarantined(q)))
         })
         .await
     }
 
     pub async fn get_job(&self, id: i64) -> Result<Option<Job>> {
-        self.call(move |c| load_job(c, id)).await
+        self.call(move |c| {
+            load_job(c, id).map_err(|e| match e {
+                LoadError::Unreadable(why) => anyhow::anyhow!(why),
+                LoadError::Db(e) => e,
+            })
+        })
+        .await
     }
 
     pub async fn save_transcript(&self, id: i64, text: String, source: String) -> Result<()> {
@@ -599,7 +646,29 @@ impl Db {
     }
 }
 
-fn load_job(c: &Connection, id: i64) -> Result<Option<Job>> {
+/// Why a job could not be loaded.
+enum LoadError {
+    /// The row itself is bad: a column of the wrong type, invalid UTF-8, or
+    /// an `AgentState` that no longer deserialises. Retrying cannot help.
+    Unreadable(String),
+    /// The database failed (I/O, busy...); worth another try.
+    Db(anyhow::Error),
+}
+
+impl From<rusqlite::Error> for LoadError {
+    fn from(e: rusqlite::Error) -> Self {
+        use rusqlite::Error as E;
+        match e {
+            E::FromSqlConversionFailure(..)
+            | E::IntegralValueOutOfRange(..)
+            | E::Utf8Error(..)
+            | E::InvalidColumnType(..) => LoadError::Unreadable(format!("unreadable job row: {e}")),
+            e => LoadError::Db(e.into()),
+        }
+    }
+}
+
+fn load_job(c: &Connection, id: i64) -> Result<Option<Job>, LoadError> {
     let row = c
         .query_row(
             "SELECT j.id, j.delivery_id, j.profile, j.status, j.attempts, j.created_at, j.transcript, \
@@ -634,9 +703,49 @@ fn load_job(c: &Connection, id: i64) -> Result<Option<Job>> {
         return Ok(None);
     };
     if let Some(s) = state {
-        job.agent_state = Some(serde_json::from_str(&s).context("decoding agent state")?);
+        job.agent_state = Some(
+            serde_json::from_str(&s)
+                .map_err(|e| LoadError::Unreadable(format!("decoding agent state: {e}")))?,
+        );
     }
     Ok(Some(job))
+}
+
+/// Mark an unloadable job failed and audit it, salvaging whatever is still
+/// readable so the user can be told what was lost.
+fn quarantine(c: &Connection, id: i64, now: i64, reason: String) -> Result<Quarantined> {
+    // Each column on its own: one bad column must not hide the others.
+    let text = |r: &rusqlite::Row<'_>, i: usize| r.get::<_, Option<String>>(i).ok().flatten();
+    let (delivery_id, transcript, phone) = c
+        .query_row(
+            "SELECT j.delivery_id, j.transcript, d.phone_transcription \
+             FROM jobs j LEFT JOIN deliveries d ON d.delivery_id = j.delivery_id WHERE j.id = ?1",
+            [id],
+            |r| Ok((text(r, 0), text(r, 1), text(r, 2))),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let error = format!("quarantined, not retried: {reason}");
+    c.execute(
+        "UPDATE jobs SET status = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, error, now],
+    )?;
+    c.execute(
+        "INSERT INTO audit (ts, job_id, delivery_id, kind, detail) \
+         VALUES (?1, ?2, ?3, 'job_quarantined', ?4)",
+        params![
+            now,
+            id,
+            delivery_id,
+            serde_json::json!({ "error": error }).to_string()
+        ],
+    )?;
+    Ok(Quarantined {
+        id,
+        delivery_id,
+        heard: transcript.filter(|t| !t.trim().is_empty()).or(phone),
+        error,
+    })
 }
 
 pub fn now() -> i64 {
@@ -662,6 +771,106 @@ mod tests {
         }
     }
 
+    fn ready(claim: Option<Claim>) -> Job {
+        match claim {
+            Some(Claim::Ready(job)) => *job,
+            other => panic!("expected a ready job, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_job_is_quarantined_not_left_at_the_head() {
+        let db = Db::open_in_memory().unwrap();
+        for id in ["bad", "good"] {
+            db.insert_delivery(delivery(id, Some("command")), true)
+                .await
+                .unwrap();
+        }
+        db.call(|c| {
+            c.execute(
+                "UPDATE jobs SET agent_state = '{not json', transcript = 'turn on the hall light' \
+                 WHERE delivery_id = 'bad'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let Some(Claim::Quarantined(q)) = db.claim_next_job(1000, &[]).await.unwrap() else {
+            panic!("the bad job should be quarantined");
+        };
+        assert_eq!(q.delivery_id.as_deref(), Some("bad"));
+        assert_eq!(q.heard.as_deref(), Some("turn on the hall light"));
+        assert!(q.error.contains("decoding agent state"), "{}", q.error);
+        // The good job behind it is next, and the bad one never comes back.
+        let good = ready(db.claim_next_job(1000, &[]).await.unwrap());
+        assert_eq!(good.delivery_id, "good");
+        assert_eq!(db.requeue_running(1000, &[]).await.unwrap(), 1);
+        assert_eq!(
+            ready(db.claim_next_job(1000, &[]).await.unwrap()).delivery_id,
+            "good"
+        );
+        assert!(db.claim_next_job(5000, &[]).await.unwrap().is_none());
+        let kinds: Vec<String> = db
+            .audit_entries(q.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(kinds, ["job_quarantined"]);
+        // A column of the wrong type is quarantined too; the phone's
+        // transcription is what is left of the request.
+        db.insert_delivery(delivery("typed", Some("command")), true)
+            .await
+            .unwrap();
+        db.call(|c| {
+            c.execute(
+                "UPDATE jobs SET created_at = 'yesterday' WHERE delivery_id = 'typed'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let Some(Claim::Quarantined(q)) = db.claim_next_job(1000, &[]).await.unwrap() else {
+            panic!("the mistyped job should be quarantined");
+        };
+        assert_eq!(q.heard.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_never_take_the_same_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let db = Db::open(&path).unwrap();
+        for i in 0..40 {
+            db.insert_delivery(delivery(&format!("d{i}"), Some("command")), true)
+                .await
+                .unwrap();
+        }
+        // Separate connections, as two worker processes would have.
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let db = Db::open(&path).unwrap();
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    while let Some(claim) = db.claim_next_job(1000, &[]).await.unwrap() {
+                        got.push(ready(Some(claim)).id);
+                    }
+                    got
+                })
+            })
+            .collect();
+        let mut all = Vec::new();
+        for w in workers {
+            all.extend(w.await.unwrap());
+        }
+        all.sort_unstable();
+        assert_eq!(all, (1..=40).collect::<Vec<i64>>());
+    }
+
     #[tokio::test]
     async fn dedupe_and_claim() {
         let db = Db::open_in_memory().unwrap();
@@ -677,19 +886,19 @@ mod tests {
         assert_eq!(again, InsertOutcome::Duplicate);
         assert!(db.delivery_exists("a").await.unwrap());
 
-        let job = db
-            .claim_next_job(1000)
-            .await
-            .unwrap()
-            .expect("job is ready");
+        let job = ready(db.claim_next_job(1000, &[]).await.unwrap());
         assert_eq!(job.status, JobStatus::Running);
         assert_eq!(job.attempts, 1);
         assert_eq!(job.phone_transcription.as_deref(), Some("hello"));
-        assert!(db.claim_next_job(1000).await.unwrap().is_none());
+        assert!(db.claim_next_job(1000, &[]).await.unwrap().is_none());
 
-        // A restart puts it back.
-        assert_eq!(db.requeue_running(2000).await.unwrap(), 1);
-        assert!(db.claim_next_job(2000).await.unwrap().is_some());
+        // Jobs this process is still working on are left alone...
+        assert_eq!(db.requeue_running(2000, &[job.id]).await.unwrap(), 0);
+        // ...anything else left running (a restart) goes back.
+        assert_eq!(db.requeue_running(2000, &[]).await.unwrap(), 1);
+        // A job still in flight is not claimed twice.
+        assert!(db.claim_next_job(2000, &[job.id]).await.unwrap().is_none());
+        assert!(db.claim_next_job(2000, &[]).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -698,13 +907,13 @@ mod tests {
         db.insert_delivery(delivery("a", Some("command")), true)
             .await
             .unwrap();
-        let job = db.claim_next_job(1000).await.unwrap().unwrap();
+        let job = ready(db.claim_next_job(1000, &[]).await.unwrap());
         db.reschedule(job.id, 1500, "mac asleep".into())
             .await
             .unwrap();
-        assert!(db.claim_next_job(1499).await.unwrap().is_none());
+        assert!(db.claim_next_job(1499, &[]).await.unwrap().is_none());
         assert_eq!(db.next_due().await.unwrap(), Some(1500));
-        assert!(db.claim_next_job(1500).await.unwrap().is_some());
+        assert!(db.claim_next_job(1500, &[]).await.unwrap().is_some());
     }
 
     #[tokio::test]

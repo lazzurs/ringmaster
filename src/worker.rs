@@ -1,18 +1,28 @@
 //! The background worker: drains the job queue, retries with back-off while
 //! the Mac or the API is unreachable, and does housekeeping.
+//!
+//! One stuck job must never hold up the others. Each job runs in its own
+//! task (up to `agent.worker_concurrency` at once), every attempt has a
+//! wall-clock deadline (`agent.attempt_timeout_secs`), a panic fails only its
+//! own job, a job that no longer loads is quarantined by the claim, and jobs
+//! left `running` without a task (a restart, a lost task) are requeued.
 
+use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use serde_json::json;
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentOutcome, Request};
 use crate::audio;
 use crate::config::Config;
-use crate::db::{Db, Job, JobStatus, now};
+use crate::db::{Claim, Db, Job, JobStatus, Quarantined, now};
 use crate::notify::{Kind, Notification, Notifier};
 use crate::stt::{SttError, Transcriber};
 
@@ -31,38 +41,97 @@ enum JobError {
     Permanent(String),
 }
 
+/// The jobs this worker is processing, one task each.
+#[derive(Default)]
+struct InFlight {
+    tasks: JoinSet<()>,
+    jobs: HashMap<tokio::task::Id, i64>,
+}
+
+impl InFlight {
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn ids(&self) -> Vec<i64> {
+        self.jobs.values().copied().collect()
+    }
+
+    fn spawn(&mut self, worker: Arc<Worker>, job: Job) {
+        let id = job.id;
+        let task = self.tasks.spawn(async move { worker.handle(job).await });
+        self.jobs.insert(task.id(), id);
+    }
+
+    /// Wait for one job task to end; `None` when there are none.
+    async fn join_next(&mut self) -> Option<()> {
+        let res = self.tasks.join_next_with_id().await?;
+        let task = match &res {
+            Ok((id, ())) => *id,
+            Err(e) => e.id(),
+        };
+        let job = self.jobs.remove(&task);
+        if let Err(e) = res {
+            // `handle` catches panics, so this is a panic while reporting
+            // one. The job is still `running`; the next sweep requeues it.
+            tracing::error!(job = ?job, error = %e, "job task ended abnormally");
+        }
+        Some(())
+    }
+}
+
 impl Worker {
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        match self.db.requeue_running(now()).await {
-            Ok(n) if n > 0 => tracing::info!(jobs = n, "requeued jobs interrupted by a restart"),
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "requeue at start-up failed"),
-        }
+        let mut jobs = InFlight::default();
         let mut last_retention = None::<std::time::Instant>;
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
-            self.tick(&shutdown).await;
+            self.housekeeping(&jobs).await;
+            self.start_due(&mut jobs, now(), &shutdown).await;
+            self.record_depth().await;
             if last_retention.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
                 self.retention().await;
                 last_retention = Some(std::time::Instant::now());
             }
+            // With every slot busy, a finishing job is what wakes the loop.
             let wait = match self.db.next_due().await {
+                _ if jobs.len() >= self.config.agent.worker_concurrency => Duration::from_secs(30),
                 Ok(Some(due)) => Duration::from_secs((due - now()).clamp(1, 30) as u64),
                 _ => Duration::from_secs(30),
             };
             tokio::select! {
                 _ = self.wake.notified() => {}
                 _ = tokio::time::sleep(wait) => {}
+                Some(()) = jobs.join_next() => {}
                 _ = shutdown.cancelled() => break,
             }
         }
+        // Let the jobs in progress reach a save point; `serve` stops waiting
+        // after a while and anything unfinished is requeued at the next start.
+        while jobs.join_next().await.is_some() {}
         tracing::info!("worker stopped");
     }
 
-    /// Expire confirmations, then process every job that is due.
-    pub async fn tick(&self, shutdown: &CancellationToken) {
+    /// Process every job that is due now and wait for all of them (jobs that
+    /// become due meanwhile, such as retries, wait for the next tick).
+    pub async fn tick(self: &Arc<Self>, shutdown: &CancellationToken) {
+        let due = now();
+        let mut jobs = InFlight::default();
+        self.housekeeping(&jobs).await;
+        loop {
+            self.start_due(&mut jobs, due, shutdown).await;
+            if jobs.join_next().await.is_none() {
+                break;
+            }
+        }
+        self.record_depth().await;
+    }
+
+    /// Expire confirmations and requeue jobs left `running` with no task
+    /// working on them (a restart, a crash, a lost task).
+    async fn housekeeping(&self, jobs: &InFlight) {
         match self.db.expire_confirmations(now()).await {
             Ok(ids) => {
                 for id in ids {
@@ -71,40 +140,100 @@ impl Worker {
             }
             Err(e) => tracing::error!(error = %e, "expiring confirmations failed"),
         }
-        loop {
-            if shutdown.is_cancelled() {
-                break;
-            }
-            let job = match self.db.claim_next_job(now()).await {
-                Ok(Some(job)) => job,
+        match self.db.requeue_running(now(), &jobs.ids()).await {
+            Ok(n) if n > 0 => tracing::info!(jobs = n, "requeued interrupted jobs"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "requeueing interrupted jobs failed"),
+        }
+    }
+
+    /// Start jobs that were due at `due` while there are free slots.
+    async fn start_due(
+        self: &Arc<Self>,
+        jobs: &mut InFlight,
+        due: i64,
+        shutdown: &CancellationToken,
+    ) {
+        let slots = self.config.agent.worker_concurrency.max(1);
+        while jobs.len() < slots && !shutdown.is_cancelled() {
+            match self.db.claim_next_job(due, &jobs.ids()).await {
+                Ok(Some(Claim::Ready(job))) => jobs.spawn(self.clone(), *job),
+                Ok(Some(Claim::Quarantined(q))) => self.quarantined(q).await,
                 Ok(None) => break,
                 Err(e) => {
                     tracing::error!(error = %e, "claiming a job failed");
                     break;
                 }
-            };
-            self.handle(job).await;
+            }
         }
+    }
+
+    async fn record_depth(&self) {
         if let Ok(depth) = self.db.queue_depth().await {
             metrics::gauge!("ringmaster_queue_depth").set(depth as f64);
         }
     }
 
+    /// Tell the user about a job that could not be loaded, with whatever is
+    /// left of what they said, so the request is not silently lost.
+    async fn quarantined(&self, q: Quarantined) {
+        tracing::error!(job = q.id, delivery = ?q.delivery_id, error = %q.error, "quarantined a job that could not be loaded");
+        metrics::counter!("ringmaster_jobs_total", "outcome" => "quarantined").increment(1);
+        let said = q
+            .heard
+            .as_deref()
+            .map(|t| format!(" You said: \"{}\"", crate::agent::truncate(t.trim(), 500)))
+            .unwrap_or_default();
+        self.notify(Notification {
+            title: "Ringmaster: failed".into(),
+            body: format!(
+                "A queued request could not be read, so it was not run ({}).{said}",
+                short(&q.error)
+            ),
+            kind: Kind::Error,
+        })
+        .await;
+    }
+
     #[tracing::instrument(skip_all, fields(job = job.id, delivery = %job.delivery_id, profile = %job.profile))]
     async fn handle(&self, job: Job) {
         let started = std::time::Instant::now();
-        let result = self.process(&job).await;
-        let outcome = match result {
-            Ok(label) => label,
-            Err(JobError::Transient(e)) => self.retry_later(&job, e).await,
-            Err(JobError::Permanent(e)) => {
-                tracing::warn!(error = %e, "job failed");
-                self.fail(&job, &e).await;
-                "failed"
+        // A panic fails this job only; the worker and the other jobs go on.
+        let outcome = match AssertUnwindSafe(self.attempt(&job)).catch_unwind().await {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                let msg = panic_message(panic.as_ref());
+                tracing::error!(error = %msg, "job handling panicked");
+                self.fail(&job, &format!("internal error: {msg}")).await;
+                "panicked"
             }
         };
         metrics::counter!("ringmaster_jobs_total", "outcome" => outcome).increment(1);
         metrics::histogram!("ringmaster_job_step_seconds").record(started.elapsed().as_secs_f64());
+    }
+
+    /// One processing attempt, bounded by `agent.attempt_timeout_secs`. A
+    /// hung attempt (a provider or MCP server that never answers) counts as
+    /// a transient failure: back off and retry, until the job's max age.
+    async fn attempt(&self, job: &Job) -> &'static str {
+        let limit = Duration::from_secs(self.config.agent.attempt_timeout_secs);
+        let result = tokio::time::timeout(limit, self.process(job))
+            .await
+            .unwrap_or_else(|_| {
+                Err(JobError::Transient(format!(
+                    "no result within {}s (agent.attempt_timeout_secs)",
+                    limit.as_secs()
+                )))
+            });
+        match result {
+            Ok(label) => label,
+            Err(JobError::Transient(e)) => self.retry_later(job, e).await,
+            Err(JobError::Permanent(e)) => {
+                tracing::warn!(error = %e, "job failed");
+                self.fail(job, &e).await;
+                "failed"
+            }
+        }
     }
 
     fn max_age(&self, job: &Job) -> i64 {
@@ -115,6 +244,11 @@ impl Worker {
             .unwrap_or(self.config.agent.job_max_age_secs) as i64
     }
 
+    fn resume_grace(&self) -> i64 {
+        let a = &self.config.agent;
+        a.retry_max_secs.saturating_add(a.confirmation_ttl_secs) as i64
+    }
+
     /// When the recording was made (or received, if earlier is unknown).
     fn origin(job: &Job) -> i64 {
         job.recorded_at_ms
@@ -123,10 +257,28 @@ impl Worker {
     }
 
     async fn process(&self, job: &Job) -> Result<&'static str, JobError> {
-        if job.agent_state.is_none() && now() - Self::origin(job) > self.max_age(job) {
-            return Err(JobError::Permanent(
-                "too old to run safely; not attempted".into(),
-            ));
+        let age = now() - Self::origin(job);
+        let max_age = self.max_age(job);
+        match &job.agent_state {
+            None if age > max_age => {
+                return Err(JobError::Permanent(
+                    "too old to run safely; not attempted".into(),
+                ));
+            }
+            // Started jobs also come back after a restart or a lost task, not
+            // only through `retry_later` (which stops at the max age). The
+            // last scheduled retry, or the answer to a confirmation asked on
+            // it, lands within `retry_max_secs + confirmation_ttl_secs` of
+            // the max age; past that (a job that keeps crashing the service,
+            // a long outage) a half-done request is stopped, not resumed.
+            // An answer that was already given is still delivered.
+            Some(state) if state.final_text.is_none() && age > max_age + self.resume_grace() => {
+                return Err(JobError::Permanent(format!(
+                    "too old to resume safely; stopped after {} attempts",
+                    job.attempts
+                )));
+            }
+            _ => {}
         }
 
         let (text, source) = match (&job.transcript, &job.transcript_source) {
@@ -192,8 +344,17 @@ impl Worker {
                                 .await;
                                 None
                             }
+                            // The decoder panicked on this file: as for any
+                            // other undecodable recording, fall back to the
+                            // phone's transcription rather than retrying.
                             Err(e) => {
-                                return Err(JobError::Transient(format!("decoder task: {e}")));
+                                self.audit(
+                                    job,
+                                    "audio_decode_failed",
+                                    json!({"error": format!("decoder task: {e}")}),
+                                )
+                                .await;
+                                None
                             }
                         }
                     }
@@ -274,9 +435,17 @@ impl Worker {
             .finish_job(job.id, JobStatus::Failed, None, Some(error.to_string()))
             .await;
         self.audit(job, "job_failed", json!({"error": error})).await;
+        // `job` is the row as claimed; the transcript may have been saved
+        // since, in this attempt.
+        let saved = match &job.transcript {
+            Some(_) => None,
+            None => self.db.get_job(job.id).await.ok().flatten(),
+        };
         let heard = job
             .transcript
             .as_deref()
+            .or_else(|| saved.as_ref().and_then(|j| j.transcript.as_deref()))
+            .or(job.phone_transcription.as_deref())
             .map(|t| format!(" (\"{}\")", short(t)))
             .unwrap_or_default();
         self.notify(Notification {
@@ -352,6 +521,14 @@ impl Worker {
             Err(e) => tracing::error!(error = %e, "retention sweep failed"),
         }
     }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".into())
 }
 
 fn short(s: &str) -> String {

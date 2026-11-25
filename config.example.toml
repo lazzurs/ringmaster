@@ -104,6 +104,13 @@ retry_max_secs = 600
 notify_on_retry = true
 tool_timeout_secs = 60
 tool_discovery_timeout_secs = 10
+# Wall-clock limit for one attempt at a job (transcription, model and tool
+# calls together). An attempt that runs over is retried with back-off, like an
+# outage, until the job's max age. Raise it for slow local models.
+attempt_timeout_secs = 900
+# Jobs processed at the same time, so one slow or stuck job does not hold up
+# the rest (1-16). With more than 1, jobs may finish out of order.
+worker_concurrency = 2
 
 [retention]
 audio_days = 30
