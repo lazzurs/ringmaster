@@ -374,9 +374,8 @@ impl ChatModel for ChatCompletions {
             .unwrap_or_default()
     }
 
-    fn final_text(&self, message: &Value) -> String {
-        let t = content_text(message.get("content"));
-        if t.is_empty() { "Done.".into() } else { t }
+    fn reply_text(&self, message: &Value) -> String {
+        content_text(message.get("content")).trim().to_string()
     }
 
     fn tool_results(&self, results: &[ToolResult]) -> Vec<Value> {

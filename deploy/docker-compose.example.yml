@@ -17,10 +17,13 @@
 #   NEXTCLOUD_USERNAME=rob
 #   NEXTCLOUD_PASSWORD=<Nextcloud app password>
 #   HOMEY_MCP_TOKEN=...                     (if the Homey MCP server needs one)
+#   SHIELDSTRAL_API_KEY=...                 (if [approval] api_key_env names it and
+#                                            llama-server runs with --api-key)
 #
 # Networks:
 #   edge  - cloudflared <-> ringmaster, with internet access (LLM APIs, ntfy,
-#           the Mac on the LAN for whisper and Ollama).
+#           the Mac on the LAN for whisper, Ollama and the Shieldstral
+#           approval classifier).
 #   mcp   - internal only: ringmaster <-> MCP servers. Nothing is published and
 #           cloudflared cannot reach the MCP servers.
 #   egress - outbound access for MCP servers that must reach Nextcloud/Homey.
@@ -44,6 +47,7 @@ services:
       RINGMASTER_WEBHOOK_SECRET: ${RINGMASTER_WEBHOOK_SECRET:?}
       NTFY_TOKEN: ${NTFY_TOKEN:-}
       HOMEY_MCP_TOKEN: ${HOMEY_MCP_TOKEN:-}
+      SHIELDSTRAL_API_KEY: ${SHIELDSTRAL_API_KEY:-}
       RUST_LOG: info
     volumes:
       - ./ringmaster/config.toml:/etc/ringmaster/config.toml:ro

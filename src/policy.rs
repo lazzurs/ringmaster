@@ -2,6 +2,11 @@
 //!
 //! Tools are named `<server>/<tool>` for matching. Policy rules are checked in
 //! order and the first match wins; a tool no rule matches needs confirmation.
+//!
+//! `confirm` and `ask` both pause the job for Approve/Deny. They differ only
+//! when an approval classifier is configured (`[approval]`): it may approve a
+//! `confirm` call on its own, but never an `ask` call, and it never sees a
+//! `deny` call at all.
 
 use anyhow::Result;
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
@@ -14,8 +19,12 @@ use crate::config::ToolPolicyRule;
 pub enum Policy {
     /// Run without asking.
     Allow,
-    /// Pause the job and ask on the phone first.
+    /// Pause the job and ask on the phone first (or, in `classifier`
+    /// approval mode, let the classifier approve it).
     Confirm,
+    /// Always ask on the phone, whatever the approval mode: the classifier
+    /// is never asked about these.
+    Ask,
     /// Never run; the tool is not even offered to Claude.
     Deny,
 }
@@ -25,6 +34,7 @@ impl Policy {
         match self {
             Policy::Allow => "allow",
             Policy::Confirm => "confirm",
+            Policy::Ask => "ask",
             Policy::Deny => "deny",
         }
     }
@@ -128,6 +138,20 @@ mod tests {
         assert_eq!(p.policy_for("nextcloud/deck_delete_card"), Policy::Deny);
         assert_eq!(p.policy_for("nextcloud/deck_get_boards"), Policy::Allow);
         assert_eq!(p.policy_for("nextcloud/deck_create_card"), Policy::Confirm);
+    }
+
+    #[test]
+    fn ask_is_its_own_policy() {
+        let p = Policies::new(&[
+            rule("homey/*alarm*", Policy::Ask),
+            rule("homey/*", Policy::Confirm),
+        ])
+        .unwrap();
+        assert_eq!(p.policy_for("homey/disarm_alarm"), Policy::Ask);
+        assert_eq!(p.policy_for("homey/set_light"), Policy::Confirm);
+        let parsed: Policy = serde_json::from_value(serde_json::json!("ask")).unwrap();
+        assert_eq!(parsed, Policy::Ask);
+        assert_eq!(Policy::Ask.as_str(), "ask");
     }
 
     #[test]

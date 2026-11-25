@@ -143,8 +143,8 @@ impl ChatModel for Anthropic {
             .unwrap_or_default()
     }
 
-    fn final_text(&self, message: &Value) -> String {
-        final_text(message.get("content").unwrap_or(&Value::Null))
+    fn reply_text(&self, message: &Value) -> String {
+        reply_text(message.get("content").unwrap_or(&Value::Null))
     }
 
     /// All results of a turn go back in one user message.
@@ -201,6 +201,16 @@ pub fn sanitize_fallback(content: Value) -> Value {
 }
 
 fn final_text(content: &Value) -> String {
+    let text = reply_text(content);
+    if text.is_empty() {
+        "Done.".into()
+    } else {
+        text
+    }
+}
+
+/// The text blocks of a message, trimmed (empty when there are none).
+fn reply_text(content: &Value) -> String {
     let text = content
         .as_array()
         .map(|a| {
@@ -211,12 +221,7 @@ fn final_text(content: &Value) -> String {
                 .join("\n")
         })
         .unwrap_or_default();
-    let text = text.trim();
-    if text.is_empty() {
-        "Done.".into()
-    } else {
-        text.to_string()
-    }
+    text.trim().to_string()
 }
 
 fn summarize_response(resp: &Value, content: &Value) -> Value {

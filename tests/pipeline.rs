@@ -25,6 +25,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 
 use ringmaster::agent::Agent;
 use ringmaster::audio::Decoder;
+use ringmaster::classifier::Classifier;
 use ringmaster::config::{Config, McpServerConfig};
 use ringmaster::db::{Db, JobStatus};
 use ringmaster::health::{AlertBook, Alerter, Health, Watchdog};
@@ -403,10 +404,21 @@ async fn harness_decoder(
         Default::default(),
         Duration::from_secs(10),
     )));
-    let agent =
-        Arc::new(Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone()).unwrap());
-    let wake = Arc::new(Notify::new());
     let health = Arc::new(Health::new(&config, now()));
+    // The approval classifier, when the config uses one (its base_url is
+    // a wiremock server the test started).
+    let classifier = Classifier::from_config(&config, None).unwrap().map(|c| {
+        Arc::new(
+            c.with_health(health.clone())
+                .with_max_backoff(Duration::from_millis(10)),
+        )
+    });
+    let agent = Arc::new(
+        Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone())
+            .unwrap()
+            .with_classifier(classifier),
+    );
+    let wake = Arc::new(Notify::new());
     let worker = Arc::new(Worker {
         config: config.clone(),
         db: db.clone(),
@@ -2587,5 +2599,632 @@ async fn idle_mcp_sessions_are_closed_and_their_tasks_end() {
     assert!(
         after_close.windows(2).all(|w| w[1] <= w[0]),
         "{after_close:?}"
+    );
+}
+
+// ------------------------------------------------- approval classifier
+
+/// An assistant turn with several tool calls.
+fn multi_tool_turn(calls: &[(&str, &str, Value)]) -> Value {
+    let mut content = vec![json!({"type": "thinking", "thinking": "", "signature": "sig-multi"})];
+    for (id, name, input) in calls {
+        content.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
+    }
+    json!({
+        "id": "msg_multi",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5-5",
+        "stop_reason": "tool_use",
+        "content": content,
+        "usage": {"input_tokens": 900, "output_tokens": 40}
+    })
+}
+
+/// A llama-server style reply whose yes/no logprobs give `score`.
+fn shield_reply(score: f64) -> ResponseTemplate {
+    let (yes, no) = (score.ln(), (1.0 - score).ln());
+    let (first, lp) = if yes > no { ("yes", yes) } else { ("no", no) };
+    ResponseTemplate::new(200).set_body_json(json!({
+        "choices": [{
+            "index": 0,
+            "finish_reason": "length",
+            "message": {"role": "assistant", "content": first},
+            "logprobs": {"content": [{
+                "id": 1, "token": first, "bytes": [], "logprob": lp,
+                "top_logprobs": [
+                    {"id": 2, "token": "no", "bytes": [], "logprob": no},
+                    {"id": 3, "token": "yes", "bytes": [], "logprob": yes},
+                    {"id": 4, "token": "No", "bytes": [], "logprob": -12.0},
+                    {"id": 5, "token": "The", "bytes": [], "logprob": -14.0}
+                ]
+            }]}
+        }],
+        "object": "chat.completion",
+        "model": "shieldstral"
+    }))
+}
+
+/// Answers each classifier request with `f(body)`.
+struct Shield(Box<dyn Fn(&str) -> ResponseTemplate + Send + Sync>);
+
+impl Respond for Shield {
+    fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+        (self.0)(std::str::from_utf8(&req.body).unwrap())
+    }
+}
+
+async fn shield_server(f: impl Fn(&str) -> ResponseTemplate + Send + Sync + 'static) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Shield(Box::new(f)))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The test config with every `home/*` tool on `confirm` (unlock on
+/// `unlock_policy`), deletes on `deny`, and `[approval]` in `mode` against
+/// the classifier at `url`.
+fn approval_config(url: &str, mode: &str, unlock_policy: &str, extra: &str) -> String {
+    let policies = "[[tool_policies]]\nmatch = \"home/unlock_*\"\npolicy = \"confirm\"\n\n\
+                    [[tool_policies]]\nmatch = \"home/*\"\npolicy = \"allow\"\n";
+    assert!(CONFIG.contains(policies));
+    let config = CONFIG.replace(
+        policies,
+        &format!(
+            "[[tool_policies]]\nmatch = \"home/unlock_*\"\npolicy = \"{unlock_policy}\"\n\n\
+             [[tool_policies]]\nmatch = \"home/*\"\npolicy = \"confirm\"\n"
+        ),
+    );
+    format!(
+        "{config}\n[approval]\nmode = \"{mode}\"\nbase_url = \"{url}\"\nauto_approve_below = 0.2\n\
+         request_timeout_secs = 1\nmax_retries = 0\n{extra}\n"
+    )
+}
+
+async fn audit_of(h: &Harness, kind: &str) -> Vec<Value> {
+    h.db.audit_entries(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|(k, _)| k == kind)
+        .map(|(_, v)| v)
+        .collect()
+}
+
+/// The path of a confirmation notification's Approve or Deny button.
+fn button(n: &Notification, approve: bool) -> String {
+    let Kind::Confirm {
+        approve_url: Some(a),
+        deny_url: Some(d),
+        ..
+    } = &n.kind
+    else {
+        panic!("expected a confirmation: {n:?}");
+    };
+    let url = if approve { a } else { d };
+    url.strip_prefix("https://ring.test").unwrap().to_string()
+}
+
+#[tokio::test]
+async fn classifier_low_score_runs_the_tool_and_says_so() {
+    let shield = shield_server(|_| shield_reply(0.02)).await;
+    let h = harness_config(
+        &approval_config(&shield.uri(), "classifier", "confirm", ""),
+        vec![
+            multi_tool_turn(&[(
+                "toolu_1",
+                "home__set_light",
+                json!({"name": "kitchen", "on": true}),
+            )]),
+            final_turn("Kitchen lights on."),
+        ],
+        Some(" Turn on the kitchen lights."),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-1", "double-click-hold").await;
+
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["set_light kitchen true".to_string()]
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "no confirmation asked: {notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert_eq!(
+        notes[0].body,
+        "Kitchen lights on.\n\nAuto-approved by the classifier: home/set_light \
+         {\"name\":\"kitchen\",\"on\":true} (score 0.02)"
+    );
+    let c = &audit_of(&h, "classification").await[0];
+    assert_eq!(c["verdict"], "safe");
+    assert_eq!(c["outcome"], "auto_approved");
+    assert_eq!(c["mode"], "classifier");
+    assert!((c["score"].as_f64().unwrap() - 0.02).abs() < 1e-9, "{c}");
+    assert_eq!(c["threshold"], 0.5);
+    assert_eq!(c["auto_approve_below"], 0.2);
+    let call = &audit_of(&h, "tool_call").await[0];
+    assert_eq!(call["approved_by"], "classifier");
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn classifier_request_matches_the_model_card() {
+    let shield = shield_server(|_| shield_reply(0.01)).await;
+    let h = harness_config(
+        &approval_config(
+            &shield.uri(),
+            "classifier",
+            "confirm",
+            "model = \"shieldstral-test\"",
+        ),
+        vec![
+            multi_tool_turn(&[(
+                "toolu_1",
+                "home__set_light",
+                json!({"name": "kitchen", "on": true}),
+            )]),
+            final_turn("Done."),
+        ],
+        Some("turn on the kitchen lights"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-2", "double-click-hold").await;
+
+    let reqs = shield.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(body["model"], "shieldstral-test");
+    assert_eq!(body["max_tokens"], 1);
+    assert_eq!(body["temperature"], 0.0);
+    assert_eq!(body["logprobs"], true);
+    assert_eq!(body["top_logprobs"], 20);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(
+        messages[0]["content"],
+        "Judge whether the Document meets the requirements based on the Query and the \
+         Instruction provided. Note that the answer can only be \"yes\" or \"no\"."
+    );
+    assert_eq!(messages[1]["role"], "user");
+    let user = messages[1]["content"].as_str().unwrap();
+    assert!(
+        user.starts_with("<Instruct>: You are a strict safety reviewer"),
+        "{user}"
+    );
+    assert!(
+        user.contains("\n\n<Query>: Does this proposed action go beyond what the user asked for"),
+        "{user}"
+    );
+    assert!(
+        user.ends_with(
+            "\n\n<Document>: [User request]\nturn on the kitchen lights\n\n\
+             [Proposed action]\nTool: home/set_light\nDescription: Turn a light on or off\n\
+             Arguments: {\"name\":\"kitchen\",\"on\":true}"
+        ),
+        "{user}"
+    );
+    // No credentials were configured, so none are sent.
+    assert!(reqs[0].headers.get("authorization").is_none());
+}
+
+#[tokio::test]
+async fn classifier_flag_escalates_and_never_denies() {
+    let shield = shield_server(|_| shield_reply(0.93)).await;
+    let h = harness_config(
+        &approval_config(&shield.uri(), "classifier", "confirm", ""),
+        vec![
+            tool_use_turn("toolu_9", "home__unlock_door", json!({"door": "front"})),
+            final_turn("Front door unlocked."),
+        ],
+        Some("unlock the front door"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-3", "double-click-hold").await;
+
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::AwaitingConfirmation
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(
+        notes[0].title,
+        "Ringmaster: approve? (flagged by the classifier)"
+    );
+    assert!(
+        notes[0].body.contains(
+            "home/unlock_door {\"door\":\"front\"}\n  Classifier flagged this (score 0.93 > 0.50)"
+        ),
+        "{}",
+        notes[0].body
+    );
+    let c = &audit_of(&h, "classification").await[0];
+    assert_eq!(
+        (c["verdict"].as_str(), c["outcome"].as_str()),
+        (Some("unsafe"), Some("escalated"))
+    );
+
+    // It did not deny anything: the human can still approve.
+    let (status, _) = send(
+        &h,
+        Request::post(button(&notes[0], true))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick(&h).await;
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["unlock_door front".to_string()]
+    );
+    let last = h.notes.take().pop().unwrap();
+    // Approved by a human: not listed as auto-approved.
+    assert_eq!(last.body, "Front door unlocked.");
+    assert_eq!(audit_of(&h, "tool_call").await[0]["approved_by"], "human");
+}
+
+#[tokio::test]
+async fn classifier_grey_band_escalates() {
+    let shield = shield_server(|_| shield_reply(0.35)).await;
+    let h = harness_config(
+        &approval_config(&shield.uri(), "classifier", "confirm", ""),
+        vec![multi_tool_turn(&[(
+            "toolu_1",
+            "home__set_light",
+            json!({"name": "hall", "on": false}),
+        )])],
+        Some("turn off the hall light"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-4", "double-click-hold").await;
+
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let notes = h.notes.take();
+    assert!(matches!(notes[0].kind, Kind::Confirm { .. }), "{notes:?}");
+    assert_eq!(notes[0].title, "Ringmaster: approve?");
+    assert!(
+        notes[0]
+            .body
+            .contains("Classifier unsure (score 0.35; only below 0.20 runs without asking)"),
+        "{}",
+        notes[0].body
+    );
+    assert_eq!(
+        audit_of(&h, "classification").await[0]["verdict"],
+        "uncertain"
+    );
+}
+
+#[tokio::test]
+async fn classifier_down_slow_or_malformed_asks_the_human() {
+    let dead = {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        format!("http://127.0.0.1:{port}")
+    };
+    let slow = shield_server(|_| shield_reply(0.01).set_delay(Duration::from_secs(5))).await;
+    let malformed = shield_server(|_| {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"choices": [{"message": {"content": "no"}}]}))
+    })
+    .await;
+    let not_found =
+        shield_server(|_| ResponseTemplate::new(404).set_body_string("no such model")).await;
+    for (url, expect) in [
+        (dead, "classifier unavailable"),
+        (slow.uri(), "no verdict within 1 s"),
+        (malformed.uri(), "unusable classifier reply: no logprobs"),
+        (not_found.uri(), "classifier rejected the request: 404"),
+    ] {
+        let h = harness_config(
+            &approval_config(&url, "classifier", "confirm", "alert_after_failures = 2"),
+            vec![
+                multi_tool_turn(&[(
+                    "toolu_1",
+                    "home__set_light",
+                    json!({"name": "kitchen", "on": true}),
+                )]),
+                multi_tool_turn(&[(
+                    "toolu_2",
+                    "home__set_light",
+                    json!({"name": "hall", "on": true}),
+                )]),
+            ],
+            Some("turn on the lights"),
+            |home| vec![home],
+        )
+        .await;
+        let started = std::time::Instant::now();
+        run_command(&h, "rec-shield-5a", "double-click-hold").await;
+        assert!(started.elapsed() < Duration::from_secs(4), "{url}");
+
+        assert!(h.mcp_calls.lock().unwrap().is_empty(), "{url}");
+        let job = h.db.get_job(1).await.unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::AwaitingConfirmation, "{url}");
+        let notes = h.notes.take();
+        assert_eq!(notes.len(), 1, "{url}: {notes:?}");
+        assert!(
+            notes[0].body.contains("No classifier verdict (") && notes[0].body.contains(expect),
+            "{url}: {}",
+            notes[0].body
+        );
+        let c = &audit_of(&h, "classification").await[0];
+        assert_eq!(c["verdict"], "unavailable", "{url}");
+        assert!(c["score"].is_null());
+
+        // A second failure in a row raises the operator alert.
+        run_command(&h, "rec-shield-5b", "double-click-hold").await;
+        h.notes.take();
+        h.health.beat_worker(now());
+        h.watchdog.check(now()).await;
+        let sent = alerts(&h);
+        assert_eq!(sent.len(), 1, "{url}: {sent:?}");
+        assert_eq!(
+            sent[0].title,
+            "Ringmaster alert: approval classifier failing"
+        );
+        assert!(
+            sent[0].body.contains("failed 2 times in a row"),
+            "{}",
+            sent[0].body
+        );
+        assert!(!sent[0].body.contains("lights"), "no transcripts in alerts");
+    }
+}
+
+#[tokio::test]
+async fn deny_and_ask_are_never_classified() {
+    let shield = shield_server(|_| shield_reply(0.01)).await;
+    let h = harness_config(
+        &approval_config(&shield.uri(), "classifier", "ask", ""),
+        vec![
+            multi_tool_turn(&[
+                ("toolu_d", "home__delete_everything", json!({})),
+                ("toolu_u", "home__unlock_door", json!({"door": "back"})),
+                (
+                    "toolu_l",
+                    "home__set_light",
+                    json!({"name": "porch", "on": true}),
+                ),
+            ]),
+            final_turn("Back door unlocked and porch light on."),
+        ],
+        Some("unlock the back door and turn on the porch light"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-6", "double-click-hold").await;
+
+    assert!(
+        shield.received_requests().await.unwrap().is_empty(),
+        "the classifier must not be asked"
+    );
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let body = &notes[0].body;
+    assert!(
+        body.contains("home/unlock_door {\"door\":\"back\"}\n  Always asks you (policy ask)"),
+        "{body}"
+    );
+    assert!(body.contains("home/set_light {\"name\":\"porch\",\"on\":true}\n  Not checked: another action here always asks you"), "{body}");
+    assert!(!body.contains("delete_everything"), "{body}");
+    // The denied tool was not even offered.
+    let first = h.claude_seen.lock().unwrap()[0].clone();
+    let names: Vec<&str> = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["home__set_light", "home__unlock_door"]);
+
+    // Approving runs the two allowed calls; the denied one stays blocked.
+    let (status, _) = send(
+        &h,
+        Request::post(button(&notes[0], true))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick(&h).await;
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec![
+            "unlock_door back".to_string(),
+            "set_light porch true".to_string()
+        ]
+    );
+    assert!(shield.received_requests().await.unwrap().is_empty());
+    let seen = h.claude_seen.lock().unwrap().clone();
+    let results = &seen[1]["messages"][2]["content"];
+    assert_eq!(results[0]["is_error"], true);
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool home__delete_everything")
+    );
+}
+
+#[tokio::test]
+async fn shadow_mode_records_the_verdict_and_still_asks() {
+    let shield = shield_server(|_| shield_reply(0.01)).await;
+    let h = harness_config(
+        &approval_config(&shield.uri(), "shadow", "confirm", ""),
+        vec![
+            tool_use_turn("toolu_9", "home__unlock_door", json!({"door": "front"})),
+            final_turn("OK, I left it locked."),
+        ],
+        Some("unlock the front door"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-7", "double-click-hold").await;
+
+    assert_eq!(shield.received_requests().await.unwrap().len(), 1);
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].title, "Ringmaster: approve?");
+    assert!(
+        notes[0]
+            .body
+            .contains("(shadow) Classifier would auto-approve this (score 0.01)"),
+        "{}",
+        notes[0].body
+    );
+    let c = &audit_of(&h, "classification").await[0];
+    assert_eq!(
+        (c["verdict"].as_str(), c["outcome"].as_str()),
+        (Some("safe"), Some("shadow"))
+    );
+
+    // The human denies what the classifier would have run: a disagreement.
+    send(
+        &h,
+        Request::post(button(&notes[0], false))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    tick(&h).await;
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let cmp = &audit_of(&h, "shadow_comparison").await[0];
+    assert_eq!(cmp["decision"], "deny");
+    assert_eq!(cmp["disagreement"], true);
+    assert_eq!(cmp["result"], "classifier_would_have_run_a_denied_action");
+    assert_eq!(cmp["judgements"][0]["tool"], "home/unlock_door");
+    // Nothing ran on the classifier's say.
+    assert_eq!(h.notes.take().pop().unwrap().body, "OK, I left it locked.");
+}
+
+#[tokio::test]
+async fn one_flagged_call_sends_the_whole_turn_to_the_human() {
+    let shield = shield_server(|body| {
+        shield_reply(if body.contains("unlock_door") {
+            0.9
+        } else {
+            0.01
+        })
+    })
+    .await;
+    let h = harness_config(
+        &approval_config(&shield.uri(), "classifier", "confirm", ""),
+        vec![multi_tool_turn(&[
+            (
+                "toolu_l",
+                "home__set_light",
+                json!({"name": "porch", "on": true}),
+            ),
+            ("toolu_u", "home__unlock_door", json!({"door": "front"})),
+        ])],
+        Some("turn on the porch light"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-8", "double-click-hold").await;
+
+    // Each call was classified on its own...
+    assert_eq!(shield.received_requests().await.unwrap().len(), 2);
+    // ...and the safe one did not run either.
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let body = &notes[0].body;
+    assert!(
+        body.contains("Classifier passed this (score 0.01); asking because of the other actions"),
+        "{body}"
+    );
+    assert!(
+        body.contains("Classifier flagged this (score 0.90 > 0.50)"),
+        "{body}"
+    );
+    let verdicts: Vec<String> = audit_of(&h, "classification")
+        .await
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {}",
+                c["verdict"].as_str().unwrap(),
+                c["outcome"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(verdicts, ["safe escalated", "unsafe escalated"]);
+}
+
+#[tokio::test]
+async fn profile_can_keep_manual_approval_in_classifier_mode() {
+    let shield = shield_server(|_| shield_reply(0.01)).await;
+    let config = approval_config(&shield.uri(), "classifier", "confirm", "").replace(
+        "tools = [\"home/set_light\"]\nsystem_prompt = \"Capture mode.\"",
+        "tools = [\"home/set_light\"]\nsystem_prompt = \"Capture mode.\"\napproval_mode = \"manual\"",
+    );
+    assert!(config.contains("approval_mode = \"manual\""));
+    let h = harness_config(
+        &config,
+        vec![multi_tool_turn(&[(
+            "toolu_l",
+            "home__set_light",
+            json!({"name": "porch", "on": true}),
+        )])],
+        Some("porch light on"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "rec-shield-9", "single-click-hold").await;
+    assert!(shield.received_requests().await.unwrap().is_empty());
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let notes = h.notes.take();
+    assert!(matches!(notes[0].kind, Kind::Confirm { .. }), "{notes:?}");
+    assert!(!notes[0].body.contains("Classifier"), "{}", notes[0].body);
+}
+
+#[tokio::test]
+async fn configs_without_approval_ask_exactly_as_before() {
+    let h = harness(
+        vec![tool_use_turn(
+            "toolu_9",
+            "home__unlock_door",
+            json!({"door": "front"}),
+        )],
+        Some("unlock the front door"),
+    )
+    .await;
+    run_command(&h, "rec-shield-10", "double-click-hold").await;
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].title, "Ringmaster: approve?");
+    assert_eq!(
+        notes[0].body,
+        "Request: \"unlock the front door\"\nRun this action:\n\
+         home/unlock_door {\"door\":\"front\"}\n(expires in 10 min)"
+    );
+    assert!(audit_of(&h, "classification").await.is_empty());
+    // The parked state has the same shape as before the classifier.
+    let state = serde_json::to_value(h.db.get_job(1).await.unwrap().unwrap().agent_state).unwrap();
+    assert!(state.get("auto_approved").is_none(), "{state}");
+    let pending = &state["pending"];
+    assert_eq!(
+        pending.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["calls"]
     );
 }

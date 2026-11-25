@@ -5,7 +5,9 @@ the phone app posts the recording to Ringmaster, which transcribes it on a Mac
 with whisper.cpp, hands the text to an LLM (Claude by default; OpenAI,
 Mistral, OpenRouter or a local Ollama also work) with tools from your MCP
 servers (smart home, Nextcloud Deck, ...), and sends the outcome back to your
-phone with ntfy. Risky actions wait for you to tap **Approve**.
+phone with ntfy. Risky actions wait for you to tap **Approve** (optionally, a
+local Shieldstral classifier approves the plainly harmless ones for you; see
+[Automatic approval](#automatic-approval-shieldstral)).
 
 It is one Rust service in one container, built for a home server running
 Docker Compose.
@@ -267,6 +269,7 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | any `api_key_env` named in `[llm]` / `[llm.<provider>]` | replaces the default variable for that provider |
 | `RINGMASTER_WEBHOOK_SECRET` | the ring app's signing secret, at least 32 characters (required unless `webhook.require_signature = false`) |
 | `NTFY_TOKEN` | ntfy access token, if the topic needs one |
+| the `approval.api_key_env` variable, if set | bearer token for the approval classifier server (a missing one is a warning; calls then go to you) |
 | any `token_env` named by an `[[mcp_servers]]` entry | bearer token for that MCP server |
 
 ### Reference
@@ -331,9 +334,19 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `[[mcp_servers]]` `name`, `url`, `token_env` | | streamable HTTP MCP servers; `token_env` sends `Authorization: Bearer` |
 | `[[mcp_servers]]` `basic_auth` | | `{ username = "...", password_env = "VAR" }`: HTTP Basic, e.g. a Nextcloud app password; takes precedence over `token_env` |
 | `[[mcp_servers]]` `headers_env` | | `{ "X-Api-Key" = "VAR" }`: extra headers, values from environment variables |
-| `[[tool_policies]]` `match`, `policy` | | glob over `server/tool`; `allow` `confirm` `deny`; first match wins |
+| `[[tool_policies]]` `match`, `policy` | | glob over `server/tool`; `allow` `confirm` `ask` `deny`; first match wins (`ask` = `confirm` that the classifier may never approve) |
 | `[profiles.<name>]` `triggers`, `system_prompt`, `tools` | | gesture → prompt + tool allow-list (globs; `*/*` = all) |
 | `[profiles.<name>]` `provider`, `model`, `effort`, `max_iterations`, `job_max_age_secs` | | per-profile overrides; a profile with a `provider` other than the default needs a `model` (here or in `[llm.<provider>]`) |
+| `[profiles.<name>]` `approval_mode` | `approval.mode` | `manual` `shadow` `classifier` for this profile |
+| `approval.mode` | `manual` | who approves `confirm` calls: `manual` (you), `shadow` (you, with the classifier's verdict recorded), `classifier` (the classifier for clear passes, you for the rest); see [Automatic approval](#automatic-approval-shieldstral) |
+| `approval.base_url` | none; required unless every mode is `manual` | classifier server (llama-server, vLLM, SGLang), without `/v1` |
+| `approval.model` | `mistralai/Shieldstral-1.0-3B` | model name in the request (vLLM checks it, llama-server ignores it) |
+| `approval.api_key_env` | none | variable holding a bearer token for the classifier server |
+| `approval.request_timeout_secs` / `approval.max_retries` | `15` / `1` | how long to wait for a verdict, retries included (1-120), then ask you |
+| `approval.threshold` | `0.5` | scores above this are reported as "flagged" |
+| `approval.auto_approve_below` | `approval.threshold` | only scores below this run without asking; between it and `threshold` is a grey band that asks you (0.2 recommended) |
+| `approval.instruct` / `approval.query` | built in | the `<Instruct>` and `<Query>` text; phrase the query so "yes" means unsafe |
+| `approval.alert_after_failures` | `3` | classifier failures in a row before an alert |
 
 Glob `*` does not cross the `/` between server and tool: `homey/*` matches
 every Homey tool, `*` alone matches nothing.
@@ -403,7 +416,7 @@ do not use an open public topic. Notifications:
 | Kind | Priority | When |
 |---|---|---|
 | result | 3 | the agent finished; the body is the model's one-line answer |
-| approve? | 5 | a `confirm` tool is waiting; `Approve` / `Deny` buttons (`http` actions that `POST` to `/confirm/<token>/approve|deny`) and a `Details` link |
+| approve? | 5 | a `confirm` or `ask` tool is waiting; `Approve` / `Deny` buttons (`http` actions that `POST` to `/confirm/<token>/approve|deny`) and a `Details` link; with an approval classifier, a line per call with its verdict and score, and the title `Ringmaster: approve? (flagged by the classifier)` when it flagged one |
 | problem | 4 | errors, refusals, give-ups, and the first delay of a job |
 | info | 2 | test events, empty recordings |
 | alert | 5 (reminders 4) | operational problems (see [Health and alerts](#health-and-alerts)); tags `rotating_light`, `ringmaster-alert`; title `Ringmaster alert: ...` |
@@ -411,7 +424,104 @@ do not use an open public topic. Notifications:
 
 Set `alerts.ntfy_topic` to send alerts to their own topic.
 
+## Automatic approval (Shieldstral)
+
+By default every `confirm` tool call waits for you to tap Approve. Optionally,
+a local [Shieldstral](https://huggingface.co/mistralai/Shieldstral-1.0-3B)
+classifier (Mistral's 3.8B safety classifier, Apache 2.0) can approve the
+plainly harmless ones, so "turn on the kitchen lights" does not need a tap.
+It runs on your own hardware behind an OpenAI-compatible endpoint; see
+[docs/mac-shieldstral.md](docs/mac-shieldstral.md) for llama.cpp on a Mac.
+
+> **Read this first.** Shieldstral was trained and evaluated on *content*
+> safety: harmful prompts, responses and images. It was **not** trained or
+> evaluated on judging an agent's tool calls. Ringmaster shows it your words
+> and the proposed call as a document and asks whether the action goes beyond
+> what you asked for or could cause harm; how well it answers that is
+> untested. Small classifiers are particularly weak at what matters most
+> here: noticing that speech was misheard, or that the action targets the
+> wrong door, card or person when it looks harmless on its own. The
+> transcript is also untrusted text that the classifier reads, so a crafted
+> request could try to talk it into "no". Treat it as a convenience for
+> low-stakes actions, never as a safety boundary: profiles and policies stay
+> that boundary.
+
+How each mode behaves (`approval.mode`, or `approval_mode` per profile):
+
+| Mode | `confirm` calls | `ask` calls | `allow` / `deny` |
+|---|---|---|---|
+| `manual` (default) | Approve/Deny notification, exactly as before | same as `confirm` | unchanged |
+| `shadow` | Approve/Deny notification; the classifier's verdict is shown in it and recorded, and compared with your decision | Approve/Deny, never classified | unchanged |
+| `classifier` | score below `auto_approve_below`: runs at once; anything else (flagged, grey band, no verdict): Approve/Deny | Approve/Deny, never classified | unchanged |
+
+* The classifier **can approve but never deny.** A "flagged" verdict only
+  means you are asked, with the classifier's score in the notification
+  ("Classifier flagged this (score 0.93 > 0.50)").
+* **It fails over to you.** A server that is down, slow
+  (`request_timeout_secs`), answers with an error or without `yes`/`no`
+  log-probabilities, or a call too long to judge whole (transcript over 2000
+  or arguments over 4000 characters) means you are asked, never that the
+  call runs or the job fails. After `alert_after_failures` failures in a row
+  you get an operational alert.
+* `deny` tools are never offered to the model and never classified; `ask`
+  tools always ask you and are never sent to the classifier. If one call in
+  a turn is `ask`, the others are not classified either.
+* Each call in a turn is classified on its own; the turn runs without asking
+  only if every `confirm` call in it passes. Otherwise the whole turn goes to
+  you, as without a classifier, with a line per call saying what the
+  classifier made of it.
+* Every auto-approved action is listed, with its arguments and score, at the
+  end of the job's final notification ("Auto-approved by the classifier:
+  home/set_light {...} (score 0.03)"), and in the audit log.
+
+The request follows the model card: the fixed system message, a user message
+of `<Instruct>` (the context and strictness), `<Query>` (one yes/no question
+where "yes" means "do not run without asking") and `<Document>` (what you
+said, verbatim; any text the model wrote with the call; the tool's name,
+description and exact arguments), with `max_tokens = 1`, `temperature = 0`,
+`logprobs = true` and `top_logprobs = 20`. The score is the softmax of the
+`yes` and `no` log-probabilities. Override the wording with
+`approval.instruct` and `approval.query`.
+
+**Recommended rollout**
+
+1. Run `shadow` for a few weeks. Every `confirm` call still asks you; the
+   notification shows what the classifier would have done, and each decision
+   is recorded as a `shadow_comparison` audit row
+   (`ringmaster_shadow_comparisons_total{result}`). Look hard at
+   `classifier_would_have_run_a_denied_action`: each one is a call it would
+   have run that you refused.
+2. Set deletes and anything destructive to `deny` (they are then never even
+   offered), and locks, alarms, doors, payments and messages to other people
+   to `ask`.
+3. Switch to `classifier` with a grey band (`auto_approve_below = 0.2`), and
+   keep `manual` on profiles where a wrong action is costly
+   (`approval_mode = "manual"`). Watch the auto-approved lists in your
+   notifications.
+
+```toml
+[approval]
+mode = "classifier"
+base_url = "http://192.168.88.30:8090"   # llama-server on the Mac
+auto_approve_below = 0.2
+
+[[tool_policies]]
+match = "*/*delete*"
+policy = "deny"
+
+[[tool_policies]]
+match = "homey/*lock*"
+policy = "ask"
+
+[[tool_policies]]
+match = "homey/*alarm*"
+policy = "ask"
+```
+
 ## Transcription on the Mac
+
+For the optional approval classifier, see
+[docs/mac-shieldstral.md](docs/mac-shieldstral.md) (llama.cpp `llama-server`).
 
 See [docs/mac-transcription.md](docs/mac-transcription.md): whisper.cpp built
 from source (Homebrew's formula does not include the server), the
@@ -455,8 +565,15 @@ for humans). Metrics include `ringmaster_webhook_requests_total{result}`,
 `ringmaster_llm_tokens_total{provider,kind}` (input, output, cache_read,
 cache_write; up to 0.1.2 these were `ringmaster_claude_*` without a provider
 label), `ringmaster_tool_calls_total{outcome}`,
-`ringmaster_confirmations_total{decision}` and
-`ringmaster_notifications_total{status}`.
+`ringmaster_confirmations_total{decision}`,
+`ringmaster_notifications_total{status}`, and for the approval classifier
+`ringmaster_approvals_total{mode,outcome}` (per turn needing approval:
+`auto_approved`, `escalated`, `shadow`, `manual`),
+`ringmaster_classifications_total{mode,verdict}` (`safe`, `uncertain`,
+`unsafe`, `unavailable`, `ask`, `skipped`),
+`ringmaster_classifier_score{mode}` (histogram),
+`ringmaster_shadow_comparisons_total{result}` and the classifier's requests
+as `ringmaster_llm_requests_total{provider="classifier",status}`.
 
 Health gauges (refreshed by the watchdog and on every scrape):
 `ringmaster_db_healthy` (0/1), `ringmaster_db_errors_total{class}`,
@@ -464,7 +581,8 @@ Health gauges (refreshed by the watchdog and on every scrape):
 `ringmaster_oldest_due_job_age_seconds`,
 `ringmaster_worker_heartbeat_age_seconds`,
 `ringmaster_watchdog_heartbeat_age_seconds`, `ringmaster_alerts_active`,
-`ringmaster_alert_active{condition}`, `ringmaster_blocking_tasks{kind}`
+`ringmaster_alert_active{condition}`,
+`ringmaster_classifier_failures_in_a_row`, `ringmaster_blocking_tasks{kind}`
 (decodes and audio writes in progress), `ringmaster_mcp_sessions` and
 `ringmaster_tokio_alive_tasks`. A steady rise in the last three is a leak.
 
@@ -482,6 +600,7 @@ A watchdog task, independent of the worker, checks every
 | job past its deadline | a job has run `overrun_margin_secs` past `agent.attempt_timeout_secs` (the deadline did not fire) |
 | jobs failing | `failure_threshold` jobs failed, expired, were quarantined or panicked within `failure_window_secs` |
 | blocking work stuck | a decode (or an audio write) has not returned `overrun_margin_secs` after its limit |
+| approval classifier failing | `approval.alert_after_failures` classifications in a row got no verdict (the calls went to you); never affects `/healthz` |
 
 Each problem gets one alert when it starts, a reminder every `reminder_secs`
 while it lasts and one "recovered" message when it clears. Alerts carry
@@ -535,7 +654,12 @@ conversation; `confirmations` the hashed one-time tokens and decisions;
 `audit` a timeline per job: `delivery`, `transcript`, `agent_start`,
 `claude_response` (stop reason, tool calls, usage; `llm_response` with the
 provider and finish reason for the other providers), `tool_call` (input,
-policy action, result), `confirmation_requested` / `_answered` / `_decision`,
+policy action, result, `approved_by` `human` or `classifier`),
+`classification` (per classified call: tool, mode, verdict, score,
+`threshold`, `auto_approve_below`, outcome `auto_approved` / `escalated` /
+`shadow`, error), `confirmation_requested` (with the classifier's
+judgements) / `_answered` / `_decision`, `shadow_comparison` (your decision
+against what the classifier would have done),
 `retry_scheduled`, `job_finished` / `job_failed`, and `job_quarantined` for
 a queued job that could no longer be read.
 
@@ -565,6 +689,10 @@ docker compose cp ringmaster:/data/ringmaster.db /tmp/ && sqlite3 /tmp/ringmaste
   order; a stuck job then delays the rest by up to `attempt_timeout_secs`.
 * The transcript is untrusted input. The capture profile only has Deck
   tools, so even "unlock the door" said in capture mode becomes a card.
+* The approval classifier is a convenience, not a safety boundary: it was
+  not trained on tool calls and can be wrong or talked round. Keep
+  destructive tools on `deny` and security-relevant ones on `ask`, and start
+  in `shadow` mode (see [Automatic approval](#automatic-approval-shieldstral)).
 
 ## Development
 
