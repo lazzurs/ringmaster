@@ -1,10 +1,12 @@
-//! The agent loop: Claude Messages API + MCP tools, with confirmations.
+//! The agent loop: an LLM (Claude or another provider) + MCP tools, with
+//! confirmations.
 //!
 //! The conversation is stored in the job after every step, so a job can be
 //! retried, survive a restart, or pause for an Approve/Deny decision and pick
-//! up exactly where it left off. History is append-only: the system prompt,
-//! model and tool list are frozen when the conversation starts, and assistant
-//! content (thinking blocks included) is echoed back unchanged.
+//! up exactly where it left off. History is append-only: the provider, model,
+//! system prompt and tool list are frozen when the conversation starts, and
+//! assistant messages (Claude's thinking blocks included) are echoed back
+//! unchanged in the provider's own format.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,15 +16,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::claude::{ClaudeClient, ClaudeError, FALLBACK_BETA};
 use crate::config::{Config, ProfileConfig};
 use crate::db::{Db, Job, JobStatus};
+use crate::llm::{ChatModel, ChatRequest, LlmError, Llms, Provider, StopKind, ToolResult};
 use crate::notify::{Kind, Notification, Notifier};
 use crate::policy::{Policies, Policy, ToolFilter};
 use crate::tools::{ToolBackend, ToolDef, ToolError, to_defs};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentState {
+    /// Provider the job started with; it keeps it for good. States saved
+    /// before there was a choice are Anthropic's.
+    #[serde(default)]
+    pub provider: Provider,
     pub model: String,
     pub system: String,
     pub effort: String,
@@ -30,7 +36,7 @@ pub struct AgentState {
     pub messages: Vec<Value>,
     pub iterations: u32,
     pub pending: Option<PendingTurn>,
-    /// Set once Claude has given its final answer.
+    /// Set once the model has given its final answer.
     #[serde(default)]
     pub final_text: Option<String>,
     /// MCP servers (or "all tools") that could not be used for this job.
@@ -46,7 +52,9 @@ pub struct PendingTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedCall {
+    /// The provider's id for the call (`tool_use_id` / `tool_call_id`).
     pub tool_use_id: String,
+    /// The tool name the model used.
     pub claude_name: String,
     pub input: Value,
     pub action: CallAction,
@@ -66,7 +74,7 @@ pub enum AgentOutcome {
     Final(String),
     /// Paused for an Approve/Deny decision.
     AwaitingConfirmation,
-    /// Claude (or its safety classifiers) declined.
+    /// The model (or its provider's safety systems) declined.
     Refused(String),
     /// Stopped without an answer (iteration cap).
     GaveUp(String),
@@ -96,7 +104,7 @@ pub struct Request<'a> {
 pub struct Agent {
     pub config: Arc<Config>,
     pub db: Db,
-    pub claude: ClaudeClient,
+    pub llms: Llms,
     pub tools: Arc<dyn ToolBackend>,
     pub notifier: Arc<dyn Notifier>,
     policies: Policies,
@@ -107,7 +115,7 @@ impl Agent {
     pub fn new(
         config: Arc<Config>,
         db: Db,
-        claude: ClaudeClient,
+        llms: Llms,
         tools: Arc<dyn ToolBackend>,
         notifier: Arc<dyn Notifier>,
     ) -> anyhow::Result<Self> {
@@ -120,7 +128,7 @@ impl Agent {
         Ok(Self {
             config,
             db,
-            claude,
+            llms,
             tools,
             notifier,
             policies,
@@ -148,6 +156,7 @@ impl Agent {
         if state.messages.is_empty() {
             self.start(job, req, profile, filter, &mut state).await?;
         }
+        let llm = self.llms.get(state.provider);
 
         if let Some(pending) = state.pending.clone() {
             let decision = self.db.latest_decision(job.id).await?;
@@ -173,24 +182,25 @@ impl Agent {
             let results = self
                 .execute(job, &state, &pending.calls, approved, refusal_text)
                 .await;
-            state
-                .messages
-                .push(json!({"role": "user", "content": results}));
+            state.messages.extend(llm.tool_results(&results));
             state.pending = None;
             self.db.save_agent_state(job.id, &state).await?;
         }
 
-        let max_iterations = profile
-            .max_iterations
-            .unwrap_or(self.config.claude.max_iterations);
+        let max_iterations = self.config.max_iterations(profile);
+        let (response_kind, error_kind) = llm.audit_kinds();
 
         loop {
-            // A crash between storing Claude's reply and its tool results
+            // A crash between storing the model's reply and its tool results
             // leaves an unanswered assistant turn: answer it now.
-            if last_role(&state.messages) == Some("assistant")
-                && has_tool_use(state.messages.last())
+            if let Some(last) = state.messages.last()
+                && last.get("role").and_then(Value::as_str) == Some("assistant")
+                && !llm.tool_calls(last).is_empty()
             {
-                if let Some(outcome) = self.handle_tool_turn(job, req, filter, &mut state).await? {
+                if let Some(outcome) = self
+                    .handle_tool_turn(job, req, filter, llm, &mut state)
+                    .await?
+                {
                     return Ok(outcome);
                 }
                 continue;
@@ -202,23 +212,31 @@ impl Agent {
                 )));
             }
 
-            let (body, betas) = self.request_body(&state);
             state.iterations += 1;
-            let resp = match self.claude.create_message(&body, &betas).await {
-                Ok(r) => r,
-                Err(ClaudeError::Transient(e)) => {
+            let result = llm
+                .complete(&ChatRequest {
+                    model: &state.model,
+                    system: &state.system,
+                    effort: &state.effort,
+                    tools: &state.tools,
+                    messages: &state.messages,
+                })
+                .await;
+            let turn = match result {
+                Ok(t) => t,
+                Err(LlmError::Transient(e)) => {
                     state.iterations -= 1;
                     return Err(AgentError::Transient(e));
                 }
-                Err(ClaudeError::Permanent(e)) => {
-                    self.audit(job, "claude_error", json!({ "error": e })).await;
-                    // A tool definition the API rejects must not sink the
-                    // request. Before any tool has run, try once more with no
-                    // tools: Claude can still answer, and say what it could
-                    // not do.
-                    if !state.tools.is_empty() && state.messages.len() == 1 && e.starts_with("400")
-                    {
-                        tracing::warn!(job = job.id, error = %e, "API rejected the request with tools; retrying without them");
+                Err(LlmError::Permanent(e)) => {
+                    self.audit(job, error_kind, json!({ "error": e })).await;
+                    // A tool definition the API rejects (or a model that
+                    // cannot use tools at all) must not sink the request.
+                    // Before any tool has run, try once more with no tools:
+                    // the model can still answer, and say what it could not
+                    // do.
+                    if !state.tools.is_empty() && state.messages.len() == 1 && rejects_tools(&e) {
+                        tracing::warn!(job = job.id, provider = %state.provider, error = %e, "API rejected the request with tools; retrying without them");
                         self.audit(
                             job,
                             "tools_dropped",
@@ -237,58 +255,40 @@ impl Agent {
                     return Err(AgentError::Permanent(e));
                 }
             };
+            self.audit(job, response_kind, turn.audit.clone()).await;
 
-            let stop_reason = resp
-                .get("stop_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let content = sanitize_fallback(resp.get("content").cloned().unwrap_or(json!([])));
-            self.audit(job, "claude_response", summarize_response(&resp, &content))
-                .await;
-
-            match stop_reason.as_str() {
-                "refusal" => {
-                    let category = resp
-                        .pointer("/stop_details/category")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unspecified");
+            match turn.stop {
+                StopKind::Refusal(msg) => {
                     self.db.save_agent_state(job.id, &state).await?;
-                    return Ok(AgentOutcome::Refused(format!(
-                        "Claude declined this request (category: {category})."
+                    return Ok(AgentOutcome::Refused(msg));
+                }
+                StopKind::MaxTokens => {
+                    // A truncated tool call may still parse; never run it.
+                    self.db.save_agent_state(job.id, &state).await?;
+                    return Err(AgentError::Permanent(format!(
+                        "{}'s reply was cut off at max_tokens; raise max_tokens for {}",
+                        state.provider.display(),
+                        state.provider
                     )));
                 }
-                "max_tokens" => {
-                    // A truncated tool_use input may still parse; never run it.
-                    self.db.save_agent_state(job.id, &state).await?;
-                    return Err(AgentError::Permanent(
-                        "Claude's reply was cut off at max_tokens; raise claude.max_tokens".into(),
-                    ));
-                }
-                "pause_turn" => {
-                    state
-                        .messages
-                        .push(json!({"role": "assistant", "content": content}));
+                StopKind::Pause => {
+                    state.messages.push(turn.message);
                     self.db.save_agent_state(job.id, &state).await?;
                     continue;
                 }
-                "tool_use" => {
-                    state
-                        .messages
-                        .push(json!({"role": "assistant", "content": content}));
+                StopKind::ToolUse => {
+                    state.messages.push(turn.message);
                     self.db.save_agent_state(job.id, &state).await?;
-                    if let Some(outcome) =
-                        self.handle_tool_turn(job, req, filter, &mut state).await?
+                    if let Some(outcome) = self
+                        .handle_tool_turn(job, req, filter, llm, &mut state)
+                        .await?
                     {
                         return Ok(outcome);
                     }
                 }
-                _ => {
-                    // end_turn, stop_sequence, or anything new: the answer.
-                    let text = with_unavailable_note(final_text(&content), &state, req);
-                    state
-                        .messages
-                        .push(json!({"role": "assistant", "content": content}));
+                StopKind::EndTurn => {
+                    let text = with_unavailable_note(llm.final_text(&turn.message), &state, req);
+                    state.messages.push(turn.message);
                     state.final_text = Some(text.clone());
                     self.db.save_agent_state(job.id, &state).await?;
                     return Ok(AgentOutcome::Final(text));
@@ -372,29 +372,27 @@ impl Agent {
                 filter.allows(&q) && self.policies.policy_for(&q) != Policy::Deny
             })
             .collect();
+        let choice = self
+            .config
+            .profile_llm(Some(profile))
+            .map_err(|e| AgentError::Permanent(format!("{e:#}")))?;
+        let llm = self.llms.get(choice.provider);
         state.tools = to_defs(offered);
         state.unavailable = unavailable.clone();
-        state.model = profile
-            .model
-            .clone()
-            .unwrap_or_else(|| self.config.claude.model.clone());
-        state.effort = profile
-            .effort
-            .clone()
-            .unwrap_or_else(|| self.config.claude.effort.clone());
+        state.provider = choice.provider;
+        state.model = choice.model;
+        state.effort = choice.effort;
         state.system = format!(
             "{}\n\n{}",
             self.config.base_prompt().trim(),
             profile.system_prompt.trim()
         );
-        state.messages = vec![json!({
-            "role": "user",
-            "content": [{"type": "text", "text": self.context_text(job, req, &unavailable)}],
-        })];
+        state.messages = vec![llm.user_message(&self.context_text(job, req, &unavailable))];
         self.audit(
             job,
             "agent_start",
             json!({
+                "provider": state.provider,
                 "model": state.model,
                 "effort": state.effort,
                 "tools": state.tools.iter().map(ToolDef::qualified).collect::<Vec<_>>(),
@@ -438,31 +436,6 @@ impl Agent {
         )
     }
 
-    fn request_body(&self, state: &AgentState) -> (Value, Vec<&'static str>) {
-        let mut body = json!({
-            "model": state.model,
-            "max_tokens": self.config.claude.max_tokens,
-            "system": [{
-                "type": "text",
-                "text": state.system,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            "messages": state.messages,
-            "output_config": {"effort": state.effort},
-            // Automatic breakpoint for the growing conversation tail.
-            "cache_control": {"type": "ephemeral"},
-        });
-        if !state.tools.is_empty() {
-            body["tools"] = Value::Array(state.tools.iter().map(ToolDef::to_api).collect());
-        }
-        let mut betas = Vec::new();
-        if self.config.claude.fallbacks_enabled(&state.model) {
-            body["fallbacks"] = json!("default");
-            betas.push(FALLBACK_BETA);
-        }
-        (body, betas)
-    }
-
     /// Plan and run (or park) the tool calls of the last assistant turn.
     /// Returns `Some` when the loop must stop.
     async fn handle_tool_turn(
@@ -470,45 +443,34 @@ impl Agent {
         job: &Job,
         req: &Request<'_>,
         filter: &ToolFilter,
+        llm: &dyn ChatModel,
         state: &mut AgentState,
     ) -> Result<Option<AgentOutcome>, AgentError> {
-        let content = state
-            .messages
-            .last()
-            .and_then(|m| m.get("content"))
-            .cloned()
-            .unwrap_or(json!([]));
-        let uses: Vec<&Value> = content
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let last = state.messages.last().cloned().unwrap_or(Value::Null);
+        let uses = llm.tool_calls(&last);
         if uses.is_empty() {
             return Ok(Some(AgentOutcome::Final(with_unavailable_note(
-                final_text(&content),
+                llm.final_text(&last),
                 state,
                 req,
             ))));
         }
 
         let calls: Vec<PlannedCall> = uses
-            .iter()
+            .into_iter()
             .map(|u| {
-                let id = u
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let name = u
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let input = u.get("input").cloned().unwrap_or(json!({}));
+                let name = u.name;
+                let (input, bad_input) = match u.input {
+                    Ok(v) => (v, None),
+                    Err(why) => (Value::Null, Some(why)),
+                };
                 let action = match state.tools.iter().find(|d| d.claude_name == name) {
+                    // Malformed arguments (a small model, or a cut-off reply)
+                    // are never run, whatever the tool's policy.
+                    _ if bad_input.is_some() => CallAction::Reject(format!(
+                        "Not run: {}. Call the tool again with a JSON object as its arguments.",
+                        bad_input.as_deref().unwrap_or_default()
+                    )),
                     None => CallAction::Reject(format!("Unknown tool {name}.")),
                     Some(def) => {
                         let q = def.qualified();
@@ -528,7 +490,7 @@ impl Agent {
                     }
                 };
                 PlannedCall {
-                    tool_use_id: id,
+                    tool_use_id: u.id,
                     claude_name: name,
                     input,
                     action,
@@ -546,9 +508,7 @@ impl Agent {
         }
 
         let results = self.execute(job, state, &calls, false, "").await;
-        state
-            .messages
-            .push(json!({"role": "user", "content": results}));
+        state.messages.extend(llm.tool_results(&results));
         self.db.save_agent_state(job.id, state).await?;
         Ok(None)
     }
@@ -624,8 +584,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Run planned calls in order and build the `tool_result` blocks, all of
-    /// which go back to Claude in one user message.
+    /// Run planned calls in order; the results go back to the model in the
+    /// provider's format.
     async fn execute(
         &self,
         job: &Job,
@@ -633,7 +593,7 @@ impl Agent {
         calls: &[PlannedCall],
         approved: bool,
         refusal_text: &str,
-    ) -> Vec<Value> {
+    ) -> Vec<ToolResult> {
         let max = self.config.agent.max_tool_result_chars;
         let mut results = Vec::with_capacity(calls.len());
         for c in calls {
@@ -676,15 +636,12 @@ impl Agent {
                 }),
             )
             .await;
-            let mut block = json!({
-                "type": "tool_result",
-                "tool_use_id": c.tool_use_id,
-                "content": truncate(&text, max),
+            results.push(ToolResult {
+                id: c.tool_use_id.clone(),
+                name: c.claude_name.clone(),
+                text: truncate(&text, max),
+                is_error,
             });
-            if is_error {
-                block["is_error"] = json!(true);
-            }
-            results.push(block);
         }
         results
     }
@@ -704,113 +661,15 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-fn has_tool_use(message: Option<&Value>) -> bool {
-    message
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)
-        .is_some_and(|a| {
-            a.iter()
-                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-        })
+/// Whether a permanent error is worth one more try without tools: a 400
+/// that is not about something tools cannot fix (thinking/reasoning).
+fn rejects_tools(e: &str) -> bool {
+    let lower = e.to_ascii_lowercase();
+    e.starts_with("400") && !lower.contains("thinking") && !lower.contains("reasoning")
 }
 
-fn last_role(messages: &[Value]) -> Option<&str> {
-    messages
-        .last()
-        .and_then(|m| m.get("role"))
-        .and_then(Value::as_str)
-}
-
-/// After a server-side fallback, blocks of the declined attempt that come
-/// before the last `fallback` block must not be echoed back (thinking,
-/// redacted thinking, tool use). The `fallback` block itself stays in place.
-pub fn sanitize_fallback(content: Value) -> Value {
-    let Value::Array(blocks) = content else {
-        return content;
-    };
-    let Some(last_fb) = blocks
-        .iter()
-        .rposition(|b| b.get("type").and_then(Value::as_str) == Some("fallback"))
-    else {
-        return Value::Array(blocks);
-    };
-    Value::Array(
-        blocks
-            .into_iter()
-            .enumerate()
-            .filter(|(i, b)| {
-                *i >= last_fb
-                    || !matches!(
-                        b.get("type").and_then(Value::as_str),
-                        Some("thinking" | "redacted_thinking" | "tool_use" | "server_tool_use")
-                    )
-            })
-            .map(|(_, b)| b)
-            .collect(),
-    )
-}
-
-fn final_text(content: &Value) -> String {
-    let text = content
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|b| b.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let text = text.trim();
-    if text.is_empty() {
-        "Done.".into()
-    } else {
-        text.to_string()
-    }
-}
-
-fn summarize_response(resp: &Value, content: &Value) -> Value {
-    let blocks: Vec<&str> = content
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|b| b.get("type").and_then(Value::as_str))
-                .collect()
-        })
-        .unwrap_or_default();
-    let tool_uses: Vec<Value> = content
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-                .map(|b| json!({"name": b.get("name"), "input": b.get("input")}))
-                .collect()
-        })
-        .unwrap_or_default();
-    let fallback_served = resp
-        .pointer("/usage/iterations")
-        .and_then(Value::as_array)
-        .is_some_and(|its| {
-            its.iter()
-                .any(|i| i.get("type").and_then(Value::as_str) == Some("fallback_message"))
-        });
-    json!({
-        "id": resp.get("id"),
-        "model": resp.get("model"),
-        "stop_reason": resp.get("stop_reason"),
-        "stop_details": resp.get("stop_details"),
-        "fallback_served": fallback_served,
-        "blocks": blocks,
-        "tool_uses": tool_uses,
-        "text": truncate(&final_text(content), 2000),
-        "usage": resp.get("usage").map(|u| json!({
-            "input_tokens": u.get("input_tokens"),
-            "output_tokens": u.get("output_tokens"),
-            "cache_read_input_tokens": u.get("cache_read_input_tokens"),
-            "cache_creation_input_tokens": u.get("cache_creation_input_tokens"),
-        })),
-    })
-}
+/// Kept for callers of the Claude-only API.
+pub use crate::llm::anthropic::sanitize_fallback;
 
 /// When some tools were unavailable, end the reply with which ones and what
 /// the user said, so a request that could not be carried out is never lost.
@@ -838,34 +697,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_sanitizer_drops_declined_attempt_blocks() {
-        let content = json!([
-            {"type": "thinking", "thinking": "", "signature": "a"},
-            {"type": "tool_use", "id": "t0", "name": "x", "input": {}},
-            {"type": "text", "text": "partial"},
-            {"type": "fallback", "from": {"model": "claude-opus-5-5"}, "to": {"model": "claude-opus-5"}},
-            {"type": "thinking", "thinking": "", "signature": "b"},
-            {"type": "tool_use", "id": "t1", "name": "y", "input": {}}
-        ]);
-        let out = sanitize_fallback(content);
-        let types: Vec<_> = out
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|b| b["type"].as_str().unwrap())
-            .collect();
-        assert_eq!(types, ["text", "fallback", "thinking", "tool_use"]);
-        assert_eq!(out[3]["id"], "t1");
-
-        let plain = json!([{"type": "thinking", "thinking": "", "signature": "a"}, {"type": "text", "text": "hi"}]);
-        assert_eq!(sanitize_fallback(plain.clone()), plain);
+    fn old_states_without_provider_are_anthropic() {
+        let old = json!({
+            "model": "claude-opus-5-5", "system": "s", "effort": "low", "tools": [],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "iterations": 1,
+            "pending": {"calls": [{"tool_use_id": "toolu_1", "claude_name": "home__x",
+                                   "input": {}, "action": {"kind": "confirm"}}]}
+        });
+        let s: AgentState = serde_json::from_value(old).unwrap();
+        assert_eq!(s.provider, Provider::Anthropic);
+        assert_eq!(s.pending.unwrap().calls[0].action, CallAction::Confirm);
+        let new = serde_json::to_value(AgentState {
+            provider: Provider::Ollama,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(new["provider"], "ollama");
     }
 
     #[test]
-    fn final_text_reads_text_blocks_only() {
-        let c = json!([{"type": "thinking", "thinking": "x"}, {"type": "text", "text": " Lights on. "}]);
-        assert_eq!(final_text(&c), "Lights on.");
-        assert_eq!(final_text(&json!([])), "Done.");
+    fn tools_dropped_only_for_plain_400s() {
+        assert!(rejects_tools(
+            "400 Bad Request: invalid_request_error: tools.0: bad"
+        ));
+        assert!(rejects_tools(
+            "400 Bad Request: registry.ollama.ai/library/gemma3:4b does not support tools"
+        ));
+        assert!(!rejects_tools(
+            "400 Bad Request: \"gemma3\" does not support thinking"
+        ));
+        assert!(!rejects_tools("401 Unauthorized: bad key"));
     }
 
     #[test]

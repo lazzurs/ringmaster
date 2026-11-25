@@ -116,6 +116,21 @@ async fn main() -> ExitCode {
                     c.mcp_servers.len(),
                     c.tool_policies.len()
                 );
+                for (name, p) in &c.profiles {
+                    // Validated by load(), so this resolves.
+                    if let Ok(choice) = c.profile_llm(Some(p)) {
+                        let s = c.provider_settings(choice.provider);
+                        println!(
+                            "  profile {name}: {} {} at {}{}",
+                            choice.provider,
+                            choice.model,
+                            s.base_url,
+                            s.api_key_env
+                                .map(|v| format!(" (key from {v})"))
+                                .unwrap_or_default()
+                        );
+                    }
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {

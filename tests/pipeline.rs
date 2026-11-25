@@ -1,6 +1,7 @@
-//! End-to-end tests: signed webhook -> queue -> whisper (mock) -> Claude
-//! (wiremock) -> MCP tools (a real rmcp server on localhost) -> notification,
-//! including the confirm/deny flow.
+//! End-to-end tests: signed webhook -> queue -> whisper (mock) -> LLM
+//! (wiremock: Claude, OpenAI, Mistral, OpenRouter, Ollama) -> MCP tools (a
+//! real rmcp server on localhost) -> notification, including the
+//! confirm/deny flow.
 //!
 //! Run with proxy variables unset if your shell has them.
 
@@ -19,14 +20,14 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTemplate};
 
 use ringmaster::agent::Agent;
-use ringmaster::claude::ClaudeClient;
 use ringmaster::config::{Config, McpServerConfig};
 use ringmaster::db::{Db, JobStatus};
 use ringmaster::http::{AppState, router};
+use ringmaster::llm::{Llms, Provider};
 use ringmaster::notify::{Kind, Notification, Notifier};
 use ringmaster::signature;
 use ringmaster::stt::Transcriber;
@@ -127,17 +128,27 @@ async fn start_mcp() -> (String, Arc<Mutex<Vec<String>>>, CancellationToken) {
 
 // ------------------------------------------------------------- mock Claude
 
-/// Scripted Claude: returns `turns[n]` for the n-th request and records every
-/// request body.
+/// Scripted model API: returns `turns[n]` for the n-th request and records
+/// every request body, plus its path and headers.
 #[derive(Clone)]
 struct ScriptedClaude {
     turns: Arc<Vec<Value>>,
     seen: Arc<Mutex<Vec<Value>>>,
+    meta: Arc<Mutex<Vec<Value>>>,
 }
 
 impl Respond for ScriptedClaude {
     fn respond(&self, req: &MockRequest) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&req.body).unwrap();
+        let headers: serde_json::Map<String, Value> = req
+            .headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), json!(v.to_str().unwrap_or(""))))
+            .collect();
+        self.meta
+            .lock()
+            .unwrap()
+            .push(json!({"path": req.url.path(), "headers": headers}));
         let mut seen = self.seen.lock().unwrap();
         let n = seen.len();
         seen.push(body);
@@ -207,6 +218,9 @@ struct Harness {
     db: Db,
     notes: Arc<Recorder>,
     claude_seen: Arc<Mutex<Vec<Value>>>,
+    /// Path and headers of each model request.
+    llm_meta: Arc<Mutex<Vec<Value>>>,
+    db_path: std::path::PathBuf,
     mcp_calls: Arc<Mutex<Vec<String>>>,
     _mcp_stop: CancellationToken,
     _servers: Vec<MockServer>,
@@ -264,6 +278,22 @@ async fn harness_with(
     whisper_text: Option<&str>,
     servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
 ) -> Harness {
+    harness_config(CONFIG, turns, whisper_text, servers).await
+}
+
+/// The test config with its `[claude]` section replaced by `llm`.
+fn config_with(llm: &str) -> String {
+    let legacy = "[claude]\nmodel = \"claude-opus-5-5\"\neffort = \"low\"\nmax_retries = 0\n";
+    assert!(CONFIG.contains(legacy));
+    CONFIG.replace(legacy, llm)
+}
+
+async fn harness_config(
+    config_text: &str,
+    turns: Vec<Value>,
+    whisper_text: Option<&str>,
+    servers: impl FnOnce(McpServerConfig) -> Vec<McpServerConfig>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (mcp_url, mcp_calls, mcp_stop) = start_mcp().await;
 
@@ -286,19 +316,30 @@ async fn harness_with(
 
     let claude_server = MockServer::start().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let meta = Arc::new(Mutex::new(Vec::new()));
+    // Every provider's endpoint, on one scripted server.
     Mock::given(method("POST"))
-        .and(path("/v1/messages"))
+        .and(path_regex(r"^/(v1/messages|v1/chat/completions|api/chat)$"))
         .respond_with(ScriptedClaude {
             turns: Arc::new(turns),
             seen: seen.clone(),
+            meta: meta.clone(),
         })
         .mount(&claude_server)
         .await;
 
-    let mut config = Config::from_toml(CONFIG).unwrap();
+    let mut config = Config::from_toml(config_text).unwrap();
     config.server.data_dir = dir.path().to_path_buf();
     config.stt.primary_url = Some(whisper.uri());
     config.claude.api_base = claude_server.uri();
+    for p in [
+        &mut config.llm.openai,
+        &mut config.llm.mistral,
+        &mut config.llm.openrouter,
+        &mut config.llm.ollama,
+    ] {
+        p.base_url = Some(claude_server.uri());
+    }
     config.mcp_servers = servers(McpServerConfig {
         name: "home".into(),
         url: mcp_url,
@@ -309,20 +350,23 @@ async fn harness_with(
     let db = Db::open(&dir.path().join("test.db")).unwrap();
     let notes = Arc::new(Recorder::default());
     let notifier: Arc<dyn Notifier> = notes.clone();
-    let claude = ClaudeClient::new(
-        &claude_server.uri(),
-        "sk-test".into(),
-        Duration::from_secs(10),
-        0,
-    )
-    .unwrap();
+    let keys = [
+        (Provider::Anthropic, "sk-test"),
+        (Provider::OpenAi, "sk-openai-test"),
+        (Provider::Mistral, "mistral-test"),
+        (Provider::OpenRouter, "sk-or-test"),
+    ]
+    .into_iter()
+    .map(|(p, k)| (p, k.to_string()))
+    .collect();
+    let llms = Llms::new(&config, &keys).unwrap();
     let tools = Arc::new(McpBackend::new(
         config.mcp_servers.clone(),
         Default::default(),
         Duration::from_secs(10),
     ));
     let agent =
-        Arc::new(Agent::new(config.clone(), db.clone(), claude, tools, notifier.clone()).unwrap());
+        Arc::new(Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone()).unwrap());
     let wake = Arc::new(Notify::new());
     let worker = Arc::new(Worker {
         config: config.clone(),
@@ -348,6 +392,8 @@ async fn harness_with(
         db,
         notes,
         claude_seen: seen,
+        llm_meta: meta,
+        db_path: dir.path().join("test.db"),
         mcp_calls,
         _mcp_stop: mcp_stop,
         _servers: vec![whisper, claude_server],
@@ -1066,4 +1112,565 @@ async fn health_endpoint() {
     let (status, body) = send(&h, Request::get("/healthz").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
+}
+
+// ------------------------------------------------- other providers
+
+/// An OpenAI-style reply with one tool call (arguments as a JSON string).
+fn chat_tool_turn(id: &str, name: &str, arguments: &str) -> Value {
+    json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "refusal": null,
+                "tool_calls": [{"id": id, "type": "function",
+                                "function": {"name": name, "arguments": arguments}}]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 900, "completion_tokens": 20, "total_tokens": 920}
+    })
+}
+
+fn chat_final(text: &str) -> Value {
+    json!({
+        "id": "chatcmpl-2",
+        "object": "chat.completion",
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text, "refusal": null},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 950, "completion_tokens": 8, "total_tokens": 958}
+    })
+}
+
+/// Ollama's native `/api/chat` reply: arguments as an object, no id.
+fn ollama_tool_turn(name: &str, arguments: Value) -> Value {
+    json!({
+        "model": "qwen3:8b",
+        "created_at": "2026-11-25T10:00:00Z",
+        "message": {"role": "assistant", "content": "", "thinking": "The user wants light.",
+                    "tool_calls": [{"function": {"name": name, "arguments": arguments}}]},
+        "done": true,
+        "done_reason": "stop",
+        "prompt_eval_count": 1200,
+        "eval_count": 30
+    })
+}
+
+fn ollama_final(text: &str) -> Value {
+    json!({
+        "model": "qwen3:8b",
+        "created_at": "2026-11-25T10:00:05Z",
+        "message": {"role": "assistant", "content": text},
+        "done": true,
+        "done_reason": "stop",
+        "prompt_eval_count": 1300,
+        "eval_count": 12
+    })
+}
+
+async fn run_command(h: &Harness, delivery: &str, trigger: &str) {
+    let (ct, body) = multipart(Some(TONE), None, false);
+    let (status, text) = send(
+        h,
+        signed_request(delivery, trigger, false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    tick(h).await;
+}
+
+fn meta(h: &Harness) -> Vec<Value> {
+    h.llm_meta.lock().unwrap().clone()
+}
+
+async fn job_provider(h: &Harness) -> Value {
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    serde_json::to_value(job.agent_state.unwrap()).unwrap()["provider"].clone()
+}
+
+#[tokio::test]
+async fn openai_tool_loop_request_shape() {
+    let h = harness_config(
+        &config_with(
+            "[llm]\nprovider = \"openai\"\nmodel = \"gpt-6.2-sol\"\neffort = \"low\"\nmax_tokens = 2000\nmax_retries = 0\n",
+        ),
+        vec![
+            chat_tool_turn(
+                "call_abc",
+                "home__set_light",
+                r#"{"name":"kitchen","on":true}"#,
+            ),
+            chat_final("Kitchen lights on."),
+        ],
+        Some("Turn on the kitchen lights."),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "oa-1", "double-click-hold").await;
+
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["set_light kitchen true".to_string()]
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert_eq!(notes[0].body, "Kitchen lights on.");
+
+    let m = meta(&h);
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0]["path"], "/v1/chat/completions");
+    assert_eq!(m[0]["headers"]["authorization"], "Bearer sk-openai-test");
+    assert!(m[0]["headers"].get("x-api-key").is_none());
+
+    let seen = h.claude_seen.lock().unwrap().clone();
+    let first = &seen[0];
+    assert_eq!(first["model"], "gpt-6.2-sol");
+    assert_eq!(first["reasoning_effort"], "low");
+    assert_eq!(first["max_completion_tokens"], 2000);
+    assert!(first.get("max_tokens").is_none());
+    for anthropic_only in ["system", "output_config", "cache_control", "fallbacks"] {
+        assert!(first.get(anthropic_only).is_none(), "{anthropic_only}");
+    }
+    assert_eq!(first["messages"][0]["role"], "developer");
+    assert!(
+        first["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Command mode.")
+    );
+    assert_eq!(first["messages"][1]["role"], "user");
+    assert!(
+        first["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Turn on the kitchen lights.")
+    );
+    let tools: Vec<&str> = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            assert_eq!(t["type"], "function");
+            assert_eq!(t["function"]["parameters"]["type"], "object");
+            t["function"]["name"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(tools, ["home__set_light", "home__unlock_door"]);
+
+    let second = &seen[1];
+    assert_eq!(second["tools"], first["tools"]);
+    assert_eq!(second["messages"][0], first["messages"][0]);
+    assert_eq!(second["messages"][1], first["messages"][1]);
+    // The assistant turn is echoed with its tool call; response-only fields
+    // (refusal) are not.
+    assert_eq!(
+        second["messages"][2],
+        json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call_abc", "type": "function",
+            "function": {"name": "home__set_light", "arguments": r#"{"name":"kitchen","on":true}"#}}]})
+    );
+    assert_eq!(
+        second["messages"][3],
+        json!({"role": "tool", "tool_call_id": "call_abc", "content": "kitchen is now on"})
+    );
+
+    assert_eq!(job_provider(&h).await, "openai");
+    let kinds: Vec<String> =
+        h.db.audit_entries(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+    assert!(kinds.iter().any(|k| k == "llm_response"), "{kinds:?}");
+}
+
+#[tokio::test]
+async fn mistral_confirm_approve_round_trip() {
+    let h = harness_config(
+        &config_with(
+            "[llm]\nprovider = \"mistral\"\nmodel = \"mistral-small-latest\"\nmax_retries = 0\n",
+        ),
+        vec![
+            chat_tool_turn("D681PevKs", "home__unlock_door", r#"{"door":"front"}"#),
+            chat_final("Front door unlocked."),
+        ],
+        Some("unlock the front door"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "mi-1", "double-click-hold").await;
+    assert!(
+        h.mcp_calls.lock().unwrap().is_empty(),
+        "must not run before approval"
+    );
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::AwaitingConfirmation
+    );
+    let notes = h.notes.take();
+    let Kind::Confirm {
+        approve_url: Some(approve),
+        ..
+    } = &notes[0].kind
+    else {
+        panic!("expected confirm notification: {:?}", notes[0]);
+    };
+    assert!(notes[0].body.contains("home/unlock_door"));
+    let approve_path = approve
+        .strip_prefix("https://ring.test")
+        .unwrap()
+        .to_string();
+    let (status, _) = send(
+        &h,
+        Request::post(&approve_path).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick(&h).await;
+
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["unlock_door front".to_string()]
+    );
+    assert_eq!(h.notes.take().last().unwrap().body, "Front door unlocked.");
+    let m = meta(&h);
+    assert_eq!(m[0]["path"], "/v1/chat/completions");
+    assert_eq!(m[0]["headers"]["authorization"], "Bearer mistral-test");
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0]["model"], "mistral-small-latest");
+    assert_eq!(seen[0]["messages"][0]["role"], "system");
+    assert!(
+        seen[0].get("reasoning_effort").is_none(),
+        "no effort configured"
+    );
+    assert!(seen[0].get("max_tokens").is_none(), "no limit configured");
+    assert_eq!(seen[1]["messages"][2]["tool_calls"][0]["id"], "D681PevKs");
+    assert_eq!(
+        seen[1]["messages"][3],
+        json!({"role": "tool", "tool_call_id": "D681PevKs", "name": "home__unlock_door", "content": "unlocked"})
+    );
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::Done
+    );
+}
+
+#[tokio::test]
+async fn openrouter_sends_attribution_and_echoes_reasoning() {
+    let mut tool_turn = chat_tool_turn(
+        "toolu_or1",
+        "home__set_light",
+        r#"{"name":"hall","on":false}"#,
+    );
+    let details = json!([{"type": "reasoning.encrypted", "data": "opaque", "id": "r1",
+                          "format": "anthropic-claude-v1", "index": 0}]);
+    tool_turn["choices"][0]["message"]["reasoning"] = json!("Turn off the hall light.");
+    tool_turn["choices"][0]["message"]["reasoning_details"] = details.clone();
+    tool_turn["choices"][0]["native_finish_reason"] = json!("tool_use");
+    let h = harness_config(
+        &config_with(
+            "[llm]\nprovider = \"openrouter\"\nmodel = \"anthropic/claude-sonnet-5.5\"\neffort = \"medium\"\nmax_retries = 0\n\n[llm.openrouter]\napp_url = \"https://github.com/lazzurs/ringmaster\"\napp_title = \"Ringmaster\"\n",
+        ),
+        vec![tool_turn, chat_final("Hall light off.")],
+        Some("hall light off"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "or-1", "double-click-hold").await;
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["set_light hall false".to_string()]
+    );
+    assert_eq!(h.notes.take()[0].body, "Hall light off.");
+    let m = meta(&h);
+    assert_eq!(m[0]["headers"]["authorization"], "Bearer sk-or-test");
+    assert_eq!(
+        m[0]["headers"]["http-referer"],
+        "https://github.com/lazzurs/ringmaster"
+    );
+    assert_eq!(m[0]["headers"]["x-openrouter-title"], "Ringmaster");
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen[0]["reasoning"], json!({"effort": "medium"}));
+    assert!(seen[0].get("reasoning_effort").is_none());
+    let echoed = &seen[1]["messages"][2];
+    assert_eq!(
+        echoed["reasoning_details"], details,
+        "passed back unchanged"
+    );
+    assert!(echoed.get("reasoning").is_none());
+    assert_eq!(seen[1]["messages"][3]["tool_call_id"], "toolu_or1");
+}
+
+#[tokio::test]
+async fn ollama_native_tool_loop_without_auth() {
+    let h = harness_config(
+        &config_with(
+            "[llm]\nprovider = \"ollama\"\nmodel = \"qwen3:8b\"\neffort = \"none\"\nmax_retries = 0\n",
+        ),
+        vec![
+            ollama_tool_turn("home__set_light", json!({"name": "kitchen", "on": true})),
+            ollama_final("Kitchen light is on."),
+        ],
+        Some("kitchen light on"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "ol-1", "double-click-hold").await;
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["set_light kitchen true".to_string()]
+    );
+    assert_eq!(h.notes.take()[0].body, "Kitchen light is on.");
+
+    let m = meta(&h);
+    assert_eq!(m[0]["path"], "/api/chat");
+    assert!(
+        m[0]["headers"].get("authorization").is_none(),
+        "Ollama needs no key"
+    );
+    let seen = h.claude_seen.lock().unwrap().clone();
+    let first = &seen[0];
+    assert_eq!(first["model"], "qwen3:8b");
+    assert_eq!(first["stream"], false);
+    assert_eq!(first["truncate"], false);
+    assert_eq!(first["options"]["num_ctx"], 8192);
+    assert_eq!(first["think"], false);
+    assert_eq!(first["messages"][0]["role"], "system");
+    assert_eq!(first["tools"][0]["type"], "function");
+
+    // Object arguments, a generated id and the thinking are echoed back.
+    let echoed = &seen[1]["messages"][2];
+    let id = echoed["tool_calls"][0]["id"].as_str().unwrap();
+    assert_eq!(id.len(), 9);
+    assert_eq!(
+        echoed["tool_calls"][0]["function"]["arguments"],
+        json!({"name": "kitchen", "on": true})
+    );
+    assert_eq!(echoed["thinking"], "The user wants light.");
+    assert_eq!(
+        seen[1]["messages"][3],
+        json!({"role": "tool", "tool_call_id": id, "tool_name": "home__set_light", "content": "kitchen is now on"})
+    );
+    assert_eq!(job_provider(&h).await, "ollama");
+}
+
+#[tokio::test]
+async fn ollama_model_without_tools_runs_without_them() {
+    let h = harness_config(
+        &config_with("[llm]\nprovider = \"ollama\"\nmodel = \"gemma3:4b\"\nmax_retries = 0\n"),
+        vec![
+            json!({"__status": 400, "__body": {"error": "registry.ollama.ai/library/gemma3:4b does not support tools"}}),
+            ollama_final("I can't control lights with this model."),
+        ],
+        Some("kitchen light on"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "ol-2", "double-click-hold").await;
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2, "retried once");
+    assert!(seen[0].get("tools").is_some());
+    assert!(seen[1].get("tools").is_none());
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0].body.contains("Unavailable: all tools"),
+        "{}",
+        notes[0].body
+    );
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_tool_arguments_are_never_run() {
+    let h = harness_config(
+        &config_with("[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.4-mini\"\nmax_retries = 0\n"),
+        vec![
+            // Truncated JSON from a weak model.
+            chat_tool_turn(
+                "call_bad",
+                "home__set_light",
+                r#"{"name": "kitchen", "on": tr"#,
+            ),
+            chat_final("Sorry, that went wrong."),
+        ],
+        Some("kitchen light on"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "bad-1", "double-click-hold").await;
+    assert!(h.mcp_calls.lock().unwrap().is_empty(), "never run");
+    let seen = h.claude_seen.lock().unwrap().clone();
+    let result = &seen[1]["messages"][3];
+    assert_eq!(result["role"], "tool");
+    assert_eq!(result["tool_call_id"], "call_bad");
+    let text = result["content"].as_str().unwrap();
+    assert!(
+        text.starts_with("Error: Not run: the arguments are not valid JSON"),
+        "{text}"
+    );
+    assert_eq!(h.notes.take()[0].body, "Sorry, that went wrong.");
+}
+
+#[tokio::test]
+async fn ollama_unparseable_tool_call_fails_cleanly() {
+    let h = harness_config(
+        &config_with("[llm]\nprovider = \"ollama\"\nmodel = \"qwen3:8b\"\nmax_retries = 0\n"),
+        vec![json!({"__status": 500, "__body": {"error": "failed to parse JSON: unexpected end of JSON input"}})],
+        Some("kitchen light on"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "ol-3", "double-click-hold").await;
+    assert!(h.mcp_calls.lock().unwrap().is_empty());
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Failed, "not retried for an hour");
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Error);
+    assert!(
+        notes[0].body.contains("malformed tool call"),
+        "{}",
+        notes[0].body
+    );
+}
+
+#[tokio::test]
+async fn profiles_can_use_different_providers() {
+    // Default (legacy [claude]) for command; capture on a local model.
+    let config = CONFIG.replace(
+        "system_prompt = \"Capture mode.\"",
+        "system_prompt = \"Capture mode.\"\nprovider = \"ollama\"\nmodel = \"qwen3:8b\"",
+    );
+    let h = harness_config(
+        &config,
+        vec![
+            ollama_final("Added: buy milk"),
+            final_turn("Kitchen lights on."),
+        ],
+        Some("buy milk"),
+        |home| vec![home],
+    )
+    .await;
+    run_command(&h, "mix-1", "single-click-hold").await;
+    run_command(&h, "mix-2", "double-click-hold").await;
+    let m = meta(&h);
+    assert_eq!(m[0]["path"], "/api/chat");
+    assert_eq!(m[1]["path"], "/v1/messages");
+    assert_eq!(m[1]["headers"]["x-api-key"], "sk-test");
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(seen[0]["model"], "qwen3:8b");
+    assert_eq!(seen[1]["model"], "claude-opus-5-5");
+    let notes = h.notes.take();
+    assert_eq!(notes[0].body, "Added: buy milk");
+    assert_eq!(notes[1].body, "Kitchen lights on.");
+}
+
+#[tokio::test]
+async fn state_saved_before_providers_still_resumes() {
+    // A job paused for confirmation by v0.1.2 has no `provider` in its state.
+    let h = harness(
+        vec![
+            tool_use_turn("toolu_old", "home__unlock_door", json!({"door": "side"})),
+            final_turn("Side door unlocked."),
+        ],
+        Some("unlock the side door"),
+    )
+    .await;
+    run_command(&h, "old-1", "double-click-hold").await;
+    assert_eq!(
+        h.db.get_job(1).await.unwrap().unwrap().status,
+        JobStatus::AwaitingConfirmation
+    );
+    {
+        let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE jobs SET agent_state = json_remove(agent_state, '$.provider') WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let raw: String = conn
+            .query_row("SELECT agent_state FROM jobs WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(!raw.contains("\"provider\""), "{raw}");
+    }
+    let notes = h.notes.take();
+    let Kind::Confirm {
+        approve_url: Some(approve),
+        ..
+    } = &notes[0].kind
+    else {
+        panic!()
+    };
+    let approve_path = approve
+        .strip_prefix("https://ring.test")
+        .unwrap()
+        .to_string();
+    send(
+        &h,
+        Request::post(&approve_path).body(Body::empty()).unwrap(),
+    )
+    .await;
+    tick(&h).await;
+    assert_eq!(
+        *h.mcp_calls.lock().unwrap(),
+        vec!["unlock_door side".to_string()]
+    );
+    assert_eq!(h.notes.take().last().unwrap().body, "Side door unlocked.");
+    let m = meta(&h);
+    assert_eq!(m[1]["path"], "/v1/messages");
+    let seen = h.claude_seen.lock().unwrap().clone();
+    assert_eq!(
+        seen[1]["messages"][2]["content"][0]["tool_use_id"],
+        "toolu_old"
+    );
+    assert_eq!(job_provider(&h).await, "anthropic");
+}
+
+#[tokio::test]
+async fn missing_key_for_unused_provider_is_fine() {
+    use ringmaster::config::Secrets;
+    let config = Config::from_toml(&config_with(
+        "[llm]\nprovider = \"ollama\"\nmodel = \"qwen3:8b\"\n",
+    ))
+    .unwrap();
+    let secrets = Secrets {
+        webhook_secret: Some(SECRET.into()),
+        ..Default::default()
+    };
+    config.validate_runtime(&secrets).unwrap();
+
+    // A profile on OpenAI makes its key required.
+    let config = Config::from_toml(&CONFIG.replace(
+        "system_prompt = \"Capture mode.\"",
+        "system_prompt = \"Capture mode.\"\nprovider = \"openai\"\nmodel = \"gpt-5.4-mini\"",
+    ))
+    .unwrap();
+    let mut secrets = Secrets {
+        webhook_secret: Some(SECRET.into()),
+        ..Default::default()
+    };
+    secrets
+        .llm_keys
+        .insert(Provider::Anthropic, "sk-ant".into());
+    let err = config.validate_runtime(&secrets).unwrap_err().to_string();
+    assert!(err.contains("OPENAI_API_KEY"), "{err}");
+    secrets.llm_keys.insert(Provider::OpenAi, "sk".into());
+    config.validate_runtime(&secrets).unwrap();
 }
