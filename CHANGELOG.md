@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/lazzurs/ringmaster/compare/v0.1.6...v0.1.7) (2026-11-25)
+
+
+### Features
+
+* optional automatic approval of tool calls by a local Shieldstral classifier ([#20](https://github.com/lazzurs/ringmaster/issues/20)) ([9c7d483](https://github.com/lazzurs/ringmaster/commit/9c7d483d9e587b62983fde46212c583531493e7c))
+
 ## [0.1.6](https://github.com/lazzurs/ringmaster/compare/v0.1.5...v0.1.6) (2026-11-25)
 
 
