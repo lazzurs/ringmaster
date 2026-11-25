@@ -13,7 +13,8 @@ use tokio::sync::Notify;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
-use crate::db::Db;
+use crate::db::{Db, now};
+use crate::health::Health;
 use crate::notify::Notifier;
 use crate::{confirm, webhook};
 
@@ -25,7 +26,11 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub webhook_secret: Option<String>,
     pub metrics: Option<PrometheusHandle>,
+    pub health: Arc<Health>,
 }
+
+/// Longest `/healthz` waits for the database (Docker's probe allows 5 s).
+const PING_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn router(state: Arc<AppState>) -> Router {
     let webhook_path = state.config.webhook.path.clone();
@@ -54,19 +59,42 @@ fn request_span(req: &Request) -> tracing::Span {
     tracing::debug_span!("request", method = %req.method(), route, version = ?req.version())
 }
 
+/// `200 ok`, or `503` with the reasons, when recordings cannot be stored or
+/// processed at all: the database is corrupt, read-only, full, failing I/O
+/// or not answering, or the worker loop or the watchdog has stopped. It
+/// reads in-memory state plus a bounded `SELECT 1`; it never runs the
+/// expensive checks itself. Problems a restart cannot fix and that are not
+/// the container's fault (failing jobs, a sleeping Mac, a down MCP server)
+/// are alerted on but never make it unhealthy.
 async fn healthz(State(app): State<Arc<AppState>>) -> impl IntoResponse {
-    match app.db.ping().await {
-        Ok(()) => (StatusCode::OK, "ok"),
-        Err(e) => {
+    let now = now();
+    let mut problems = app.health.unhealthy(now, &app.db.status().snapshot());
+    match tokio::time::timeout(PING_LIMIT, app.db.ping()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "health check failed");
-            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
+            problems.push("database unavailable".into());
         }
+        Err(_) => problems.push("database unresponsive".into()),
+    }
+    if problems.is_empty() {
+        (StatusCode::OK, "ok".to_string())
+    } else {
+        tracing::warn!(problems = ?problems, "unhealthy");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("unhealthy: {}", problems.join("; ")),
+        )
     }
 }
 
 async fn metrics(State(app): State<Arc<AppState>>) -> impl IntoResponse {
     match &app.metrics {
-        Some(h) => (StatusCode::OK, h.render()),
+        Some(h) => {
+            // Heartbeat ages and the like are as of this scrape.
+            app.health.export(now(), &app.db.status().snapshot());
+            (StatusCode::OK, h.render())
+        }
         None => (StatusCode::NOT_FOUND, String::new()),
     }
 }

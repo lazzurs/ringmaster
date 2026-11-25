@@ -96,8 +96,10 @@ async fn secrets_stay_out_of_logs() {
 
     // 2. Confirmation links: the token never reaches the request span.
     let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(Config::from_toml("").unwrap());
     let state = Arc::new(AppState {
-        config: Arc::new(Config::from_toml("").unwrap()),
+        health: Arc::new(ringmaster::health::Health::new(&config, 0)),
+        config,
         db: Db::open(&dir.path().join("t.db")).unwrap(),
         notifier: Arc::new(LogNotifier),
         wake: Arc::new(Notify::new()),

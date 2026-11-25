@@ -23,21 +23,22 @@ outages and pending confirmations resume where they stopped.
 
 | Path | What lives there | Change it for |
 |---|---|---|
-| `src/main.rs` | CLI: `serve`, `healthcheck`, `check-config`; logging setup | new subcommands, `check-config` output |
-| `src/lib.rs` | `serve()`: wires config, secrets, DB, notifier, LLMs, MCP backend, worker, HTTP; graceful shutdown | start-up wiring |
+| `src/main.rs` | CLI: `serve`, `healthcheck`, `check-config`; logging setup; the runtime (built by hand so `shutdown_timeout` drops stuck blocking threads) | new subcommands, `check-config` output |
+| `src/lib.rs` | `serve()`: wires config, secrets, DB (`open_db` retries and alerts instead of exiting), notifier and alert notifier, LLMs, MCP backend, worker, watchdog, HTTP; `run_service()`: runs them and shuts down within `server.shutdown_grace_secs` | start-up wiring, shutdown |
+| `src/health.rs` | `Health` (heartbeats, jobs in flight, failures, `BlockingTracker`, gauges, `/healthz` reasons), `Condition`s, `AlertBook` (debounce, `alerts.json`), `Alerter`, `Watchdog` | alerts, health, gauges |
 | `src/config.rs` | TOML structs (`deny_unknown_fields`), defaults, validation, `Secrets::from_env`, `secret_from_env`, `mcp_headers`, provider resolution (`provider_settings`, `profile_llm`) | any config key |
-| `src/http.rs` | axum router: webhook, `/confirm/*`, `/healthz`, `/metrics` | routes |
-| `src/webhook.rs` | webhook handler: version, signature, dedupe, multipart, audio write, delivery + job insert | webhook behaviour |
+| `src/http.rs` | axum router: webhook, `/confirm/*`, `/healthz` (in-memory health + bounded ping), `/metrics` (refreshes health gauges) | routes |
+| `src/webhook.rs` | webhook handler (bounded by `STORE_TIMEOUT`): version, signature, refuse while the DB is corrupt, dedupe, multipart, audio write (`io_permits`), delivery + job insert | webhook behaviour |
 | `src/signature.rs` | HMAC-SHA256 signing string and constant-time verify | signature format |
-| `src/db.rs` | SQLite schema (`MIGRATION_1`, `SCHEMA_VERSION`), queue (atomic claim, quarantine of unreadable jobs, requeue of orphaned `running` jobs), confirmations, audit log, retention | persistence, migrations |
+| `src/db.rs` | SQLite schema (`MIGRATION_1`, `SCHEMA_VERSION`), queue (atomic claim, quarantine of unreadable jobs, requeue of orphaned `running` jobs), confirmations, audit log, retention; `DbStatus` (every statement's error class), `health_check` (fresh-connection `quick_check` + write probe), `queue_stats` | persistence, migrations, DB health |
 | `src/worker.rs` | job loop: one task per job (`InFlight`, up to `worker_concurrency`), attempt deadline, panic isolation, max age, transcribe, run agent, retry with back-off, notify, audio retention | job lifecycle |
 | `src/stt.rs` | whisper-server client and fallback chain | transcription |
-| `src/audio.rs` | M4A (AAC-LC) to 16 kHz mono WAV in pure Rust (symphonia + hound) | audio decoding |
+| `src/audio.rs` | M4A (AAC-LC) to 16 kHz mono WAV in pure Rust (symphonia + hound); `Budget` (deadline and duration checked in the decode loop) and `Decoder` (size cap, semaphore, timeout; `with_fn` for tests) | audio decoding |
 | `src/agent.rs` | provider-neutral agent loop, `AgentState`, tool discovery, planning, confirmations, tool execution | agent behaviour |
 | `src/policy.rs` | `Policies` (allow/confirm/deny) and per-profile `ToolFilter` globs | tool policy rules |
-| `src/tools.rs` | `ToolBackend` trait, `McpBackend` (rmcp client), `to_defs` (sorted, sanitised names), `check_schema` | MCP integration |
+| `src/tools.rs` | `ToolBackend` trait (`housekeeping`), `McpBackend` (rmcp client; sessions closed when idle `MCP_SESSION_IDLE` or dead, bounded close), `to_defs` (sorted, sanitised names), `check_schema` | MCP integration |
 | `src/confirm.rs` | `GET /confirm/{token}` page, `POST /confirm/{token}/{approve,deny}` | confirmation UX |
-| `src/notify.rs` | `Notifier` trait, ntfy client, `LogNotifier` | notifications |
+| `src/notify.rs` | `Notifier` trait, ntfy client (`with_topic` for alerts), `Kind` (incl. `Alert`, `Recovered`), `LogNotifier` | notifications |
 | `src/claude.rs` | thin Anthropic Messages client (headers, usage metrics); legacy re-exports | Anthropic HTTP details |
 | `src/llm/mod.rs` | `Provider`, `ChatModel` trait, `Turn`/`StopKind`/`ToolCall`/`ToolResult`, `Llms`, `parse_arguments` | adding a provider |
 | `src/llm/anthropic.rs` | Anthropic adapter: request body, cache breakpoints, fallbacks, `sanitize_fallback` | Claude request/response shape |
@@ -189,6 +190,38 @@ outages and pending confirmations resume where they stopped.
      falls back to the phone transcription instead of retrying.
    - Jobs in `awaiting_confirmation` are never claimed; they take no slot.
 
+10. **Problems are alerted, health is honest, and every task ends**
+    (`src/health.rs`, `src/db.rs`, `src/lib.rs`).
+    - Database errors are classified in `Db::call` (`DbStatus`):
+      corruption (`SQLITE_CORRUPT`/`NOTADB`, or `quick_check` problems on a
+      fresh connection) and storage errors (full, read-only, I/O) alert at
+      once and stay set until a clean `health_check` (quick_check plus write
+      probe); other failures alert after `alerts.db_error_threshold` in a
+      row. While the DB is corrupt the webhook answers 503 before storing.
+    - The `Watchdog` is its own task: heartbeats (worker loop, watchdog),
+      due jobs (`queue_stats`), jobs past `attempt_timeout_secs` + margin,
+      failure bursts, blocking work past its limit. Each step is bounded
+      (DB check 30 s and never two at once, queue query 10 s, each send 20 s).
+    - `Alerter`/`AlertBook`: one alert per condition start, reminders every
+      `alerts.reminder_secs`, one "recovered"; state in `alerts.json`. An
+      alert that fails to send is logged and retried; sending never blocks
+      or fails anything. Alert text carries counts, job ids, ages and
+      `DbErrorClass` names only: never a transcript, model output, SQLite
+      message text or secret (`alerts_never_carry_transcripts_or_secrets`).
+    - `/healthz` is non-200 only when recordings cannot be stored or
+      processed (DB corrupt/storage/unresponsive, worker or watchdog
+      stalled). It does no heavy work. Do not add conditions a restart
+      cannot fix and that are not the container's fault.
+    - Every spawned task or thread ends: job tasks by the attempt deadline
+      and the shutdown grace; worker, watchdog and HTTP by `run_service`;
+      `Db::call` takes the async lock before `spawn_blocking` (one blocking
+      thread per hung disk, not one per caller); decodes are bounded by
+      `Budget` and capped by `stt.decode_concurrency`; webhook audio writes
+      by `io_permits` and `STORE_TIMEOUT`; MCP sessions by idle/dead close;
+      the runtime is dropped with `shutdown_timeout`. A new `spawn`/
+      `spawn_blocking` needs a bound like these, and blocking work should be
+      registered with `Health::blocking` so the watchdog sees it stuck.
+
 Other behaviour to keep: `GET /confirm/*` never changes state; confirmation
 tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
 `confirmation_ttl_secs` (no answer counts as deny). Jobs older than
@@ -217,6 +250,13 @@ tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
   (`hang_requests_containing`). `queue_command` queues a job with a phone
   transcription; `harness_full` wraps the tool backend (see
   `PanickingTools`).
+- Health and alerts: the harness has `health` and a `watchdog` that sends
+  to the same recorder. Call `h.watchdog.check(t)` with an explicit time
+  (move heartbeats with `h.health.beat_worker`) instead of sleeping; read
+  alerts with `alerts(&h)`, gauges with `gauges(&h)` (a local Prometheus
+  recorder, so parallel tests do not share values) and `/healthz` with
+  `healthz(&h)`. `harness_decoder` swaps in a misbehaving decoder;
+  `set_read_only` makes the database file read-only.
 - **wiremock pooling gotcha:** a dropped `MockServer` goes back to a pool and
   is handed to tests running at the same time, so it is not "unreachable".
   For a dead endpoint, bind `std::net::TcpListener` to `127.0.0.1:0`, take

@@ -6,6 +6,10 @@
 //! wall-clock deadline (`agent.attempt_timeout_secs`), a panic fails only its
 //! own job, a job that no longer loads is quarantined by the claim, and jobs
 //! left `running` without a task (a restart, a lost task) are requeued.
+//!
+//! The loop beats a heartbeat in [`Health`] on every pass and reports the
+//! jobs it runs and how they end, so the watchdog can tell a stalled loop,
+//! a job whose deadline did not fire, or a run of failures.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -20,9 +24,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentOutcome, Request};
-use crate::audio;
-use crate::config::Config;
+use crate::audio::{Decoded, Decoder};
+use crate::config::{Config, WORKER_LOOP_MAX_WAIT_SECS};
 use crate::db::{Claim, Db, Job, JobStatus, Quarantined, now};
+use crate::health::Health;
 use crate::notify::{Kind, Notification, Notifier};
 use crate::stt::{SttError, Transcriber};
 
@@ -34,6 +39,8 @@ pub struct Worker {
     pub notifier: Arc<dyn Notifier>,
     pub wake: Arc<Notify>,
     pub data_dir: PathBuf,
+    pub health: Arc<Health>,
+    pub decoder: Decoder,
 }
 
 enum JobError {
@@ -42,13 +49,21 @@ enum JobError {
 }
 
 /// The jobs this worker is processing, one task each.
-#[derive(Default)]
 struct InFlight {
     tasks: JoinSet<()>,
     jobs: HashMap<tokio::task::Id, i64>,
+    health: Arc<Health>,
 }
 
 impl InFlight {
+    fn new(health: Arc<Health>) -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            jobs: HashMap::new(),
+            health,
+        }
+    }
+
     fn len(&self) -> usize {
         self.tasks.len()
     }
@@ -59,6 +74,7 @@ impl InFlight {
 
     fn spawn(&mut self, worker: Arc<Worker>, job: Job) {
         let id = job.id;
+        self.health.job_started(id, now());
         let task = self.tasks.spawn(async move { worker.handle(job).await });
         self.jobs.insert(task.id(), id);
     }
@@ -71,6 +87,9 @@ impl InFlight {
             Err(e) => e.id(),
         };
         let job = self.jobs.remove(&task);
+        if let Some(id) = job {
+            self.health.job_finished(id);
+        }
         if let Err(e) = res {
             // `handle` catches panics, so this is a panic while reporting
             // one. The job is still `running`; the next sweep requeues it.
@@ -82,12 +101,14 @@ impl InFlight {
 
 impl Worker {
     pub async fn run(self: Arc<Self>, shutdown: CancellationToken) {
-        let mut jobs = InFlight::default();
+        let mut jobs = InFlight::new(self.health.clone());
         let mut last_retention = None::<std::time::Instant>;
+        let max_wait = Duration::from_secs(WORKER_LOOP_MAX_WAIT_SECS);
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
+            self.health.beat_worker(now());
             self.housekeeping(&jobs).await;
             self.start_due(&mut jobs, now(), &shutdown).await;
             self.record_depth().await;
@@ -97,9 +118,11 @@ impl Worker {
             }
             // With every slot busy, a finishing job is what wakes the loop.
             let wait = match self.db.next_due().await {
-                _ if jobs.len() >= self.config.agent.worker_concurrency => Duration::from_secs(30),
-                Ok(Some(due)) => Duration::from_secs((due - now()).clamp(1, 30) as u64),
-                _ => Duration::from_secs(30),
+                _ if jobs.len() >= self.config.agent.worker_concurrency => max_wait,
+                Ok(Some(due)) => Duration::from_secs(
+                    (due - now()).clamp(1, WORKER_LOOP_MAX_WAIT_SECS as i64) as u64,
+                ),
+                _ => max_wait,
             };
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -108,8 +131,10 @@ impl Worker {
                 _ = shutdown.cancelled() => break,
             }
         }
-        // Let the jobs in progress reach a save point; `serve` stops waiting
-        // after a while and anything unfinished is requeued at the next start.
+        // Let the jobs in progress reach a save point; `run_service` stops
+        // waiting after `server.shutdown_grace_secs` (dropping this task and
+        // its job tasks) and anything unfinished is requeued at the next
+        // start.
         while jobs.join_next().await.is_some() {}
         tracing::info!("worker stopped");
     }
@@ -118,7 +143,7 @@ impl Worker {
     /// become due meanwhile, such as retries, wait for the next tick).
     pub async fn tick(self: &Arc<Self>, shutdown: &CancellationToken) {
         let due = now();
-        let mut jobs = InFlight::default();
+        let mut jobs = InFlight::new(self.health.clone());
         self.housekeeping(&jobs).await;
         loop {
             self.start_due(&mut jobs, due, shutdown).await;
@@ -145,6 +170,8 @@ impl Worker {
             Ok(_) => {}
             Err(e) => tracing::error!(error = %e, "requeueing interrupted jobs failed"),
         }
+        // Close MCP sessions nobody has used for a while.
+        self.agent.tools.housekeeping().await;
     }
 
     /// Start jobs that were due at `due` while there are free slots.
@@ -156,7 +183,12 @@ impl Worker {
     ) {
         let slots = self.config.agent.worker_concurrency.max(1);
         while jobs.len() < slots && !shutdown.is_cancelled() {
-            match self.db.claim_next_job(due, &jobs.ids()).await {
+            let claim = self.db.claim_next_job(due, &jobs.ids()).await;
+            match &claim {
+                Ok(_) => self.health.claim_ok(),
+                Err(e) => self.health.claim_failed(crate::db::classify(e)),
+            }
+            match claim {
                 Ok(Some(Claim::Ready(job))) => jobs.spawn(self.clone(), *job),
                 Ok(Some(Claim::Quarantined(q))) => self.quarantined(q).await,
                 Ok(None) => break,
@@ -179,6 +211,7 @@ impl Worker {
     async fn quarantined(&self, q: Quarantined) {
         tracing::error!(job = q.id, delivery = ?q.delivery_id, error = %q.error, "quarantined a job that could not be loaded");
         metrics::counter!("ringmaster_jobs_total", "outcome" => "quarantined").increment(1);
+        self.health.record_outcome(q.id, "quarantined", now());
         let said = q
             .heard
             .as_deref()
@@ -209,6 +242,7 @@ impl Worker {
             }
         };
         metrics::counter!("ringmaster_jobs_total", "outcome" => outcome).increment(1);
+        self.health.record_outcome(job.id, outcome, now());
         metrics::histogram!("ringmaster_job_step_seconds").record(started.elapsed().as_secs_f64());
     }
 
@@ -324,47 +358,7 @@ impl Worker {
     async fn transcribe(&self, job: &Job) -> Result<(String, String), JobError> {
         let wav = match &job.audio_path {
             None => None,
-            Some(p) => {
-                let path = self.data_dir.join(p);
-                match tokio::fs::read(&path).await {
-                    Ok(bytes) => {
-                        match tokio::task::spawn_blocking(move || audio::m4a_to_whisper_wav(&bytes))
-                            .await
-                        {
-                            Ok(Ok((wav, secs))) => {
-                                tracing::debug!(secs, "decoded recording");
-                                Some(wav)
-                            }
-                            Ok(Err(e)) => {
-                                self.audit(
-                                    job,
-                                    "audio_decode_failed",
-                                    json!({"error": format!("{e:#}")}),
-                                )
-                                .await;
-                                None
-                            }
-                            // The decoder panicked on this file: as for any
-                            // other undecodable recording, fall back to the
-                            // phone's transcription rather than retrying.
-                            Err(e) => {
-                                self.audit(
-                                    job,
-                                    "audio_decode_failed",
-                                    json!({"error": format!("decoder task: {e}")}),
-                                )
-                                .await;
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.audit(job, "audio_missing", json!({"error": e.to_string()}))
-                            .await;
-                        None
-                    }
-                }
-            }
+            Some(p) => self.decode(job, &self.data_dir.join(p)).await?,
         };
         match self
             .transcriber
@@ -386,6 +380,67 @@ impl Worker {
             }
             Err(SttError::Transient(e)) => Err(JobError::Transient(e)),
             Err(SttError::Permanent(e)) => Err(JobError::Permanent(e)),
+        }
+    }
+
+    /// The recording as a WAV, or `None` to go on with the phone's
+    /// transcription (missing, oversized or undecodable file, a decoder
+    /// that ran out of time or panicked). With every decoder still stuck on
+    /// earlier recordings and no phone transcription to use, the job waits
+    /// for a later attempt instead.
+    async fn decode(&self, job: &Job, path: &std::path::Path) -> Result<Option<Vec<u8>>, JobError> {
+        let too_big = match tokio::fs::metadata(path).await {
+            Ok(m) => m.len() > self.decoder.max_bytes(),
+            Err(e) => {
+                self.audit(job, "audio_missing", json!({"error": e.to_string()}))
+                    .await;
+                return Ok(None);
+            }
+        };
+        let decoded = if too_big {
+            Decoded::Failed(format!(
+                "recording is over stt.max_audio_bytes ({})",
+                self.decoder.max_bytes()
+            ))
+        } else {
+            match tokio::fs::read(path).await {
+                Ok(bytes) => self.decoder.decode(bytes).await,
+                Err(e) => {
+                    self.audit(job, "audio_missing", json!({"error": e.to_string()}))
+                        .await;
+                    return Ok(None);
+                }
+            }
+        };
+        match decoded {
+            Decoded::Wav(wav, secs) => {
+                tracing::debug!(secs, "decoded recording");
+                Ok(Some(wav))
+            }
+            // As for any undecodable recording (a panic included), fall
+            // back to the phone's transcription rather than retrying.
+            Decoded::Failed(error) => {
+                tracing::warn!(error = %error, "could not decode recording");
+                self.audit(job, "audio_decode_failed", json!({"error": error}))
+                    .await;
+                Ok(None)
+            }
+            Decoded::Busy => {
+                let error = "every audio decoder is busy (stuck on an earlier recording?)";
+                tracing::warn!(error, "recording not decoded");
+                self.audit(job, "audio_decode_failed", json!({"error": error}))
+                    .await;
+                let usable = self.config.stt.use_phone_transcription
+                    && job
+                        .phone_transcription
+                        .as_deref()
+                        .is_some_and(|t| !t.trim().is_empty());
+                if usable {
+                    Ok(None)
+                } else {
+                    Err(JobError::Transient(error.into()))
+                }
+            }
         }
     }
 

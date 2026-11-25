@@ -49,8 +49,17 @@ services:
       - ./ringmaster/config.toml:/etc/ringmaster/config.toml:ro
       - ringmaster-data:/data          # SQLite + recordings; the only writable path
     networks: [edge, mcp]
+    # Give in-flight jobs time to finish on `docker compose down`/restart:
+    # set server.shutdown_grace_secs a few seconds lower (25 here). Without
+    # this Docker sends SIGKILL after 10 s; jobs are still requeued at the
+    # next start either way.
+    stop_grace_period: 30s
     # No ports: cloudflared reaches it as http://ringmaster:8080.
-    # The image has a HEALTHCHECK (`ringmaster healthcheck`).
+    # The image has a HEALTHCHECK (`ringmaster healthcheck`, /healthz). It goes
+    # unhealthy when recordings cannot be stored or processed (database
+    # corrupt, read-only, full or hung; worker loop stalled). Docker only
+    # marks the container; `restart: unless-stopped` acts on exits, not on
+    # health, so this never restart-loops it. Alerts go out through ntfy.
 
   cloudflared:
     image: cloudflare/cloudflared:2026.10.7@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
