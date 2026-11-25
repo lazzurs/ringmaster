@@ -41,7 +41,7 @@ ARG RINGMASTER_VERSION
 LABEL org.opencontainers.image.title="ringmaster" \
       org.opencontainers.image.description="Voice commands from a smart ring: webhook, local transcription, Claude agent with MCP tools" \
       org.opencontainers.image.source="https://github.com/lazzurs/ringmaster" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
       org.opencontainers.image.version="${RINGMASTER_VERSION}"
 COPY --from=build /ringmaster /usr/local/bin/ringmaster
 # /data is the only writable path (SQLite + recordings); owned by nonroot.

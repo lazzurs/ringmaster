@@ -214,10 +214,15 @@ tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
   bumps the patch version and breaking changes bump the minor.
 - Do not edit `CHANGELOG.md` or `.release-please-manifest.json` by hand.
 - Do not add dependencies lightly. Each one must pass `cargo deny` (licences,
-  advisories, bans, sources). The runtime image is distroless
+  advisories, bans, sources); the licence allow list in `deny.toml` is
+  limited to GPL-3.0-compatible licences. The runtime image is distroless
   (glibc, no shell), so a dependency that needs other shared libraries at run
   time will not work there; C code must build under the `Dockerfile`'s
   cross-compiling builder.
+
+## Licence
+
+GPL-3.0-or-later (`LICENSE`, `Cargo.toml`). Copyright (C) 2026 Rob Lazzurs.
 
 ## Security notes
 
