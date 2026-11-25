@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/lazzurs/ringmaster/compare/v0.1.5...v0.1.6) (2026-11-25)
+
+
+### Features
+
+* alert on database and queue problems, and make every task end ([#18](https://github.com/lazzurs/ringmaster/issues/18)) ([6ea42f7](https://github.com/lazzurs/ringmaster/commit/6ea42f73789f8e1e80394d27ac662755cab4f0b3))
+
 ## [0.1.5](https://github.com/lazzurs/ringmaster/compare/v0.1.4...v0.1.5) (2026-11-25)
 
 
