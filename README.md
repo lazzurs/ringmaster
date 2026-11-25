@@ -54,6 +54,15 @@ Docker Compose.
 Jobs are durable: a restart, a sleeping Mac, an API outage or a pending
 confirmation all resume from the last saved step.
 
+One job never holds up the others. Up to `agent.worker_concurrency` jobs (2)
+run at once, each attempt has a deadline (`agent.attempt_timeout_secs`, 15
+minutes) after which it is retried with back-off like an outage, a crash
+while handling one job fails only that job, and a job pending Approve/Deny
+does not occupy the worker. A queued job that can no longer be read (for
+example a conversation saved by an incompatible version) is marked failed
+(`job_quarantined` in the audit log) and you are notified with what you said,
+instead of it blocking the queue.
+
 ## LLM providers
 
 | `provider` | API | Key (env) | Default model |
@@ -213,7 +222,9 @@ quietly forgotten transcript.
   load: `launchctl setenv OLLAMA_KEEP_ALIVE 30m` (or `-1`).
 * Local models are slow: the default timeout is 600 s with one retry
   (`request_timeout_secs`, `max_retries`). Raise `agent.job_max_age_secs` (or
-  the profile's) if the Mac may be busy for longer.
+  the profile's) if the Mac may be busy for longer, and
+  `agent.attempt_timeout_secs` (900 s) if one job can legitimately take
+  longer than that.
 * Use a model with tool support, such as `qwen3:8b` (thinking and tools),
   `llama3.1:8b` or `qwen2.5:7b`. A model without tools rejects the request
   (`does not support tools`); the job then runs once more without tools and
@@ -294,6 +305,8 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `agent.tool_timeout_secs` | `60` | per MCP call |
 | `agent.tool_discovery_timeout_secs` | `10` | listing a server's tools; slower servers are skipped for that job |
 | `agent.max_tool_result_chars` | `20000` | tool output truncation |
+| `agent.attempt_timeout_secs` | `900` | wall-clock limit for one attempt at a job; an attempt that runs over is retried with back-off until the job's max age |
+| `agent.worker_concurrency` | `2` | jobs processed at once (1-16), so one slow or stuck job does not hold up the queue; with more than 1, jobs can finish out of order |
 | `retention.audio_days` | `30` | delete recordings after this (0 keeps them) |
 | `notify.ntfy.url` / `.topic` | `https://ntfy.sh` / required | |
 | `notify.ntfy.action_headers` | `{}` | headers the phone sends with Approve/Deny |
@@ -432,7 +445,8 @@ conversation; `confirmations` the hashed one-time tokens and decisions;
 `claude_response` (stop reason, tool calls, usage; `llm_response` with the
 provider and finish reason for the other providers), `tool_call` (input,
 policy action, result), `confirmation_requested` / `_answered` / `_decision`,
-`retry_scheduled`, `job_finished` / `job_failed`.
+`retry_scheduled`, `job_finished` / `job_failed`, and `job_quarantined` for
+a queued job that could no longer be read.
 
 The image has no shell; copy the database out to query it:
 
@@ -448,8 +462,16 @@ docker compose cp ringmaster:/data/ringmaster.db /tmp/ && sqlite3 /tmp/ringmaste
 * Jobs older than `job_max_age_secs` are not started: a "turn the heating
   off" should not run hours later because the Mac was asleep. The example
   uses 15 minutes for commands and a day for captures.
-* MCP tool calls are at-least-once: if Ringmaster dies after a tool ran but
-  before the result was saved, the call runs again on restart.
+* MCP tool calls are at-least-once: if Ringmaster dies (or an attempt hits
+  `attempt_timeout_secs`) after a tool ran but before the result was saved,
+  the call runs again on the next attempt.
+* A job that was already started is not resumed after a restart if it is
+  more than `job_max_age_secs` + `retry_max_secs` + `confirmation_ttl_secs`
+  old: a long outage, or a job that keeps crashing the service, does not
+  carry out a stale half-done request.
+* With `worker_concurrency` above 1, two commands spoken close together may
+  run at the same time and finish in either order. Set it to 1 for strict
+  order; a stuck job then delays the rest by up to `attempt_timeout_secs`.
 * The transcript is untrusted input. The capture profile only has Deck
   tools, so even "unlock the door" said in capture mode becomes a card.
 

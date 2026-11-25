@@ -117,7 +117,7 @@ pub async fn serve(config_path: &Path) -> Result<()> {
         })
         .await?;
 
-    // Let the job in progress reach a save point; anything unfinished is
+    // Let the jobs in progress reach a save point; anything unfinished is
     // requeued at the next start.
     shutdown.cancel();
     if tokio::time::timeout(Duration::from_secs(20), worker_task)
