@@ -9,11 +9,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use reqwest::StatusCode;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, LOCATION};
 use serde_json::Value;
 
 use super::{LlmError, Provider};
 
-#[derive(Clone)]
+/// Credentials travel only in header values marked sensitive (see
+/// `config::credential_header`), so `Debug` output of this, of the clients
+/// holding it and of the requests it builds never shows them.
+#[derive(Debug, Clone)]
 pub struct Transport {
     http: reqwest::Client,
     provider: Provider,
@@ -28,6 +32,10 @@ impl Transport {
             .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
             .user_agent(concat!("ringmaster/", env!("CARGO_PKG_VERSION")))
+            // API endpoints do not redirect. Following one would replay the
+            // key headers (`x-api-key` survives even a cross-host redirect)
+            // to wherever it points.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             http,
@@ -43,11 +51,12 @@ impl Transport {
     }
 
     /// POST `body` to `url` with `headers`, retrying transient failures.
-    /// Returns the parsed JSON body of a 2xx response.
+    /// Returns the parsed JSON body of a 2xx response. Error messages have
+    /// the sensitive header values in `headers` redacted.
     pub async fn post_json(
         &self,
         url: &str,
-        headers: &[(String, String)],
+        headers: &HeaderMap,
         body: &Value,
     ) -> Result<Value, LlmError> {
         let mut attempt = 0u32;
@@ -71,23 +80,47 @@ impl Transport {
         }
     }
 
+    /// The request `post_json` sends.
+    pub fn request(
+        &self,
+        url: &str,
+        headers: &HeaderMap,
+        body: &Value,
+    ) -> reqwest::Result<reqwest::Request> {
+        self.http
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .headers(headers.clone())
+            .json(body)
+            .build()
+    }
+
     async fn attempt(
         &self,
         url: &str,
-        headers: &[(String, String)],
+        headers: &HeaderMap,
+        body: &Value,
+    ) -> Result<Value, Failure> {
+        self.attempt_unredacted(url, headers, body)
+            .await
+            .map_err(|f| match f {
+                Failure::Transient(r, e) => Failure::Transient(r, redact(&e, headers)),
+                Failure::Permanent(e) => Failure::Permanent(redact(&e, headers)),
+            })
+    }
+
+    async fn attempt_unredacted(
+        &self,
+        url: &str,
+        headers: &HeaderMap,
         body: &Value,
     ) -> Result<Value, Failure> {
         let provider = self.provider.as_str();
-        let mut req = self
-            .http
-            .post(url)
-            .header("content-type", "application/json")
-            .json(body);
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
+        let req = self
+            .request(url, headers, body)
+            .map_err(|e| Failure::Permanent(format!("building the request: {e}")))?;
         let started = Instant::now();
-        let resp = match req.send().await {
+        let resp = match self.http.execute(req).await {
             Ok(r) => r,
             Err(e) => {
                 metrics::counter!("ringmaster_llm_requests_total", "provider" => provider, "status" => "network_error")
@@ -117,6 +150,11 @@ impl Transport {
             .find_map(|h| resp.headers().get(*h))
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        let location = resp
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(crate::config::display_url);
         let text = resp
             .text()
             .await
@@ -125,13 +163,30 @@ impl Transport {
             return serde_json::from_str::<Value>(&text)
                 .map_err(|e| Failure::Transient(None, format!("invalid JSON in response: {e}")));
         }
-        let detail = format!("{status}: {}", error_detail(&text, request_id.as_deref()));
+        let mut detail = format!("{status}: {}", error_detail(&text, request_id.as_deref()));
+        if status.is_redirection() {
+            detail.push_str(&format!(
+                " (redirect to {} not followed; set base_url to the final address)",
+                location.as_deref().unwrap_or("an unknown location")
+            ));
+        }
         if is_quota_exhausted(&text) || !retryable(status) {
             Err(Failure::Permanent(detail))
         } else {
             Err(Failure::Transient(retry_after, detail))
         }
     }
+}
+
+/// `text` with the sensitive values of `headers` redacted.
+pub fn redact(text: &str, headers: &HeaderMap) -> String {
+    crate::config::redact_credentials(
+        text,
+        headers
+            .values()
+            .filter(|v| v.is_sensitive())
+            .filter_map(|v| v.to_str().ok()),
+    )
 }
 
 enum Failure {
@@ -195,6 +250,117 @@ pub fn error_detail(body: &str, request_id: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::credential_header;
+    use reqwest::header::{AUTHORIZATION, HeaderValue};
+    use serde_json::json;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const KEY: &str = "sk-live-0123456789abcdef";
+
+    fn bearer() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            AUTHORIZATION,
+            credential_header(&format!("Bearer {KEY}")).unwrap(),
+        );
+        h
+    }
+
+    fn transport(retries: u32) -> Transport {
+        Transport::new(Provider::OpenAi, Duration::from_secs(5), retries)
+            .unwrap()
+            .with_max_backoff(Duration::from_millis(10))
+    }
+
+    #[test]
+    fn built_requests_keep_the_key_out_of_debug_output() {
+        let t = transport(0);
+        let req = t
+            .request(
+                "http://127.0.0.1:1/v1/chat/completions",
+                &bearer(),
+                &json!({}),
+            )
+            .unwrap();
+        assert_eq!(
+            req.headers()[AUTHORIZATION],
+            format!("Bearer {KEY}").as_str()
+        );
+        assert!(req.headers()[AUTHORIZATION].is_sensitive());
+        let shown = format!("{req:?} {:?} {t:?}", req.headers());
+        assert!(!shown.contains(KEY), "{shown}");
+    }
+
+    #[test]
+    fn redact_removes_sensitive_values_and_bare_tokens() {
+        let mut h = bearer();
+        h.insert("x-plain", HeaderValue::from_static("not-a-secret"));
+        assert_eq!(
+            redact(&format!("got Bearer {KEY}; key {KEY}; not-a-secret"), &h),
+            "got [redacted]; key [redacted]; not-a-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_echoing_the_key_are_redacted() {
+        // A proxy that echoes the request headers back in its errors.
+        let server = MockServer::start().await;
+        let echo =
+            json!({"error": {"message": format!("upstream rejected Authorization: Bearer {KEY}")}});
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(echo.clone()))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(echo))
+            .mount(&server)
+            .await;
+        let err = transport(1)
+            .post_json(
+                &format!("{}/v1/chat/completions", server.uri()),
+                &bearer(),
+                &json!({}),
+            )
+            .await
+            .unwrap_err();
+        let LlmError::Permanent(msg) = &err else {
+            panic!("{err}")
+        };
+        assert!(msg.contains("401") && msg.contains("[redacted]"), "{msg}");
+        assert!(!err.to_string().contains(KEY), "{err}");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        // `x-api-key` and custom headers would survive a cross-host redirect.
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&elsewhere)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/v1/messages", elsewhere.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", credential_header(KEY).unwrap());
+        let err = transport(3)
+            .post_json(&format!("{}/v1/messages", server.uri()), &h, &json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LlmError::Permanent(ref m) if m.contains("307") && m.contains("not followed")),
+            "{err}"
+        );
+    }
 
     #[test]
     fn error_detail_reads_every_provider_shape() {

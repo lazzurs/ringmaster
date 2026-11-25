@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -39,8 +39,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/confirm/{token}/{decision}", post(confirm::decide))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
+}
+
+/// The request span logs the route template (`/confirm/{token}`), never the
+/// path itself: a confirmation token in a debug log could approve a tool
+/// call.
+fn request_span(req: &Request) -> tracing::Span {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str);
+    tracing::debug_span!("request", method = %req.method(), route, version = ?req.version())
 }
 
 async fn healthz(State(app): State<Arc<AppState>>) -> impl IntoResponse {

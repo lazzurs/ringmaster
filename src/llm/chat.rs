@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 
 use super::transport::Transport;
 use super::{ChatModel, ChatRequest, LlmError, Provider, StopKind, ToolCall, ToolResult, Turn};
-use crate::config::ProviderSettings;
+use crate::config::{ProviderSettings, credential_header};
 use crate::tools::ToolDef;
 
 /// How one provider differs from the common shape.
@@ -72,14 +73,19 @@ fn dialect(p: Provider) -> Dialect {
     }
 }
 
+/// The key is held only as a sensitive header value, so `Debug` shows
+/// `Sensitive` instead of it.
+#[derive(Debug)]
 pub struct ChatCompletions {
     provider: Provider,
     dialect: Dialect,
     transport: Transport,
     url: String,
-    headers: Vec<(String, String)>,
+    headers: HeaderMap,
     key_env: Option<String>,
     missing_key: bool,
+    /// A key was set but cannot be sent as a header.
+    invalid_key: bool,
     max_tokens: Option<u32>,
     num_ctx: Option<u32>,
 }
@@ -90,15 +96,27 @@ impl ChatCompletions {
         let base = s.base_url.trim_end_matches('/');
         // Accept a base URL given with the API version on the end.
         let base = base.strip_suffix("/v1").unwrap_or(base);
-        let mut headers = Vec::new();
+        let mut headers = HeaderMap::new();
+        let mut invalid_key = false;
+        // Every provider, Ollama behind a reverse proxy included, gets the
+        // key as a bearer token.
         if let Some(k) = &api_key {
-            headers.push(("authorization".to_string(), format!("Bearer {k}")));
+            match credential_header(&format!("Bearer {k}")) {
+                Some(v) => {
+                    headers.insert(AUTHORIZATION, v);
+                }
+                None => invalid_key = true,
+            }
         }
-        if let Some(u) = &s.app_url {
-            headers.push(("HTTP-Referer".to_string(), u.clone()));
-        }
-        if let Some(t) = &s.app_title {
-            headers.push(("X-OpenRouter-Title".to_string(), t.clone()));
+        // OpenRouter attribution: public values from the config, not
+        // secrets (checked to be valid header values by `Config::validate`).
+        for (name, value) in [
+            ("http-referer", &s.app_url),
+            ("x-openrouter-title", &s.app_title),
+        ] {
+            if let Some(v) = value.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+                headers.insert(HeaderName::from_static(name), v);
+            }
         }
         Ok(Self {
             provider: s.provider,
@@ -108,6 +126,7 @@ impl ChatCompletions {
             headers,
             key_env: s.api_key_env.clone(),
             missing_key: api_key.is_none() && s.provider.needs_key(),
+            invalid_key,
             max_tokens: s.max_tokens,
             num_ctx: s.num_ctx,
         })
@@ -173,7 +192,8 @@ impl ChatCompletions {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| err.to_string());
-            let msg = format!("{name} error {code}: {msg}");
+            let msg =
+                super::transport::redact(&format!("{name} error {code}: {msg}"), &self.headers);
             return Err(
                 if (400..500).contains(&code) && code != 408 && code != 429 {
                     LlmError::Permanent(msg)
@@ -299,6 +319,13 @@ impl ChatModel for ChatCompletions {
         if self.missing_key {
             return Err(LlmError::Permanent(format!(
                 "no API key for {}: {} is not set",
+                self.provider,
+                self.key_env.as_deref().unwrap_or("the key variable")
+            )));
+        }
+        if self.invalid_key {
+            return Err(LlmError::Permanent(format!(
+                "the API key for {} in {} is not a valid HTTP header value (check for stray characters)",
                 self.provider,
                 self.key_env.as_deref().unwrap_or("the key variable")
             )));
@@ -628,5 +655,79 @@ mod tests {
         cfg.llm.openrouter.base_url = Some("https://openrouter.ai/api/v1".into());
         let a = ChatCompletions::new(&cfg.provider_settings(Provider::OpenRouter), None).unwrap();
         assert_eq!(a.url, "https://openrouter.ai/api/v1/chat/completions");
+    }
+
+    #[test]
+    fn every_provider_sends_its_key_as_a_sensitive_header() {
+        const KEY: &str = "chat-key-0123456789abcdef";
+        let mut cfg = Config::from_toml("").unwrap();
+        cfg.llm.openrouter.app_url = Some("https://github.com/lazzurs/ringmaster".into());
+        cfg.llm.openrouter.app_title = Some("Ringmaster".into());
+        // Ollama sends a key when it sits behind a reverse proxy.
+        for p in [
+            Provider::OpenAi,
+            Provider::Mistral,
+            Provider::OpenRouter,
+            Provider::Ollama,
+        ] {
+            let a = ChatCompletions::new(&cfg.provider_settings(p), Some(KEY.into())).unwrap();
+            let req = a.transport.request(&a.url, &a.headers, &json!({})).unwrap();
+            let auth = &req.headers()[AUTHORIZATION];
+            assert_eq!(auth, format!("Bearer {KEY}").as_str(), "{p}");
+            assert!(auth.is_sensitive(), "{p}");
+            let shown = format!("{a:?} {req:?} {:?}", req.headers());
+            assert!(!shown.contains(KEY), "{p}: {shown}");
+            if p == Provider::OpenRouter {
+                assert_eq!(req.headers()["x-openrouter-title"], "Ringmaster");
+                assert_eq!(
+                    req.headers()["http-referer"],
+                    "https://github.com/lazzurs/ringmaster"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_that_is_not_a_header_value_fails_only_its_requests() {
+        let cfg = Config::from_toml("").unwrap();
+        let a = ChatCompletions::new(
+            &cfg.provider_settings(Provider::OpenAi),
+            Some("sk-bad\u{7f}key".into()),
+        )
+        .unwrap();
+        let err = a
+            .complete(&ChatRequest {
+                model: "m",
+                system: "s",
+                effort: "",
+                tools: &[],
+                messages: &[json!({"role": "user", "content": "hi"})],
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, LlmError::Permanent(_)), "{msg}");
+        assert!(
+            msg.contains("OPENAI_API_KEY") && !msg.contains("sk-bad"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn errors_inside_a_200_are_redacted() {
+        const KEY: &str = "sk-or-0123456789abcdef";
+        let cfg = Config::from_toml("").unwrap();
+        let a = ChatCompletions::new(
+            &cfg.provider_settings(Provider::OpenRouter),
+            Some(KEY.into()),
+        )
+        .unwrap();
+        let err = a
+            .turn(
+                &json!({"error": {"code": 401, "message": format!("bad key {KEY}")}}),
+                true,
+            )
+            .unwrap_err();
+        assert!(!err.to_string().contains(KEY), "{err}");
     }
 }

@@ -6,8 +6,10 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
+use crate::config::credential_header;
 use crate::llm::Provider;
 use crate::llm::transport::Transport;
 
@@ -18,19 +20,26 @@ pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 /// provider now.
 pub use crate::llm::LlmError as ClaudeError;
 
-#[derive(Clone)]
+/// The key is held only as a sensitive header value, so `Debug` shows
+/// `Sensitive` instead of it.
+#[derive(Debug, Clone)]
 pub struct ClaudeClient {
     transport: Transport,
     base: String,
-    api_key: String,
+    /// `x-api-key`; `None` when no key is set.
+    api_key: Option<HeaderValue>,
+    /// A key was set but cannot be sent as a header.
+    invalid_key: bool,
 }
 
 impl ClaudeClient {
     pub fn new(base: &str, api_key: String, timeout: Duration, max_retries: u32) -> Result<Self> {
+        let header = (!api_key.is_empty()).then(|| credential_header(&api_key));
         Ok(Self {
             transport: Transport::new(Provider::Anthropic, timeout, max_retries)?,
             base: base.trim_end_matches('/').to_string(),
-            api_key,
+            invalid_key: matches!(header, Some(None)),
+            api_key: header.flatten(),
         })
     }
 
@@ -40,21 +49,40 @@ impl ClaudeClient {
     }
 
     pub fn has_key(&self) -> bool {
-        !self.api_key.is_empty()
+        self.api_key.is_some() || self.invalid_key
+    }
+
+    fn headers(&self, betas: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(k) = &self.api_key {
+            h.insert(HeaderName::from_static("x-api-key"), k.clone());
+        }
+        h.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static(API_VERSION),
+        );
+        if !betas.is_empty()
+            && let Ok(v) = HeaderValue::from_str(&betas.join(","))
+        {
+            h.insert(HeaderName::from_static("anthropic-beta"), v);
+        }
+        h
     }
 
     /// POST /v1/messages with retries for 429, 5xx/529 and connection errors,
     /// honouring `retry-after`. 4xx (other than 408/429) are not retried.
     pub async fn create_message(&self, body: &Value, betas: &[&str]) -> Result<Value, ClaudeError> {
-        let url = format!("{}/v1/messages", self.base);
-        let mut headers = vec![
-            ("x-api-key".to_string(), self.api_key.clone()),
-            ("anthropic-version".to_string(), API_VERSION.to_string()),
-        ];
-        if !betas.is_empty() {
-            headers.push(("anthropic-beta".to_string(), betas.join(",")));
+        if self.invalid_key {
+            return Err(ClaudeError::Permanent(
+                "the Anthropic API key is not a valid HTTP header value (check for stray characters)"
+                    .into(),
+            ));
         }
-        let value = self.transport.post_json(&url, &headers, body).await?;
+        let url = format!("{}/v1/messages", self.base);
+        let value = self
+            .transport
+            .post_json(&url, &self.headers(betas), body)
+            .await?;
         record_usage(&value);
         Ok(value)
     }
@@ -91,6 +119,43 @@ mod tests {
         )
         .unwrap()
         .with_max_backoff(Duration::from_millis(20))
+    }
+
+    #[test]
+    fn key_header_is_sensitive_and_kept_out_of_debug_output() {
+        const KEY: &str = "sk-ant-0123456789abcdef";
+        let c =
+            ClaudeClient::new("http://127.0.0.1:1", KEY.into(), Duration::from_secs(5), 0).unwrap();
+        let req = c
+            .transport
+            .request(
+                "http://127.0.0.1:1/v1/messages",
+                &c.headers(&[FALLBACK_BETA]),
+                &json!({}),
+            )
+            .unwrap();
+        assert_eq!(req.headers()["x-api-key"], KEY);
+        assert!(req.headers()["x-api-key"].is_sensitive());
+        assert_eq!(req.headers()["anthropic-beta"], FALLBACK_BETA);
+        let shown = format!("{c:?} {req:?} {:?}", req.headers());
+        assert!(!shown.contains(KEY), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_key_that_is_not_a_header_value_is_a_permanent_error() {
+        let c = ClaudeClient::new(
+            "http://127.0.0.1:1",
+            "sk-ant\nbad".into(),
+            Duration::from_secs(5),
+            0,
+        )
+        .unwrap();
+        assert!(c.has_key());
+        let err = c.create_message(&json!({}), &[]).await.unwrap_err();
+        assert!(
+            matches!(err, ClaudeError::Permanent(ref m) if m.contains("not a valid HTTP header value") && !m.contains("sk-ant")),
+            "{err}"
+        );
     }
 
     #[tokio::test]
