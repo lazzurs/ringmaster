@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/lazzurs/ringmaster/compare/v0.1.7...v0.1.8) (2026-11-26)
+
+
+### Features
+
+* argument-aware tool policies and spoken authorisation codes ([#22](https://github.com/lazzurs/ringmaster/issues/22)) ([460ed2a](https://github.com/lazzurs/ringmaster/commit/460ed2ad1314494beac084d847a6134c3d3300c6))
+
 ## [0.1.7](https://github.com/lazzurs/ringmaster/compare/v0.1.6...v0.1.7) (2026-11-25)
 
 
