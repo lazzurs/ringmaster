@@ -12,8 +12,10 @@ from a smart ring into actions:
 POST /webhook (HMAC-signed multipart) -> SQLite job queue -> worker
   -> whisper.cpp /inference (primary, fallback, then the phone's transcript)
   -> LLM agent loop (Anthropic native; OpenAI/Mistral/OpenRouter chat completions; Ollama /api/chat)
-  -> MCP tools over streamable HTTP, gated by allow/confirm/ask/deny policies
-     (optionally: a local Shieldstral classifier approves clear `confirm` passes)
+  -> MCP tools over streamable HTTP, gated by allow/confirm/ask/deny/code policies
+     (on the tool name and optionally its arguments; `code` needs a spoken
+     authorisation code, checked by Ringmaster after transcription;
+     optionally: a local Shieldstral classifier approves clear `confirm` passes)
   -> ntfy notification (result, problem, or Approve/Deny buttons)
 ```
 
@@ -36,7 +38,8 @@ outages and pending confirmations resume where they stopped.
 | `src/stt.rs` | whisper-server client and fallback chain | transcription |
 | `src/audio.rs` | M4A (AAC-LC) to 16 kHz mono WAV in pure Rust (symphonia + hound); `Budget` (deadline and duration checked in the decode loop) and `Decoder` (size cap, semaphore, timeout; `with_fn` for tests) | audio decoding |
 | `src/agent.rs` | provider-neutral agent loop, `AgentState`, tool discovery, planning, confirmations, tool execution | agent behaviour |
-| `src/policy.rs` | `Policies` (allow/confirm/ask/deny) and per-profile `ToolFilter` globs | tool policy rules |
+| `src/policy.rs` | `Policies` (allow/confirm/ask/deny/code; argument conditions `when`/`when_any`/`unless` as JSON pointer -> case-insensitive glob; `matched`, `always_denies`) and per-profile `ToolFilter` globs | tool policy rules |
+| `src/authcode.rs` | spoken authorisation codes: `AuthCodes` (keyed HMAC tags, never plain codes; `scan` strips trigger + code into a marker, `scrub` strips code words), normalisation, `decide` (combine whisper and phone scans, lockout), `CodeAuth` ("code X until T") | code detection and redaction |
 | `src/classifier.rs` | Shieldstral approval classifier: `Classifier` (request body, bounded `classify`, health reporting), `document`, `score_from_response`, `Verdict` | automatic approval |
 | `src/tools.rs` | `ToolBackend` trait (`housekeeping`), `McpBackend` (rmcp client; sessions closed when idle `MCP_SESSION_IDLE` or dead, bounded close), `to_defs` (sorted, sanitised names), `check_schema` | MCP integration |
 | `src/confirm.rs` | `GET /confirm/{token}` page, `POST /confirm/{token}/{approve,deny}` | confirmation UX |
@@ -122,9 +125,15 @@ outages and pending confirmations resume where they stopped.
    asking the model to retry (`Agent::handle_tool_turn`).
 5. **Tool policies** (`src/policy.rs`): globs over `server/tool`, `*` does not
    cross `/` (`literal_separator`), first matching rule wins, no match means
-   `confirm`. `deny` tools are filtered out before the model sees them
-   (`Agent::start`) and rejected again if called. Profile `tools` globs are a
-   second, independent allow-list (`ToolFilter`).
+   `confirm`. A rule with argument conditions matches only when its tool glob
+   and every condition match; a missing pointer never matches (for `unless`
+   the rule then applies), lists match if any element does (`unless`: all).
+   Only tools whose first applicable rule is an unconditional `deny`
+   (`Policies::always_denies`) are filtered out before the model sees them
+   (`Agent::start`); every call is checked again with its arguments
+   (`Policies::matched` in `Agent::handle_tool_turn`), so a conditional
+   `deny` is refused at call time with an error result. Profile `tools` globs
+   are a second, independent allow-list (`ToolFilter`).
 6. **Secrets come only from environment variables or `<NAME>_FILE`**
    (`config::secret_from_env`). Never add secret values to config structs,
    log lines, audit entries or `Debug` output (`Secrets` has a redacting
@@ -132,7 +141,9 @@ outages and pending confirmations resume where they stopped.
    via `config::credential_header` (held as such by `ClaudeClient` and
    `ChatCompletions`), MCP headers in `McpBackend::new`, ntfy via
    `bearer_auth`. Error text built from a server's reply goes through
-   `config::redact_credentials` (`transport::redact` for LLMs). The LLM
+   `config::redact_credentials` (`transport::redact` for LLMs), which also
+   removes every value registered with `config::register_secret` (spoken
+   codes). The LLM
    `Transport` never follows redirects (`x-api-key` would follow one to
    another host). Request spans log the route template, not the path
    (confirmation tokens). `tests/log_redaction.rs` checks the logs.
@@ -145,7 +156,9 @@ outages and pending confirmations resume where they stopped.
    decodes no longer blocks the queue (invariant 9), but the job is
    quarantined and the user's request is dropped, so this still matters.
    Schema changes go in a new migration with a bumped `SCHEMA_VERSION`;
-   never edit `MIGRATION_1`.
+   never edit `MIGRATION_1` or `MIGRATION_2` (codes: `deliveries.phone_code`,
+   `jobs.code_auth`, `auth_code_failures`, `auth_code_lockouts`; one
+   transaction including the `user_version` bump).
 8. **Webhook verification and dedupe** (`src/webhook.rs`, `src/signature.rs`):
    - Version header must be `1`; the HMAC covers
      `v1\n{timestamp}\n{delivery_id}\n{trigger}\n{1|0}\n` + raw body, is
@@ -230,10 +243,12 @@ outages and pending confirmations resume where they stopped.
     `Agent::handle_tool_turn` in `src/agent.rs`).
     - Only `confirm` calls are classified, and only in `shadow` or
       `classifier` mode (`approval.mode`, profile `approval_mode`; default
-      `manual` = no classifier at all). `deny` calls are never offered or
-      classified; `ask` calls always go to the human and are never sent to
-      the classifier (nor, in classifier mode, are the other calls of their
-      turn).
+      `manual` = no classifier at all). `deny` calls are never classified;
+      `ask` calls always go to the human and are never sent to the
+      classifier (nor, in classifier mode, are the other calls of their
+      turn). `code` calls are never classified: they run on a valid code
+      (`CallAction::Authorised`), are refused, or (`on_missing = "ask"`) go
+      to the human as `ask`.
     - A turn runs without asking only when every `confirm` call in it scored
       below `approval.auto_approve_below` (`Judged::Safe`); anything else
       parks the turn for Approve/Deny exactly as in manual mode. No verdict
@@ -251,6 +266,39 @@ outages and pending confirmations resume where they stopped.
     - New persisted fields (`AgentState::auto_approved`,
       `PendingTurn::approval_mode`/`judgements`) are `serde(default)` and
       skipped when empty, so manual-mode states keep their old shape.
+
+12. **Authorisation codes are checked by Ringmaster, never seen by the LLM,
+    the classifier, ntfy or the logs** (`src/authcode.rs`,
+    `Worker::check_codes`, the webhook, `Agent::handle_tool_turn`).
+    - Code values come only from the environment (`code_env`, `_FILE`);
+      `AuthCodes` holds keyed HMAC tags, compares with `verify_slice`
+      (constant time), and has a redacting `Debug`. A configured code
+      without a value refuses to start.
+    - The phone's transcription is scanned in the webhook before it is
+      stored, logged or audited; the whisper transcript in
+      `Worker::check_codes` before the `transcript` audit row and
+      `save_transcript_with_codes`. Trigger + code become a marker
+      (`[authorisation code accepted]`/`rejected`/locked), code words alone
+      become `[redacted]`. Everything downstream (`jobs.transcript`, audit,
+      `AgentState`, model and classifier requests, confirmation summaries,
+      notifications) only ever sees the stripped text; `Worker::notify` and
+      confirmation summaries `scrub` again. Without `[auth_codes.codes]`
+      nothing is scanned or changed.
+    - A recording that held a code is deleted right after transcription
+      (`Worker::delete_code_audio`, audit `audio_deleted`), whatever the
+      retention.
+    - The job stores only `CodeAuth` ("code X until T", T = recording time +
+      `valid_for_secs`), saved in the same transaction as the transcript and
+      the wrong-code count. A code authorises `code` calls naming it in that
+      job only; `execute` re-checks expiry and lockout before running.
+    - Wrong codes are counted in `auth_code_failures`; too many start a
+      lockout (`auth_code_lockouts`, persisted) during which codes are not
+      checked, and the watchdog raises `Condition::AuthCodeLockout` (counts
+      only). A transcript with any wrong attempt authorises nothing.
+    - Tests: `spoken_code_authorises_the_disarm_without_ntfy_or_classifier`
+      and its neighbours in `tests/pipeline.rs` assert the code is absent from
+      the database dump, model and classifier requests and notifications;
+      `tests/log_redaction.rs` checks the logs.
 
 Other behaviour to keep: `GET /confirm/*` never changes state; confirmation
 tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after

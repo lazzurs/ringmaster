@@ -174,6 +174,22 @@ async fn run(cli: Cli) -> ExitCode {
                         }
                     );
                 }
+                let a = &c.auth_codes;
+                if !a.codes.is_empty() {
+                    let codes: Vec<String> = a
+                        .codes
+                        .iter()
+                        .map(|(name, code)| format!("{name} (from {})", code.code_env))
+                        .collect();
+                    println!(
+                        "  auth codes: {}; valid {} s; lockout after {} wrong in {} s, for {} s",
+                        codes.join(", "),
+                        a.valid_for_secs,
+                        a.max_failures,
+                        a.failure_window_secs,
+                        a.lockout_secs
+                    );
+                }
                 ExitCode::SUCCESS
             }
             Err(e) => {

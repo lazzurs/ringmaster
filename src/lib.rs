@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod audio;
+pub mod authcode;
 pub mod classifier;
 pub mod claude;
 pub mod config;
@@ -110,6 +111,13 @@ pub async fn serve(config_path: &Path) -> Result<()> {
         secrets.mcp_headers.clone(),
         Duration::from_secs(config.agent.tool_timeout_secs),
     ));
+    let codes = Arc::new(authcode::AuthCodes::load(
+        &config.auth_codes,
+        config::secret_from_env,
+    )?);
+    if codes.enabled() {
+        tracing::info!(codes = ?codes, "spoken authorisation codes configured");
+    }
     let classifier = classifier::Classifier::from_config(&config, secrets.classifier_key.clone())?
         .map(|c| Arc::new(c.with_health(health.clone())));
     if let Some(base) = &config.approval.base_url
@@ -123,7 +131,8 @@ pub async fn serve(config_path: &Path) -> Result<()> {
     }
     let agent = Arc::new(
         Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone())?
-            .with_classifier(classifier),
+            .with_classifier(classifier)
+            .with_auth_codes(codes.clone()),
     );
     let wake = Arc::new(Notify::new());
     let worker = Arc::new(Worker {
@@ -149,6 +158,7 @@ pub async fn serve(config_path: &Path) -> Result<()> {
         webhook_secret: secrets.webhook_secret.clone(),
         metrics,
         health,
+        codes,
     });
 
     let listener = tokio::net::TcpListener::bind(config.server.listen)

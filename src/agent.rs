@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::authcode::{AuthCodes, CodeAuth};
 use crate::classifier::{Classifier, ClassifyError, ProposedCall, Verdict};
-use crate::config::{ApprovalMode, Config, ProfileConfig};
+use crate::config::{ApprovalMode, Config, OnMissing, ProfileConfig};
 use crate::db::{Db, Job, JobStatus};
 use crate::llm::{ChatModel, ChatRequest, LlmError, Llms, Provider, StopKind, ToolResult};
 use crate::notify::{Kind, Notification, Notifier};
@@ -47,6 +48,20 @@ pub struct AgentState {
     /// final notification.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auto_approved: Vec<AutoApproval>,
+    /// `code` calls that ran on a spoken authorisation code; listed in the
+    /// final notification. Holds the code's name, never the code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub code_authorised: Vec<CodeApproval>,
+}
+
+/// A `code` call that ran because the request carried its code.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeApproval {
+    /// `<server>/<tool>`.
+    pub tool: String,
+    pub input: Value,
+    /// The `[auth_codes.codes]` entry's name.
+    pub code: String,
 }
 
 /// A `confirm` call that ran on the classifier's approval.
@@ -155,6 +170,9 @@ pub enum CallAction {
     Run,
     Confirm,
     Reject(String),
+    /// A `code` call the request's authorisation code (named here) allows:
+    /// it runs without Approve/Deny or the classifier.
+    Authorised(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,8 +204,11 @@ impl From<anyhow::Error> for AgentError {
 
 /// What the agent knows about the request.
 pub struct Request<'a> {
+    /// With any authorisation code already replaced by a marker.
     pub transcript: &'a str,
     pub transcript_source: &'a str,
+    /// Which codes this job may use, and until when.
+    pub code_auth: Option<&'a CodeAuth>,
 }
 
 pub struct Agent {
@@ -200,6 +221,8 @@ pub struct Agent {
     filters: HashMap<String, ToolFilter>,
     /// The approval classifier, when a profile uses one.
     classifier: Option<Arc<Classifier>>,
+    /// Spoken authorisation codes (none by default).
+    codes: Arc<AuthCodes>,
 }
 
 impl Agent {
@@ -210,7 +233,8 @@ impl Agent {
         tools: Arc<dyn ToolBackend>,
         notifier: Arc<dyn Notifier>,
     ) -> anyhow::Result<Self> {
-        let policies = Policies::new(&config.tool_policies)?;
+        let code_names: Vec<String> = config.auth_codes.codes.keys().cloned().collect();
+        let policies = Policies::with_codes(&config.tool_policies, &code_names)?;
         let filters = config
             .profiles
             .iter()
@@ -225,7 +249,18 @@ impl Agent {
             policies,
             filters,
             classifier: None,
+            codes: Arc::new(AuthCodes::disabled()),
         })
+    }
+
+    /// Use these spoken authorisation codes (loaded from the environment).
+    pub fn with_auth_codes(mut self, codes: Arc<AuthCodes>) -> Self {
+        self.codes = codes;
+        self
+    }
+
+    pub fn codes(&self) -> &Arc<AuthCodes> {
+        &self.codes
     }
 
     /// Use `classifier` for shadow and classifier approval. Without one,
@@ -249,7 +284,7 @@ impl Agent {
         let outcome = self.run_state(job, req, &mut state).await;
         // Every action the classifier approved is listed in what the user
         // is told at the end, however the job ends.
-        let note = |text: String| with_auto_approved_note(text, &state);
+        let note = |text: String| with_code_note(with_auto_approved_note(text, &state), &state);
         match outcome {
             Ok(AgentOutcome::Final(t)) => Ok(AgentOutcome::Final(note(t))),
             Ok(AgentOutcome::Refused(t)) => Ok(AgentOutcome::Refused(note(t))),
@@ -303,6 +338,7 @@ impl Agent {
             let results = self
                 .execute(
                     job,
+                    req,
                     state,
                     &pending.calls,
                     approved.then_some(Approver::Human),
@@ -496,7 +532,7 @@ impl Agent {
             .into_iter()
             .filter(|t| {
                 let q = t.qualified();
-                filter.allows(&q) && self.policies.policy_for(&q) != Policy::Deny
+                filter.allows(&q) && !self.policies.always_denies(&q)
             })
             .collect();
         let choice = self
@@ -587,51 +623,85 @@ impl Agent {
         // The policy of each call, kept for the approval step: `ask` calls
         // are never shown to the classifier.
         let mut policies = Vec::with_capacity(uses.len());
-        let calls: Vec<PlannedCall> = uses
-            .into_iter()
-            .map(|u| {
-                let name = u.name;
-                let (input, bad_input) = match u.input {
-                    Ok(v) => (v, None),
-                    Err(why) => (Value::Null, Some(why)),
-                };
-                let mut policy = None;
-                let action = match state.tools.iter().find(|d| d.claude_name == name) {
-                    // Malformed arguments (a small model, or a cut-off reply)
-                    // are never run, whatever the tool's policy.
-                    _ if bad_input.is_some() => CallAction::Reject(format!(
-                        "Not run: {}. Call the tool again with a JSON object as its arguments.",
-                        bad_input.as_deref().unwrap_or_default()
-                    )),
-                    None => CallAction::Reject(format!("Unknown tool {name}.")),
-                    Some(def) => {
-                        let q = def.qualified();
-                        if !filter.allows(&q) {
-                            CallAction::Reject(
-                                "This tool is not available for this gesture.".into(),
-                            )
-                        } else {
-                            let p = self.policies.policy_for(&q);
-                            policy = Some(p);
-                            match p {
-                                Policy::Allow => CallAction::Run,
-                                Policy::Confirm | Policy::Ask => CallAction::Confirm,
-                                Policy::Deny => {
-                                    CallAction::Reject("This tool is blocked by policy.".into())
+        let mut calls: Vec<PlannedCall> = Vec::with_capacity(uses.len());
+        let now = crate::db::now();
+        // Read once per turn, and only when a call needs a code.
+        let mut lockout: Option<bool> = None;
+        for u in uses {
+            let name = u.name;
+            let (input, bad_input) = match u.input {
+                Ok(v) => (v, None),
+                Err(why) => (Value::Null, Some(why)),
+            };
+            let mut policy = None;
+            let action = match state.tools.iter().find(|d| d.claude_name == name) {
+                // Malformed arguments (a small model, or a cut-off reply)
+                // are never run, whatever the tool's policy.
+                _ if bad_input.is_some() => CallAction::Reject(format!(
+                    "Not run: {}. Call the tool again with a JSON object as its arguments.",
+                    bad_input.as_deref().unwrap_or_default()
+                )),
+                None => CallAction::Reject(format!("Unknown tool {name}.")),
+                Some(def) => {
+                    let q = def.qualified();
+                    if !filter.allows(&q) {
+                        CallAction::Reject("This tool is not available for this gesture.".into())
+                    } else {
+                        let m = self.policies.matched(&q, &input);
+                        let (p, conditional, code) = (m.policy, m.conditional, m.code.cloned());
+                        policy = Some(p);
+                        match (p, code) {
+                            (Policy::Allow, _) => CallAction::Run,
+                            (Policy::Confirm | Policy::Ask, _) => CallAction::Confirm,
+                            // A deny that depends on the arguments cannot
+                            // hide the tool, so it is enforced here.
+                            (Policy::Deny, _) if conditional => {
+                                CallAction::Reject(BLOCKED_FOR_ARGUMENTS.into())
+                            }
+                            (Policy::Deny, _) => {
+                                CallAction::Reject("This tool is blocked by policy.".into())
+                            }
+                            (Policy::Code, None) => CallAction::Reject(code_refusal(false, false)),
+                            (Policy::Code, Some(need)) => {
+                                let locked = match lockout {
+                                    Some(l) => l,
+                                    None => {
+                                        let l = self.db.active_lockout(now).await?.is_some();
+                                        lockout = Some(l);
+                                        l
+                                    }
+                                };
+                                let auth = req.code_auth;
+                                if !locked && auth.is_some_and(|a| a.allows(&need.code, now)) {
+                                    CallAction::Authorised(need.code)
+                                } else {
+                                    match need.on_missing {
+                                        // No valid code: a human decides,
+                                        // never the classifier.
+                                        OnMissing::Ask => {
+                                            policy = Some(Policy::Ask);
+                                            CallAction::Confirm
+                                        }
+                                        OnMissing::Deny => {
+                                            let expired = auth
+                                                .is_some_and(|a| a.until.contains_key(&need.code));
+                                            CallAction::Reject(code_refusal(locked, expired))
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                };
-                policies.push(policy);
-                PlannedCall {
-                    tool_use_id: u.id,
-                    claude_name: name,
-                    input,
-                    action,
                 }
-            })
-            .collect();
+            };
+            policies.push(policy);
+            calls.push(PlannedCall {
+                tool_use_id: u.id,
+                claude_name: name,
+                input,
+                action,
+            });
+        }
 
         if calls.iter().any(|c| c.action == CallAction::Confirm) {
             let mode = self.config.approval_mode(Some(profile));
@@ -668,7 +738,7 @@ impl Agent {
                     });
                 }
                 let results = self
-                    .execute(job, state, &calls, Some(Approver::Classifier), "")
+                    .execute(job, req, state, &calls, Some(Approver::Classifier), "")
                     .await;
                 state.messages.extend(llm.tool_results(&results));
                 self.db.save_agent_state(job.id, state).await?;
@@ -686,7 +756,7 @@ impl Agent {
             return Ok(Some(AgentOutcome::AwaitingConfirmation));
         }
 
-        let results = self.execute(job, state, &calls, None, "").await;
+        let results = self.execute(job, req, state, &calls, None, "").await;
         state.messages.extend(llm.tool_results(&results));
         self.db.save_agent_state(job.id, state).await?;
         Ok(None)
@@ -878,7 +948,7 @@ impl Agent {
             .collect();
         let summary = format!(
             "Request: \"{}\"\nRun {}:\n{}",
-            truncate(req.transcript.trim(), 200),
+            truncate(&self.codes.scrub(req.transcript.trim()), 200),
             if lines.len() == 1 {
                 "this action"
             } else {
@@ -969,11 +1039,14 @@ impl Agent {
     }
 
     /// Run planned calls in order; the results go back to the model in the
-    /// provider's format.
+    /// provider's format. Calls allowed by an authorisation code run
+    /// whatever the human decided about the others of their turn (the code
+    /// is their approval), as long as the code is still valid.
     async fn execute(
         &self,
         job: &Job,
-        state: &AgentState,
+        req: &Request<'_>,
+        state: &mut AgentState,
         calls: &[PlannedCall],
         approval: Option<Approver>,
         refusal_text: &str,
@@ -981,6 +1054,7 @@ impl Agent {
         let approved = approval.is_some();
         let max = self.config.agent.max_tool_result_chars;
         let mut results = Vec::with_capacity(calls.len());
+        let mut by_code = Vec::new();
         for c in calls {
             let def = state.tools.iter().find(|d| d.claude_name == c.claude_name);
             let qualified = def
@@ -988,6 +1062,7 @@ impl Agent {
                 .unwrap_or_else(|| c.claude_name.clone());
             let run = match &c.action {
                 CallAction::Run => Ok(()),
+                CallAction::Authorised(code) => self.code_still_valid(req, code).await,
                 CallAction::Confirm if approved => Ok(()),
                 CallAction::Confirm => Err(refusal_text.to_string()),
                 CallAction::Reject(r) => Err(r.clone()),
@@ -1007,6 +1082,23 @@ impl Agent {
                     }
                 }
             };
+            let code = match &c.action {
+                CallAction::Authorised(code) if outcome != "not_run" => {
+                    tracing::info!(job = job.id, tool = %qualified, code = %code, "ran on a spoken authorisation code");
+                    by_code.push(CodeApproval {
+                        tool: qualified.clone(),
+                        input: c.input.clone(),
+                        code: code.clone(),
+                    });
+                    Some(code.clone())
+                }
+                _ => None,
+            };
+            let approved_by = match &c.action {
+                CallAction::Authorised(_) => code.as_ref().map(|_| "auth_code"),
+                CallAction::Confirm if approved => approval.map(Approver::as_str),
+                _ => None,
+            };
             metrics::counter!("ringmaster_tool_calls_total", "outcome" => outcome).increment(1);
             self.audit(
                 job,
@@ -1015,10 +1107,9 @@ impl Agent {
                     "tool": qualified,
                     "input": c.input,
                     "action": c.action,
-                    "approved": approved,
-                    "approved_by": (approved && c.action == CallAction::Confirm)
-                        .then(|| approval.map(Approver::as_str))
-                        .flatten(),
+                    "approved": approved || code.is_some(),
+                    "approved_by": approved_by,
+                    "auth_code": code,
                     "outcome": outcome,
                     "result": truncate(&text, 2000),
                 }),
@@ -1031,7 +1122,26 @@ impl Agent {
                 is_error,
             });
         }
+        state.code_authorised.extend(by_code);
         results
+    }
+
+    /// Whether a call allowed by `code` may still run: the code has not
+    /// expired (a turn may have waited for Approve/Deny on another call)
+    /// and codes are not locked out. Fails closed.
+    async fn code_still_valid(&self, req: &Request<'_>, code: &str) -> Result<(), String> {
+        let now = crate::db::now();
+        if !req.code_auth.is_some_and(|a| a.allows(code, now)) {
+            return Err(code_refusal(false, true));
+        }
+        match self.db.active_lockout(now).await {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(code_refusal(true, false)),
+            Err(e) => {
+                tracing::error!(error = %e, "could not read the authorisation code lockout");
+                Err("Not run: the authorisation code could not be checked. Tell the user to try again later.".into())
+            }
+        }
     }
 
     async fn audit(&self, job: &Job, kind: &str, detail: Value) {
@@ -1042,6 +1152,29 @@ impl Agent {
         {
             tracing::error!(job = job.id, error = %e, "audit write failed");
         }
+    }
+}
+
+/// The error result for a conditional `deny`.
+const BLOCKED_FOR_ARGUMENTS: &str = "Not run: policy blocks this call with these arguments. Do not try \
+to achieve the same effect another way.";
+
+/// The error result for a `code` call without a valid code, for the model
+/// to relay.
+fn code_refusal(locked: bool, expired: bool) -> String {
+    if locked {
+        "Not run: authorisation codes are locked after too many wrong codes. Tell the user to try \
+         again later."
+            .into()
+    } else if expired {
+        "Not run: the authorisation code given with this request has expired. Tell the user to \
+         say the request again with the code."
+            .into()
+    } else {
+        "Not run: this action needs the user's spoken authorisation code, and this request did not \
+         include a valid one. Tell the user it needs their authorisation code; do not try to do it \
+         another way."
+            .into()
     }
 }
 
@@ -1093,6 +1226,31 @@ fn with_auto_approved_note(text: String, state: &AgentState) -> String {
         .collect();
     format!(
         "{}\n\nAuto-approved by the classifier: {}",
+        text.trim_end(),
+        items.join("; ")
+    )
+}
+
+/// When calls ran on a spoken authorisation code in this job, end the text
+/// with them, so every action a code allowed is seen.
+fn with_code_note(text: String, state: &AgentState) -> String {
+    if state.code_authorised.is_empty() {
+        return text;
+    }
+    let items: Vec<String> = state
+        .code_authorised
+        .iter()
+        .map(|a| {
+            format!(
+                "{} {} (code \"{}\")",
+                a.tool,
+                truncate(&a.input.to_string(), 100),
+                a.code
+            )
+        })
+        .collect();
+    format!(
+        "{}\n\nAuthorised by code: {}",
         text.trim_end(),
         items.join("; ")
     )
@@ -1201,5 +1359,40 @@ mod tests {
     fn truncate_marks_cut() {
         assert_eq!(truncate("abc", 5), "abc");
         assert_eq!(truncate("abcdef", 3), "abc… [truncated]");
+    }
+
+    #[test]
+    fn code_fields_round_trip_and_old_states_keep_their_shape() {
+        let mut s = AgentState::default();
+        let shape = serde_json::to_value(&s).unwrap();
+        assert!(shape.get("code_authorised").is_none());
+        s.code_authorised.push(CodeApproval {
+            tool: "homeassistant/call_action".into(),
+            input: json!({"action": "alarm_control_panel.alarm_disarm"}),
+            code: "alarm".into(),
+        });
+        s.pending = Some(PendingTurn {
+            calls: vec![PlannedCall {
+                tool_use_id: "t".into(),
+                claude_name: "homeassistant__call_action".into(),
+                input: json!({}),
+                action: CallAction::Authorised("alarm".into()),
+            }],
+            approval_mode: None,
+            judgements: vec![],
+        });
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            v["pending"]["calls"][0]["action"],
+            json!({"kind": "authorised", "reason": "alarm"})
+        );
+        let back: AgentState = serde_json::from_value(v).unwrap();
+        assert_eq!(back.code_authorised, s.code_authorised);
+        assert_eq!(
+            with_code_note("Disarmed. ".into(), &back),
+            "Disarmed.\n\nAuthorised by code: homeassistant/call_action \
+             {\"action\":\"alarm_control_panel.alarm_disarm\"} (code \"alarm\")"
+        );
+        assert_eq!(with_code_note("x".into(), &AgentState::default()), "x");
     }
 }

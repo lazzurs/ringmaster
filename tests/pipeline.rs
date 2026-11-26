@@ -25,6 +25,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 
 use ringmaster::agent::Agent;
 use ringmaster::audio::Decoder;
+use ringmaster::authcode::AuthCodes;
 use ringmaster::classifier::Classifier;
 use ringmaster::config::{Config, McpServerConfig};
 use ringmaster::db::{Db, JobStatus};
@@ -39,6 +40,11 @@ use ringmaster::worker::Worker;
 
 const SECRET: &str = "0123456789abcdef0123456789abcdef-test";
 const TONE: &[u8] = include_bytes!("fixtures/tone-1s.m4a");
+/// Spoken codes the harness reads "from the environment".
+const CODE_ENV: &[(&str, &str)] = &[
+    ("RINGMASTER_CODE_ALARM", "Delta Beta 5 | delta better five"),
+    ("RINGMASTER_CODE_GARAGE", "echo foxtrot 7"),
+];
 
 // ------------------------------------------------------------ mock MCP server
 
@@ -413,10 +419,21 @@ async fn harness_decoder(
                 .with_max_backoff(Duration::from_millis(10)),
         )
     });
+    // Code values as the environment would give them.
+    let codes = Arc::new(
+        AuthCodes::load(&config.auth_codes, |var| {
+            Ok(CODE_ENV
+                .iter()
+                .find(|(k, _)| *k == var)
+                .map(|(_, v)| v.to_string()))
+        })
+        .unwrap(),
+    );
     let agent = Arc::new(
         Agent::new(config.clone(), db.clone(), llms, tools, notifier.clone())
             .unwrap()
-            .with_classifier(classifier),
+            .with_classifier(classifier)
+            .with_auth_codes(codes.clone()),
     );
     let wake = Arc::new(Notify::new());
     let worker = Arc::new(Worker {
@@ -444,6 +461,7 @@ async fn harness_decoder(
         webhook_secret: Some(SECRET.into()),
         metrics: None,
         health: health.clone(),
+        codes,
     });
     Harness {
         app: router(state),
@@ -3227,4 +3245,784 @@ async fn configs_without_approval_ask_exactly_as_before() {
         pending.as_object().unwrap().keys().collect::<Vec<_>>(),
         ["calls"]
     );
+}
+
+// ------------------------------------- argument policies and spoken codes
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Target {
+    entity_id: String,
+}
+
+/// Home Assistant's `call_action` arguments (helpers in
+/// `homeassistant/components/homeassistant/llm.py`).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ActionArgs {
+    /// The action to call, e.g. 'light.turn_on'.
+    action: String,
+    target: Option<Target>,
+}
+
+#[derive(Clone)]
+struct Ha {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[tool_router]
+impl Ha {
+    #[tool(description = "Call a Home Assistant action")]
+    async fn call_action(
+        &self,
+        Parameters(a): Parameters<ActionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let entity = a.target.map(|t| t.entity_id).unwrap_or_default();
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("{} {entity}", a.action));
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            "{\"success\": true}",
+        )]))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for Ha {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+}
+
+/// A Home Assistant-like MCP server ("homeassistant") with `call_action`.
+async fn start_ha() -> (McpServerConfig, Arc<Mutex<Vec<String>>>, CancellationToken) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let ha = Ha {
+        calls: calls.clone(),
+    };
+    let ct = CancellationToken::new();
+    let service = StreamableHttpService::new(
+        move || Ok(ha.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+    );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = ct.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { stop.cancelled().await })
+            .await
+            .unwrap();
+    });
+    let cfg = McpServerConfig {
+        name: "homeassistant".into(),
+        url: format!("http://{addr}/mcp"),
+        ..Default::default()
+    };
+    (cfg, calls, ct)
+}
+
+const HOUSE: &str = "alarm_control_panel.64_104058";
+const UNIFI: &str = "alarm_control_panel.loft_dream_machine_pro_alarm_manager";
+
+/// Rob's alarm rules, a garage door on a second code, and the codes.
+const ALARM_RULES: &str = r#"
+[auth_codes]
+lockout_secs = 900
+
+[auth_codes.codes.alarm]
+code_env = "RINGMASTER_CODE_ALARM"
+
+[auth_codes.codes.garage]
+code_env = "RINGMASTER_CODE_GARAGE"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when_any = { "/target/entity_id" = "*loft_dream_machine_pro_alarm_manager*", "/data/entity_id" = "*loft_dream_machine_pro_alarm_manager*" }
+policy = "deny"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.*" }
+when_any = { "/target/area_id" = "*", "/target/device_id" = "*", "/target/floor_id" = "*", "/target/label_id" = "*", "/data/entity_id" = "*", "/data/area_id" = "*", "/data/device_id" = "*", "/data/floor_id" = "*", "/data/label_id" = "*" }
+policy = "deny"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.*" }
+unless = { "/target/entity_id" = "{alarm_control_panel.64_104058,alarm_control_panel.64_104058_perimeter_only,alarm_control_panel.64_104058_motions_only,alarm_control_panel.64_104058_shed_only}" }
+policy = "deny"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.alarm_disarm" }
+policy = "code"
+code = "alarm"
+ON_MISSING
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "cover.open_cover" }
+policy = "code"
+code = "garage"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.*" }
+policy = "confirm"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "{script,automation}.*" }
+policy = "ask"
+
+[[tool_policies]]
+match = "homeassistant/*render_template"
+policy = "confirm"
+
+[[tool_policies]]
+match = "homeassistant/*"
+policy = "allow"
+"#;
+
+/// The test config plus `ALARM_RULES` (`on_missing` as given) and `extra`.
+fn alarm_config(on_missing: &str, extra: &str) -> String {
+    format!(
+        "{}\n{}\n{extra}\n",
+        config_agent("worker_concurrency = 1"),
+        ALARM_RULES.replace("ON_MISSING", on_missing)
+    )
+}
+
+struct AlarmHarness {
+    h: Harness,
+    ha_calls: Arc<Mutex<Vec<String>>>,
+    _ha_stop: CancellationToken,
+}
+
+async fn alarm_harness(config: &str, turns: Vec<Value>, whisper: Option<&str>) -> AlarmHarness {
+    let (ha, ha_calls, ha_stop) = start_ha().await;
+    let h = harness_config(config, turns, whisper, move |home| vec![home, ha]).await;
+    AlarmHarness {
+        h,
+        ha_calls,
+        _ha_stop: ha_stop,
+    }
+}
+
+fn disarm(id: &str, entity: &str) -> Value {
+    tool_use_turn(
+        id,
+        "homeassistant__call_action",
+        json!({"action": "alarm_control_panel.alarm_disarm", "target": {"entity_id": entity}}),
+    )
+}
+
+async fn send_command(h: &Harness, delivery: &str, phone: Option<&str>) {
+    let (ct, body) = multipart(Some(TONE), phone, false);
+    let (status, text) = send(
+        h,
+        signed_request(delivery, "double-click-hold", false, &ct, body, now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+}
+
+/// The text of the first user message the model got in request `n`.
+fn user_text(h: &Harness, n: usize) -> String {
+    let seen = h.claude_seen.lock().unwrap();
+    seen[n]["messages"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The tool result the model got in request `n`.
+fn tool_result(h: &Harness, n: usize) -> Value {
+    let seen = h.claude_seen.lock().unwrap();
+    seen[n]["messages"][2]["content"][0].clone()
+}
+
+/// Everything Ringmaster stored, as one string: every column of every
+/// table (transcripts, deliveries, audit rows, saved agent states,
+/// confirmations).
+fn database_dump(h: &Harness) -> String {
+    let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+    let mut out = String::new();
+    for table in [
+        "deliveries",
+        "jobs",
+        "audit",
+        "confirmations",
+        "auth_code_failures",
+        "auth_code_lockouts",
+    ] {
+        let mut st = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let n = st.column_count();
+        let rows = st
+            .query_map([], |r| {
+                Ok((0..n)
+                    .map(|i| match r.get_ref(i).unwrap() {
+                        rusqlite::types::ValueRef::Text(t) => {
+                            String::from_utf8_lossy(t).into_owned()
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap();
+        for row in rows {
+            out.push_str(&row.unwrap());
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// None of the code's words appear in `text`, in any case.
+fn assert_no_code(what: &str, text: &str) {
+    let lower = text.to_lowercase();
+    for word in ["delta", "beta", "better", "echo foxtrot"] {
+        assert!(!lower.contains(word), "{what} holds {word:?}: {text}");
+    }
+}
+
+fn audio_files(h: &Harness) -> usize {
+    std::fs::read_dir(h._dir.path().join("audio"))
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn spoken_code_authorises_the_disarm_without_ntfy_or_classifier() {
+    for (n, said) in [
+        "Disarm the house alarm, authorisation code Delta Beta 5",
+        "Disarm the house alarm. Authorisation code delta, beta, five.",
+        "Authorization code delta beta five. Disarm the house alarm.",
+        "Disarm the house alarm, auth code delta better five",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shield = shield_server(|_| shield_reply(0.01)).await;
+        let config = alarm_config(
+            "",
+            &format!(
+                "[approval]\nmode = \"classifier\"\nbase_url = \"{}\"\nrequest_timeout_secs = 1\nmax_retries = 0\n",
+                shield.uri()
+            ),
+        );
+        let a = alarm_harness(
+            &config,
+            vec![
+                disarm("toolu_1", HOUSE),
+                final_turn("The house alarm is disarmed."),
+            ],
+            Some(said),
+        )
+        .await;
+        let h = &a.h;
+        // The phone heard the code too.
+        send_command(h, &format!("rec-code-{n}"), Some(said)).await;
+        tick(h).await;
+
+        assert_eq!(
+            *a.ha_calls.lock().unwrap(),
+            vec![format!("alarm_control_panel.alarm_disarm {HOUSE}")],
+            "{said}"
+        );
+        let notes = h.notes.take();
+        assert_eq!(notes.len(), 1, "no Approve/Deny: {notes:?}");
+        assert_eq!(notes[0].kind, Kind::Result);
+        assert!(
+            notes[0].body.starts_with(
+                "The house alarm is disarmed.\n\nAuthorised by code: homeassistant/call_action"
+            ),
+            "{}",
+            notes[0].body
+        );
+        assert!(
+            notes[0].body.contains("(code \"alarm\")"),
+            "{}",
+            notes[0].body
+        );
+        assert!(
+            shield.received_requests().await.unwrap().is_empty(),
+            "classifier asked"
+        );
+        assert!(
+            user_text(h, 0).contains("[authorisation code accepted]"),
+            "{said}"
+        );
+        let call = audit_of(h, "tool_call").await;
+        assert_eq!(call[0]["approved_by"], "auth_code");
+        assert_eq!(call[0]["auth_code"], "alarm");
+        assert_eq!(call[0]["outcome"], "ok");
+
+        // The code is nowhere: database, model requests, notifications.
+        let dump = database_dump(h);
+        assert!(dump.contains("Disarm the house"), "{dump}");
+        assert_no_code("database", &dump);
+        for body in h.claude_seen.lock().unwrap().iter() {
+            assert_no_code("model request", &body.to_string());
+        }
+        assert_no_code("notification", &format!("{notes:?}"));
+        let job = h.db.get_job(1).await.unwrap().unwrap();
+        assert_no_code(
+            "agent state",
+            &serde_json::to_string(&job.agent_state).unwrap(),
+        );
+        assert!(
+            job.transcript
+                .unwrap()
+                .contains("[authorisation code accepted]")
+        );
+        // The recording is gone, whatever the retention.
+        assert_eq!(audio_files(h), 0);
+        assert!(job.audio_path.is_none());
+        let deleted = audit_of(h, "audio_deleted").await;
+        assert_eq!(deleted[0]["reason"], "contained an authorisation code");
+        let auth = audit_of(h, "auth_code").await;
+        assert_eq!(auth[0]["status"], "accepted");
+    }
+}
+
+#[tokio::test]
+async fn wrong_or_missing_code_is_refused_with_a_relayable_error() {
+    for (n, said) in [
+        "Disarm the house alarm, authorisation code delta beta six",
+        "Disarm the house alarm",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shield = shield_server(|_| shield_reply(0.01)).await;
+        let config = alarm_config(
+            "",
+            &format!(
+                "[approval]\nmode = \"classifier\"\nbase_url = \"{}\"\nrequest_timeout_secs = 1\nmax_retries = 0\n",
+                shield.uri()
+            ),
+        );
+        let a = alarm_harness(
+            &config,
+            vec![
+                disarm("toolu_1", HOUSE),
+                final_turn("Disarming needs your authorisation code."),
+            ],
+            Some(said),
+        )
+        .await;
+        let h = &a.h;
+        send_command(h, &format!("rec-wrong-{n}"), None).await;
+        tick(h).await;
+
+        assert!(a.ha_calls.lock().unwrap().is_empty(), "{said}");
+        let result = tool_result(h, 1);
+        assert_eq!(result["is_error"], true);
+        assert!(
+            result["content"]
+                .as_str()
+                .unwrap()
+                .contains("needs the user's spoken authorisation code"),
+            "{result}"
+        );
+        let notes = h.notes.take();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].body, "Disarming needs your authorisation code.");
+        assert!(shield.received_requests().await.unwrap().is_empty());
+        let marker = n == 0;
+        assert_eq!(
+            user_text(h, 0).contains("[authorisation code rejected]"),
+            marker,
+            "{said}"
+        );
+        assert_no_code("database", &database_dump(h));
+        assert_no_code("model request", &user_text(h, 0));
+        // A recording without a code keeps its audio.
+        assert_eq!(audio_files(h), usize::from(!marker));
+    }
+}
+
+#[tokio::test]
+async fn missing_code_can_fall_back_to_asking_but_never_the_classifier() {
+    let shield = shield_server(|_| shield_reply(0.01)).await;
+    let config = alarm_config(
+        "on_missing = \"ask\"",
+        &format!(
+            "[approval]\nmode = \"classifier\"\nbase_url = \"{}\"\nrequest_timeout_secs = 1\nmax_retries = 0\n",
+            shield.uri()
+        ),
+    );
+    let a = alarm_harness(
+        &config,
+        vec![disarm("toolu_1", HOUSE), final_turn("Disarmed.")],
+        Some("Disarm the house alarm, authorisation code delta beta six"),
+    )
+    .await;
+    let h = &a.h;
+    send_command(h, "rec-ask", None).await;
+    tick(h).await;
+    assert!(a.ha_calls.lock().unwrap().is_empty());
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].title, "Ringmaster: approve?");
+    assert!(
+        notes[0].body.contains("Always asks you (policy ask)"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("[authorisation code rejected]"),
+        "{}",
+        notes[0].body
+    );
+    assert_no_code("confirmation", &notes[0].body);
+    assert!(shield.received_requests().await.unwrap().is_empty());
+
+    // Approved by the human, it runs (and is not listed as code-authorised).
+    send(
+        h,
+        Request::post(button(&notes[0], true))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    tick(h).await;
+    assert_eq!(a.ha_calls.lock().unwrap().len(), 1);
+    let notes = h.notes.take();
+    assert_eq!(notes[0].body, "Disarmed.");
+    assert_eq!(audit_of(h, "tool_call").await[0]["approved_by"], "human");
+}
+
+#[tokio::test]
+async fn a_code_authorises_neither_another_job_nor_another_code() {
+    // Whisper is down: each job uses its phone transcription.
+    let a = alarm_harness(
+        &alarm_config("", ""),
+        vec![
+            tool_use_turn(
+                "toolu_g",
+                "homeassistant__call_action",
+                json!({"action": "cover.open_cover", "target": {"entity_id": "cover.garage"}}),
+            ),
+            final_turn("The garage needs its own code."),
+            disarm("toolu_d", HOUSE),
+            final_turn("Disarming needs your authorisation code."),
+        ],
+        None,
+    )
+    .await;
+    let h = &a.h;
+    // The alarm's code, used for the garage.
+    send_command(
+        h,
+        "rec-a",
+        Some("open the garage, authorisation code delta beta five"),
+    )
+    .await;
+    tick(h).await;
+    // The next request, without a code.
+    send_command(h, "rec-b", Some("disarm the house alarm")).await;
+    tick(h).await;
+
+    assert!(a.ha_calls.lock().unwrap().is_empty());
+    for n in [1, 3] {
+        let r = tool_result(h, n);
+        assert_eq!(r["is_error"], true, "{r}");
+        assert!(
+            r["content"]
+                .as_str()
+                .unwrap()
+                .contains("authorisation code"),
+            "{r}"
+        );
+    }
+    assert!(user_text(h, 0).contains("[authorisation code accepted]"));
+    assert!(!user_text(h, 2).contains("authorisation code"));
+    let second = h.db.get_job(2).await.unwrap().unwrap();
+    assert!(second.code_auth.unwrap().until.is_empty());
+    assert_no_code("database", &database_dump(h));
+}
+
+#[tokio::test]
+async fn the_unifi_panel_is_refused_even_with_a_valid_code() {
+    let a = alarm_harness(
+        &alarm_config("", ""),
+        vec![
+            disarm("toolu_1", UNIFI),
+            final_turn("I can't use that panel."),
+        ],
+        Some("Disarm the loft alarm, authorisation code delta beta five"),
+    )
+    .await;
+    let h = &a.h;
+    send_command(h, "rec-unifi", None).await;
+    tick(h).await;
+    assert!(a.ha_calls.lock().unwrap().is_empty());
+    // The tool is offered (the deny depends on the arguments) and the call
+    // is refused when made.
+    let first = h.claude_seen.lock().unwrap()[0].clone();
+    assert!(
+        first["tools"]
+            .to_string()
+            .contains("homeassistant__call_action")
+    );
+    let r = tool_result(h, 1);
+    assert_eq!(r["is_error"], true);
+    assert!(
+        r["content"]
+            .as_str()
+            .unwrap()
+            .contains("policy blocks this call with these arguments"),
+        "{r}"
+    );
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1);
+    assert!(
+        !notes[0].body.contains("Authorised by code"),
+        "{}",
+        notes[0].body
+    );
+}
+
+#[tokio::test]
+async fn wrong_codes_lock_out_alert_survive_a_restart_and_expire() {
+    let a = alarm_harness(
+        &alarm_config("", ""),
+        vec![
+            final_turn("Wrong code."),
+            final_turn("Wrong code."),
+            final_turn("Wrong code."),
+            disarm("toolu_l", HOUSE),
+            final_turn("Codes are locked."),
+            disarm("toolu_ok", HOUSE),
+            final_turn("Disarmed."),
+        ],
+        None,
+    )
+    .await;
+    let h = &a.h;
+    for n in 0..3 {
+        send_command(
+            h,
+            &format!("rec-guess-{n}"),
+            Some(&format!("disarm the alarm, code alpha alpha {n}")),
+        )
+        .await;
+        tick(h).await;
+    }
+    h.notes.take();
+    h.watchdog.check(now()).await;
+    let sent = alerts(h);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].title,
+        "Ringmaster alert: authorisation codes locked out"
+    );
+    assert!(
+        sent[0].body.contains("3 wrong authorisation codes"),
+        "{}",
+        sent[0].body
+    );
+    assert!(
+        !sent[0].body.to_lowercase().contains("alpha"),
+        "{}",
+        sent[0].body
+    );
+    assert_eq!(audit_of(h, "auth_code").await[0]["failures"], 1);
+
+    // While locked out the right code is not even checked.
+    send_command(
+        h,
+        "rec-locked",
+        Some("disarm the alarm, code delta beta five"),
+    )
+    .await;
+    tick(h).await;
+    assert!(a.ha_calls.lock().unwrap().is_empty());
+    assert!(
+        user_text(h, 3).contains("not checked: locked"),
+        "{}",
+        user_text(h, 3)
+    );
+    let r = tool_result(h, 4);
+    assert!(r["content"].as_str().unwrap().contains("locked"), "{r}");
+    h.notes.take();
+
+    // A restart keeps the lockout and its alert.
+    let reopened = Db::open(&h.db_path).unwrap();
+    let lockout = reopened.active_lockout(now()).await.unwrap().unwrap();
+    let config = Config::from_toml(&alarm_config("", "")).unwrap();
+    let recorder = Arc::new(Recorder::default());
+    let fresh = Watchdog::new(
+        Arc::new(Health::new(&config, now())),
+        reopened,
+        Alerter::new(recorder.clone(), &config.alerts, AlertBook::load(None)),
+    );
+    fresh.check(now()).await;
+    let again = recorder.take();
+    assert!(
+        again
+            .iter()
+            .any(|n| n.title.contains("authorisation codes locked out")),
+        "{again:?}"
+    );
+
+    // It ends on time: the alert recovers and codes work again.
+    h.watchdog.check(lockout.until).await;
+    let recovered = alerts(h);
+    assert!(
+        recovered
+            .iter()
+            .any(|n| n.kind == Kind::Recovered && n.title.contains("authorisation codes")),
+        "{recovered:?}"
+    );
+    let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+    conn.execute("UPDATE auth_code_lockouts SET until = since", [])
+        .unwrap();
+    send_command(
+        h,
+        "rec-after",
+        Some("disarm the alarm, code delta beta five"),
+    )
+    .await;
+    tick(h).await;
+    assert_eq!(a.ha_calls.lock().unwrap().len(), 1);
+    assert_no_code("database", &database_dump(h));
+}
+
+#[tokio::test]
+async fn without_codes_transcripts_and_recordings_are_left_alone() {
+    let h = harness(
+        vec![final_turn("Card added.")],
+        Some("Add a card for the code review, code delta beta five"),
+    )
+    .await;
+    run_command(&h, "rec-plain", "double-click-hold").await;
+    assert!(
+        user_text(&h, 0).contains("Add a card for the code review, code delta beta five"),
+        "{}",
+        user_text(&h, 0)
+    );
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert!(job.code_auth.is_none() && job.audio_path.is_some());
+    assert_eq!(audio_files(&h), 1);
+    assert!(audit_of(&h, "audio_deleted").await.is_empty());
+}
+
+#[tokio::test]
+async fn classifier_requests_never_carry_the_code() {
+    let shield = shield_server(|_| shield_reply(0.01)).await;
+    let config = alarm_config(
+        "",
+        &format!(
+            "[approval]\nmode = \"classifier\"\nbase_url = \"{}\"\nauto_approve_below = 0.2\nrequest_timeout_secs = 1\nmax_retries = 0\n",
+            shield.uri()
+        ),
+    );
+    let a = alarm_harness(
+        &config,
+        vec![
+            multi_tool_turn(&[
+                (
+                    "toolu_d",
+                    "homeassistant__call_action",
+                    json!({"action": "alarm_control_panel.alarm_disarm", "target": {"entity_id": HOUSE}}),
+                ),
+                (
+                    "toolu_a",
+                    "homeassistant__call_action",
+                    json!({"action": "alarm_control_panel.alarm_arm_away",
+                           "target": {"entity_id": "alarm_control_panel.64_104058_shed_only"}}),
+                ),
+            ]),
+            final_turn("House disarmed, shed armed."),
+        ],
+        Some("Disarm the house and arm the shed, authorisation code delta beta five"),
+    )
+    .await;
+    let h = &a.h;
+    send_command(
+        h,
+        "rec-both",
+        Some("disarm the house and arm the shed authorisation code delta beta 5"),
+    )
+    .await;
+    tick(h).await;
+    assert_eq!(a.ha_calls.lock().unwrap().len(), 2);
+    // Only the `confirm` call was classified, and its request has the
+    // marker, not the code.
+    let requests = shield.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body).to_string();
+    assert!(body.contains("alarm_arm_away"), "{body}");
+    assert!(body.contains("[authorisation code accepted]"), "{body}");
+    assert_no_code("classifier request", &body);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0]
+            .body
+            .contains("Authorised by code: homeassistant/call_action"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("Auto-approved by the classifier"),
+        "{}",
+        notes[0].body
+    );
+    let calls = audit_of(h, "tool_call").await;
+    let by: Vec<&str> = calls
+        .iter()
+        .map(|c| c["approved_by"].as_str().unwrap())
+        .collect();
+    assert_eq!(by, ["auth_code", "classifier"]);
+    assert_no_code("database", &database_dump(h));
+}
+
+#[tokio::test]
+async fn a_recording_with_a_code_is_deleted_even_if_the_job_is_too_old_to_run() {
+    let a = alarm_harness(&alarm_config("", ""), vec![], Some("disarm the alarm")).await;
+    let h = &a.h;
+    // Recorded two hours ago: past the default max age. (`multipart`
+    // stamps the recording time itself, so the body is built here.)
+    let old = (jiff::Timestamp::now().as_millisecond() - 7_200_000).to_string();
+    let boundary = "b";
+    let mut raw = Vec::new();
+    raw.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"audio\"; filename=\"r.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n").as_bytes(),
+    );
+    raw.extend_from_slice(TONE);
+    raw.extend_from_slice(
+        format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"transcription\"\r\n\r\ndisarm the alarm, code delta beta five\r\n\
+             --{boundary}\r\nContent-Disposition: form-data; name=\"recordedAt\"\r\n\r\n{old}\r\n--{boundary}--\r\n"
+        )
+        .as_bytes(),
+    );
+    let (status, text) = send(
+        h,
+        signed_request(
+            "rec-old",
+            "double-click-hold",
+            false,
+            &format!("multipart/form-data; boundary={boundary}"),
+            raw,
+            now(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    assert_eq!(audio_files(h), 1);
+    tick(h).await;
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(h.claude_seen.lock().unwrap().is_empty());
+    assert_eq!(audio_files(h), 0);
+    assert_eq!(audit_of(h, "audio_deleted").await.len(), 1);
+    assert_no_code("database", &database_dump(h));
 }

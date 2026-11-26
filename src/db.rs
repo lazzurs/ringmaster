@@ -20,7 +20,7 @@ use serde_json::Value;
 
 use crate::agent::AgentState;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE deliveries (
@@ -78,6 +78,47 @@ CREATE TABLE audit (
 CREATE INDEX audit_job ON audit(job_id);
 "#;
 
+/// Spoken authorisation codes: the phone transcription's code scan, the
+/// job's "authorised for code X until T", wrong codes and lockouts. Never
+/// a code. One transaction, the version bump included, so a crash cannot
+/// leave it half applied.
+const MIGRATION_2: &str = r#"
+BEGIN;
+ALTER TABLE deliveries ADD COLUMN phone_code TEXT;
+ALTER TABLE jobs ADD COLUMN code_auth TEXT;
+CREATE TABLE auth_code_failures (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      INTEGER NOT NULL,
+    job_id  INTEGER
+);
+CREATE INDEX auth_code_failures_ts ON auth_code_failures(ts);
+CREATE TABLE auth_code_lockouts (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    since     INTEGER NOT NULL,
+    until     INTEGER NOT NULL,
+    failures  INTEGER NOT NULL
+);
+PRAGMA user_version = 2;
+COMMIT;
+"#;
+
+/// A lockout of `code` actions after too many wrong codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lockout {
+    pub since: i64,
+    pub until: i64,
+    /// Wrong codes that caused it.
+    pub failures: i64,
+}
+
+/// When wrong codes lock codes out (`[auth_codes]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockoutRule {
+    pub max_failures: u32,
+    pub window_secs: u64,
+    pub lockout_secs: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
     Queued,
@@ -122,6 +163,9 @@ pub struct NewDelivery {
     pub audio_bytes: Option<i64>,
     pub phone_transcription: Option<String>,
     pub profile: Option<String>,
+    /// What the phone transcription held of authorisation codes (it is
+    /// stored with them already removed).
+    pub phone_code: Option<crate::authcode::ScanSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +195,9 @@ pub struct Job {
     pub recorded_at_ms: Option<i64>,
     pub audio_path: Option<String>,
     pub phone_transcription: Option<String>,
+    pub phone_code: Option<crate::authcode::ScanSummary>,
+    /// Set once the transcript is saved, when authorisation codes are on.
+    pub code_auth: Option<crate::authcode::CodeAuth>,
 }
 
 /// What [`Db::claim_next_job`] took off the queue.
@@ -438,6 +485,9 @@ impl Db {
         if version < 1 {
             conn.execute_batch(MIGRATION_1)?;
         }
+        if version < 2 {
+            conn.execute_batch(MIGRATION_2)?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Self {
             conn: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -586,8 +636,9 @@ impl Db {
             let outcome = if queue { "queued" } else { "recorded" };
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO deliveries (delivery_id, received_at, trigger, is_test, \
-                 recorded_at_ms, client, audio_path, audio_bytes, phone_transcription, profile, outcome) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 recorded_at_ms, client, audio_path, audio_bytes, phone_transcription, profile, outcome, \
+                 phone_code) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     d.delivery_id,
                     d.received_at,
@@ -599,7 +650,11 @@ impl Db {
                     d.audio_bytes,
                     d.phone_transcription,
                     d.profile,
-                    outcome
+                    outcome,
+                    d.phone_code
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?
                 ],
             )?;
             if inserted == 0 {
@@ -697,6 +752,57 @@ impl Db {
             c.execute(
                 "UPDATE jobs SET transcript = ?2, transcript_source = ?3, updated_at = ?4 WHERE id = ?1",
                 params![id, text, source, now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Save the transcript with what it held of authorisation codes, and
+    /// count `failures` wrong codes, in one transaction (a retry after a
+    /// crash cannot count them twice). Returns the lockout this started.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_transcript_with_codes(
+        &self,
+        id: i64,
+        text: String,
+        source: String,
+        auth: crate::authcode::CodeAuth,
+        failures: u32,
+        now: i64,
+        rule: LockoutRule,
+    ) -> Result<Option<Lockout>> {
+        let auth = serde_json::to_string(&auth)?;
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "UPDATE jobs SET transcript = ?2, transcript_source = ?3, code_auth = ?4, \
+                 updated_at = ?5 WHERE id = ?1",
+                params![id, text, source, auth, now],
+            )?;
+            let started = if failures > 0 {
+                record_failures(&tx, id, failures, now, rule)?
+            } else {
+                None
+            };
+            tx.commit()?;
+            Ok(started)
+        })
+        .await
+    }
+
+    /// The lockout in force at `now`, if any.
+    pub async fn active_lockout(&self, now: i64) -> Result<Option<Lockout>> {
+        self.call(move |c| active_lockout(c, now)).await
+    }
+
+    /// Forget a delivery's recording (deleted because it held a code).
+    pub async fn clear_audio(&self, delivery_id: &str) -> Result<()> {
+        let id = delivery_id.to_string();
+        self.call(move |c| {
+            c.execute(
+                "UPDATE deliveries SET audio_path = NULL WHERE delivery_id = ?1",
+                [id],
             )?;
             Ok(())
         })
@@ -1000,7 +1106,7 @@ fn load_job(c: &Connection, id: i64) -> Result<Option<Job>, LoadError> {
         .query_row(
             "SELECT j.id, j.delivery_id, j.profile, j.status, j.attempts, j.created_at, j.transcript, \
              j.transcript_source, j.agent_state, j.retry_notified, d.trigger, d.recorded_at_ms, \
-             d.audio_path, d.phone_transcription \
+             d.audio_path, d.phone_transcription, d.phone_code, j.code_auth \
              FROM jobs j JOIN deliveries d ON d.delivery_id = j.delivery_id WHERE j.id = ?1",
             [id],
             |r| {
@@ -1020,6 +1126,14 @@ fn load_job(c: &Connection, id: i64) -> Result<Option<Job>, LoadError> {
                         recorded_at_ms: r.get(11)?,
                         audio_path: r.get(12)?,
                         phone_transcription: r.get(13)?,
+                        // Unreadable code columns read as "no code": the
+                        // safe side, and never a reason to quarantine.
+                        phone_code: r
+                            .get::<_, Option<String>>(14)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        code_auth: r
+                            .get::<_, Option<String>>(15)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     },
                     r.get::<_, Option<String>>(8)?,
                 ))
@@ -1073,6 +1187,71 @@ fn quarantine(c: &Connection, id: i64, now: i64, reason: String) -> Result<Quara
         heard: transcript.filter(|t| !t.trim().is_empty()).or(phone),
         error,
     })
+}
+
+fn active_lockout(c: &Connection, now: i64) -> Result<Option<Lockout>> {
+    Ok(c.query_row(
+        "SELECT since, until, failures FROM auth_code_lockouts \
+         WHERE since <= ?1 AND until > ?1 ORDER BY until DESC LIMIT 1",
+        [now],
+        |r| {
+            Ok(Lockout {
+                since: r.get(0)?,
+                until: r.get(1)?,
+                failures: r.get(2)?,
+            })
+        },
+    )
+    .optional()?)
+}
+
+/// Count wrong codes and start a lockout when there are too many within
+/// the window (failures from before the last lockout ended do not count
+/// again).
+fn record_failures(
+    c: &Connection,
+    job_id: i64,
+    failures: u32,
+    now: i64,
+    rule: LockoutRule,
+) -> Result<Option<Lockout>> {
+    for _ in 0..failures {
+        c.execute(
+            "INSERT INTO auth_code_failures (ts, job_id) VALUES (?1, ?2)",
+            params![now, job_id],
+        )?;
+    }
+    // A week is far longer than any window; keep the table small.
+    c.execute(
+        "DELETE FROM auth_code_failures WHERE ts < ?1",
+        [now - 7 * 86_400],
+    )?;
+    if active_lockout(c, now)?.is_some() {
+        return Ok(None);
+    }
+    let last_end: i64 = c.query_row(
+        "SELECT COALESCE(MAX(until), 0) FROM auth_code_lockouts WHERE until <= ?1",
+        [now],
+        |r| r.get(0),
+    )?;
+    let recent: i64 = c.query_row(
+        "SELECT COUNT(*) FROM auth_code_failures WHERE ts > ?1 AND ts >= ?2",
+        params![now - rule.window_secs as i64, last_end],
+        |r| r.get(0),
+    )?;
+    if recent < i64::from(rule.max_failures) {
+        return Ok(None);
+    }
+    let lockout = Lockout {
+        since: now,
+        until: now + rule.lockout_secs as i64,
+        failures: recent,
+    };
+    c.execute(
+        "INSERT INTO auth_code_lockouts (since, until, failures) VALUES (?1, ?2, ?3)",
+        params![lockout.since, lockout.until, lockout.failures],
+    )?;
+    Ok(Some(lockout))
 }
 
 pub fn now() -> i64 {
@@ -1142,6 +1321,7 @@ mod tests {
             audio_bytes: Some(10),
             phone_transcription: Some("hello".into()),
             profile: profile.map(Into::into),
+            phone_code: None,
         }
     }
 
@@ -1500,5 +1680,94 @@ mod tests {
             vec!["/data/audio/x.m4a".to_string()]
         );
         assert!(db.take_expired_audio(5000).await.unwrap().is_empty());
+    }
+
+    const RULE: LockoutRule = LockoutRule {
+        max_failures: 3,
+        window_secs: 600,
+        lockout_secs: 900,
+    };
+
+    #[tokio::test]
+    async fn wrong_codes_lock_out_persist_and_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let db = Db::open(&path).unwrap();
+        db.insert_delivery(delivery("a", Some("command")), true)
+            .await
+            .unwrap();
+        let job = ready(db.claim_next_job(1000, &[]).await.unwrap());
+        let auth = crate::authcode::CodeAuth::default();
+        let save = |failures, now| {
+            db.save_transcript_with_codes(
+                job.id,
+                "t".into(),
+                "primary".into(),
+                auth.clone(),
+                failures,
+                now,
+                RULE,
+            )
+        };
+        assert_eq!(save(1, 1000).await.unwrap(), None);
+        // Out of the window by now: still only two recent ones.
+        assert_eq!(save(1, 1700).await.unwrap(), None);
+        assert_eq!(save(1, 1800).await.unwrap(), None);
+        let l = save(1, 1900).await.unwrap().unwrap();
+        assert_eq!(
+            l,
+            Lockout {
+                since: 1900,
+                until: 2800,
+                failures: 3
+            }
+        );
+        // More wrong codes during a lockout start nothing new.
+        assert_eq!(save(1, 1950).await.unwrap(), None);
+        assert_eq!(db.active_lockout(2799).await.unwrap(), Some(l));
+        drop(db);
+        // A restart keeps it, and it ends on time.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.active_lockout(2000).await.unwrap(), Some(l));
+        assert_eq!(db.active_lockout(2800).await.unwrap(), None);
+        // Failures from before the lockout ended do not count again.
+        let job = db.get_job(job.id).await.unwrap().unwrap();
+        let again = db
+            .save_transcript_with_codes(job.id, "t".into(), "p".into(), auth, 1, 2801, RULE)
+            .await
+            .unwrap();
+        assert_eq!(again, None);
+        assert!(job.code_auth.is_some());
+    }
+
+    #[tokio::test]
+    async fn version_1_databases_are_migrated_and_their_jobs_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(MIGRATION_1).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+            c.execute(
+                "INSERT INTO deliveries (delivery_id, received_at, trigger, is_test, outcome, \
+                 phone_transcription, profile) VALUES ('d', 1000, 't', 0, 'queued', 'hi', 'command')",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO jobs (delivery_id, profile, status, next_attempt_at, created_at, updated_at) \
+                 VALUES ('d', 'command', 'queued', 1000, 1000, 1000)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let job = ready(db.claim_next_job(1000, &[]).await.unwrap());
+        assert_eq!(job.phone_transcription.as_deref(), Some("hi"));
+        assert!(job.phone_code.is_none() && job.code_auth.is_none());
+        assert_eq!(db.active_lockout(1000).await.unwrap(), None);
+        drop(db);
+        // Opening again does not run the migration twice.
+        Db::open(&path).unwrap();
     }
 }
