@@ -200,9 +200,22 @@ async fn handle_inner(app: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Re
     let Some(ct) = header(&headers, "content-type") else {
         return reject(StatusCode::BAD_REQUEST, "missing content type");
     };
-    let payload = match parse_multipart(ct, body).await {
+    let mut payload = match parse_multipart(ct, body).await {
         Ok(p) => p,
         Err(e) => return reject(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    // Authorisation codes come out of the phone's transcription before it
+    // is stored, logged or audited; only what it held is kept.
+    let phone_code = match payload.transcription.take() {
+        Some(t) if app.codes.enabled() => {
+            let scan = app.codes.scan(&t);
+            payload.transcription = Some(scan.text);
+            scan.summary.contains_code().then_some(scan.summary)
+        }
+        other => {
+            payload.transcription = other;
+            None
+        }
     };
     let is_test = header_test || payload.test || trigger == "test-event";
     let received_at = now();
@@ -220,6 +233,7 @@ async fn handle_inner(app: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Re
             audio_bytes: payload.audio.as_ref().map(|a| a.len() as i64),
             phone_transcription: payload.transcription.clone(),
             profile: None,
+            phone_code: phone_code.clone(),
         };
         return match app.db.insert_delivery(d, false).await {
             Ok(InsertOutcome::Duplicate) => {
@@ -350,6 +364,7 @@ async fn handle_inner(app: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Re
         audio_bytes,
         phone_transcription: payload.transcription.clone(),
         profile: Some(profile.to_string()),
+        phone_code,
     };
     match app.db.insert_delivery(d, true).await {
         Ok(InsertOutcome::Queued { job_id }) => {

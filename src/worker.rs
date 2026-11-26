@@ -25,8 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentError, AgentOutcome, Request};
 use crate::audio::{Decoded, Decoder};
+use crate::authcode::{self, CodeAuth};
 use crate::config::{Config, WORKER_LOOP_MAX_WAIT_SECS};
-use crate::db::{Claim, Db, Job, JobStatus, Quarantined, now};
+use crate::db::{Claim, Db, Job, JobStatus, LockoutRule, Quarantined, now};
 use crate::health::Health;
 use crate::notify::{Kind, Notification, Notifier};
 use crate::stt::{SttError, Transcriber};
@@ -295,6 +296,15 @@ impl Worker {
         let max_age = self.max_age(job);
         match &job.agent_state {
             None if age > max_age => {
+                // Never transcribed, but the phone heard a code: the
+                // recording goes now rather than at the retention sweep.
+                if job.phone_code.as_ref().is_some_and(|p| p.contains_code()) {
+                    let auth = CodeAuth {
+                        contains_code: true,
+                        ..CodeAuth::default()
+                    };
+                    self.delete_code_audio(job, Some(&auth)).await;
+                }
                 return Err(JobError::Permanent(
                     "too old to run safely; not attempted".into(),
                 ));
@@ -315,10 +325,11 @@ impl Worker {
             _ => {}
         }
 
-        let (text, source) = match (&job.transcript, &job.transcript_source) {
-            (Some(t), Some(s)) => (t.clone(), s.clone()),
+        let (text, source, code_auth) = match (&job.transcript, &job.transcript_source) {
+            (Some(t), Some(s)) => (t.clone(), s.clone(), job.code_auth.clone()),
             _ => self.transcribe(job).await?,
         };
+        self.delete_code_audio(job, code_auth.as_ref()).await;
 
         if text.trim().is_empty() {
             self.finish(
@@ -334,6 +345,7 @@ impl Worker {
         let req = Request {
             transcript: &text,
             transcript_source: &source,
+            code_auth: code_auth.as_ref(),
         };
         match self.agent.run(job, &req).await {
             Ok(AgentOutcome::Final(reply)) => {
@@ -355,7 +367,7 @@ impl Worker {
         }
     }
 
-    async fn transcribe(&self, job: &Job) -> Result<(String, String), JobError> {
+    async fn transcribe(&self, job: &Job) -> Result<(String, String, Option<CodeAuth>), JobError> {
         let wav = match &job.audio_path {
             None => None,
             Some(p) => self.decode(job, &self.data_dir.join(p)).await?,
@@ -365,6 +377,7 @@ impl Worker {
             .transcribe(wav.as_deref(), job.phone_transcription.as_deref())
             .await
         {
+            Ok(t) if self.agent.codes().enabled() => self.check_codes(job, t).await,
             Ok(t) => {
                 self.audit(
                     job,
@@ -376,10 +389,128 @@ impl Worker {
                     .save_transcript(job.id, t.text.clone(), t.source.to_string())
                     .await
                     .map_err(|e| JobError::Transient(e.to_string()))?;
-                Ok((t.text, t.source.to_string()))
+                Ok((t.text, t.source.to_string(), None))
             }
             Err(SttError::Transient(e)) => Err(JobError::Transient(e)),
             Err(SttError::Permanent(e)) => Err(JobError::Permanent(e)),
+        }
+    }
+
+    /// Check the transcripts for authorisation codes before the transcript
+    /// goes anywhere: whisper's here, the phone's (already stripped) at the
+    /// webhook. A code counts if either transcript has it. The transcript
+    /// is saved with the code replaced by a marker, together with "may use
+    /// code X until T" and any wrong codes (one transaction).
+    async fn check_codes(
+        &self,
+        job: &Job,
+        t: crate::stt::Transcript,
+    ) -> Result<(String, String, Option<CodeAuth>), JobError> {
+        let codes = self.agent.codes();
+        let transient = |e: anyhow::Error| JobError::Transient(e.to_string());
+        let whisper = (t.source != "phone").then(|| codes.scan(&t.text));
+        let phone = job.phone_code.clone().unwrap_or_default();
+        let mut scans = vec![&phone];
+        if let Some(w) = &whisper {
+            scans.push(&w.summary);
+        }
+        let now = now();
+        let locked = self
+            .db
+            .active_lockout(now)
+            .await
+            .map_err(transient)?
+            .is_some();
+        let d = authcode::decide(&scans, locked, Self::origin(job), codes.valid_for_secs);
+        let heard = whisper.as_ref().map(|w| w.summary.clone());
+        let text = authcode::set_marker(&whisper.map(|w| w.text).unwrap_or(t.text), d.marker);
+        self.audit(job, "transcript", json!({"source": t.source, "text": text}))
+            .await;
+        if d.auth.contains_code {
+            // Names and counts only, never the words.
+            self.audit(
+                job,
+                "auth_code",
+                json!({
+                    "status": d.auth.status,
+                    "authorised": d.auth.until,
+                    "failures": d.failures,
+                    "locked_out": locked,
+                    "whisper": heard,
+                    "phone": job.phone_code,
+                }),
+            )
+            .await;
+        }
+        let rule = LockoutRule {
+            max_failures: codes.max_failures,
+            window_secs: codes.failure_window_secs,
+            lockout_secs: codes.lockout_secs,
+        };
+        let started = self
+            .db
+            .save_transcript_with_codes(
+                job.id,
+                text.clone(),
+                t.source.to_string(),
+                d.auth.clone(),
+                d.failures,
+                now,
+                rule,
+            )
+            .await
+            .map_err(transient)?;
+        if d.failures > 0 {
+            metrics::counter!("ringmaster_auth_code_failures_total").increment(d.failures.into());
+        }
+        if let Some(l) = started {
+            tracing::warn!(
+                failures = l.failures,
+                until = l.until,
+                "too many wrong authorisation codes; code actions are locked out"
+            );
+            metrics::counter!("ringmaster_auth_code_lockouts_total").increment(1);
+            self.audit(
+                job,
+                "auth_code_lockout",
+                json!({"since": l.since, "until": l.until, "failures": l.failures}),
+            )
+            .await;
+        }
+        Ok((text, t.source.to_string(), Some(d.auth)))
+    }
+
+    /// A recording that held an authorisation code is deleted as soon as it
+    /// is transcribed, whatever `retention.audio_days` says: the audio
+    /// cannot be redacted.
+    async fn delete_code_audio(&self, job: &Job, auth: Option<&CodeAuth>) {
+        let (Some(auth), Some(path)) = (auth, &job.audio_path) else {
+            return;
+        };
+        if !auth.contains_code {
+            return;
+        }
+        let deleted = match tokio::fs::remove_file(self.data_dir.join(path)).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                tracing::error!(error = %e, "could not delete a recording holding an authorisation code");
+                self.audit(job, "audio_delete_failed", json!({"error": e.to_string()}))
+                    .await;
+                false
+            }
+        };
+        if deleted {
+            if let Err(e) = self.db.clear_audio(&job.delivery_id).await {
+                tracing::warn!(error = %e, "could not clear the deleted recording's path");
+            }
+            tracing::info!("deleted a recording holding an authorisation code");
+            self.audit(
+                job,
+                "audio_deleted",
+                json!({"reason": "contained an authorisation code"}),
+            )
+            .await;
         }
     }
 
@@ -537,7 +668,11 @@ impl Worker {
         .await;
     }
 
-    async fn notify(&self, n: Notification) {
+    async fn notify(&self, mut n: Notification) {
+        // Defence in depth: notifications never carry code words.
+        let codes = self.agent.codes();
+        n.title = codes.scrub(&n.title);
+        n.body = codes.scrub(&n.body);
         if let Err(e) = self.notifier.send(&n).await {
             tracing::error!(error = %e, "notification failed");
         }

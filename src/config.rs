@@ -65,6 +65,9 @@ pub struct Config {
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub tool_policies: Vec<ToolPolicyRule>,
+    /// Spoken authorisation codes for `code` tool policies.
+    #[serde(default)]
+    pub auth_codes: AuthCodesConfig,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
     /// Problems with individual `[[mcp_servers]]` entries. Those entries are
@@ -752,6 +755,107 @@ pub struct ToolPolicyRule {
     #[serde(rename = "match")]
     pub pattern: String,
     pub policy: Policy,
+    /// JSON pointer into the call's arguments -> glob over the value. The
+    /// rule matches only when every one of them matches.
+    #[serde(default)]
+    pub when: BTreeMap<String, String>,
+    /// As `when`, but one of them matching is enough.
+    #[serde(default)]
+    pub when_any: BTreeMap<String, String>,
+    /// The rule does not match when every one of these holds (for a list,
+    /// every element must match). A missing pointer does not hold.
+    #[serde(default)]
+    pub unless: BTreeMap<String, String>,
+    /// `policy = "code"`: the `[auth_codes.codes]` entry the call needs
+    /// (may be left out when exactly one code is configured).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// `policy = "code"`: what happens without a valid code.
+    #[serde(default)]
+    pub on_missing: Option<OnMissing>,
+}
+
+impl ToolPolicyRule {
+    /// A rule on the tool name alone.
+    pub fn new(pattern: &str, policy: Policy) -> Self {
+        Self {
+            pattern: pattern.into(),
+            policy,
+            when: BTreeMap::new(),
+            when_any: BTreeMap::new(),
+            unless: BTreeMap::new(),
+            code: None,
+            on_missing: None,
+        }
+    }
+
+    /// Whether the rule looks at the arguments at all.
+    pub fn is_conditional(&self) -> bool {
+        !(self.when.is_empty() && self.when_any.is_empty() && self.unless.is_empty())
+    }
+}
+
+/// What a `code` rule does when the job has no valid code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnMissing {
+    /// Refuse, with an error result the model can relay.
+    #[default]
+    Deny,
+    /// Ask on the phone (Approve/Deny), as policy `ask`.
+    Ask,
+}
+
+/// `[auth_codes]`: spoken authorisation codes. Code values come only from
+/// the environment (`code_env`, or `<code_env>_FILE`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthCodesConfig {
+    /// Phrases that introduce a code; the code words follow them.
+    pub triggers: Vec<String>,
+    /// How long after the recording an accepted code stays valid for its
+    /// job (a job resumed or retried later needs a new code).
+    pub valid_for_secs: u64,
+    /// Wrong codes within `failure_window_secs` that lock codes out.
+    pub max_failures: u32,
+    pub failure_window_secs: u64,
+    /// How long codes stay locked out.
+    pub lockout_secs: u64,
+    /// Named codes.
+    pub codes: BTreeMap<String, AuthCodeConfig>,
+}
+
+impl Default for AuthCodesConfig {
+    fn default() -> Self {
+        Self {
+            triggers: DEFAULT_CODE_TRIGGERS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+            valid_for_secs: 300,
+            max_failures: 3,
+            failure_window_secs: 600,
+            lockout_secs: 900,
+            codes: BTreeMap::new(),
+        }
+    }
+}
+
+/// Default `auth_codes.triggers`.
+pub const DEFAULT_CODE_TRIGGERS: [&str; 4] = [
+    "authorisation code",
+    "authorization code",
+    "auth code",
+    "code",
+];
+
+/// One named code.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthCodeConfig {
+    /// Environment variable holding the spoken code. Several spoken forms
+    /// (what whisper may hear instead) are separated by `|`.
+    pub code_env: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -836,23 +940,50 @@ pub fn credential_header(value: &str) -> Option<reqwest::header::HeaderValue> {
     Some(v)
 }
 
+/// Secret values every [`redact_credentials`] call removes as well, whatever
+/// credentials it is given: the spoken authorisation codes.
+static EXTRA_SECRETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Have every [`redact_credentials`] call remove `value` too (values
+/// shorter than 4 characters are ignored, as there).
+pub fn register_secret(value: &str) {
+    let value = value.trim();
+    if value.len() < 4 {
+        return;
+    }
+    let mut extra = EXTRA_SECRETS.write().unwrap_or_else(|p| p.into_inner());
+    if !extra.iter().any(|v| v == value) {
+        extra.push(value.to_string());
+    }
+}
+
 /// `text` with every credential replaced by `[redacted]`, for error strings
 /// built from what a server sent back (a misbehaving proxy can echo request
 /// headers). A value with an auth scheme (`Bearer <token>`) also has the bare
-/// token removed. Values shorter than 4 characters are left alone.
+/// token removed. Values shorter than 4 characters are left alone. Secrets
+/// registered with [`register_secret`] are always removed.
 pub fn redact_credentials<'a>(
     text: &str,
     credentials: impl IntoIterator<Item = &'a str>,
 ) -> String {
+    let extra = EXTRA_SECRETS
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
     let mut out = text.to_string();
+    let mut redact = |needle: &str| {
+        if needle.len() >= 4 && out.contains(needle) {
+            out = out.replace(needle, "[redacted]");
+        }
+    };
     for c in credentials {
         let c = c.trim();
-        let token = c.split_once(' ').map_or(c, |(_, t)| t.trim());
-        for needle in [c, token] {
-            if needle.len() >= 4 && out.contains(needle) {
-                out = out.replace(needle, "[redacted]");
-            }
-        }
+        redact(c);
+        redact(c.split_once(' ').map_or(c, |(_, t)| t.trim()));
+    }
+    // Registered secrets (spoken codes) are phrases: only the whole value.
+    for c in &extra {
+        redact(c);
     }
     out
 }
@@ -1270,10 +1401,7 @@ impl Config {
         if a.ntfy_topic.as_deref().is_some_and(|t| t.trim().is_empty()) {
             bail!("alerts.ntfy_topic must not be empty (leave it out to use notify.ntfy.topic)");
         }
-        for r in &self.tool_policies {
-            globset::Glob::new(&r.pattern)
-                .with_context(|| format!("tool_policies match {:?}", r.pattern))?;
-        }
+        self.validate_policies()?;
         let mut triggers = std::collections::HashMap::new();
         for (name, p) in &self.profiles {
             for t in &p.triggers {
@@ -1297,6 +1425,62 @@ impl Config {
         }
         if let Some(u) = &self.server.public_base_url {
             url::Url::parse(u).context("server.public_base_url")?;
+        }
+        Ok(())
+    }
+
+    fn validate_policies(&self) -> Result<()> {
+        let a = &self.auth_codes;
+        for (name, c) in &a.codes {
+            if name.is_empty() || c.code_env.trim().is_empty() {
+                bail!("auth_codes.codes entries need a name and a code_env");
+            }
+        }
+        if !a.codes.is_empty() {
+            if a.triggers
+                .iter()
+                .all(|t| crate::authcode::normalise(t).is_empty())
+            {
+                bail!("auth_codes.triggers must hold at least one phrase");
+            }
+            if a.valid_for_secs == 0
+                || a.max_failures == 0
+                || a.failure_window_secs == 0
+                || a.lockout_secs == 0
+            {
+                bail!(
+                    "auth_codes.valid_for_secs, max_failures, failure_window_secs and lockout_secs must be at least 1"
+                );
+            }
+        }
+        for (i, r) in self.tool_policies.iter().enumerate() {
+            let at = || format!("tool_policies[{i}] (match {:?})", r.pattern);
+            globset::Glob::new(&r.pattern).with_context(at)?;
+            for (pointer, glob) in r.when.iter().chain(&r.when_any).chain(&r.unless) {
+                if !pointer.starts_with('/') {
+                    bail!(
+                        "{}: condition {pointer:?} must be a JSON pointer starting with '/'",
+                        at()
+                    );
+                }
+                globset::Glob::new(glob)
+                    .with_context(|| format!("{}: condition {pointer:?} glob", at()))?;
+            }
+            match (r.policy, &r.code) {
+                (Policy::Code, Some(code)) if !a.codes.contains_key(code) => {
+                    bail!("{}: code {code:?} is not in [auth_codes.codes]", at())
+                }
+                (Policy::Code, None) if a.codes.len() != 1 => bail!(
+                    "{}: policy \"code\" needs code = \"<name>\" (one of [auth_codes.codes])",
+                    at()
+                ),
+                (Policy::Code, _) => {}
+                (_, Some(_)) => bail!("{}: code is only for policy \"code\"", at()),
+                (_, None) if r.on_missing.is_some() => {
+                    bail!("{}: on_missing is only for policy \"code\"", at())
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -1791,5 +1975,72 @@ basic_auth = { username = "x", password_env = "UNSET" }
         .unwrap();
         let e = cfg.validate_runtime(&secrets).unwrap_err().to_string();
         assert!(e.contains("OR_KEY"), "{e}");
+    }
+
+    #[test]
+    fn argument_conditions_and_code_rules_are_validated() {
+        let base = "[auth_codes.codes.alarm]\ncode_env = \"RINGMASTER_CODE_ALARM\"\n";
+        let ok = |extra: &str| Config::from_toml(&format!("{base}{extra}"));
+        let rule = |body: &str| format!("[[tool_policies]]\nmatch = \"ha/*\"\n{body}\n");
+        // A good one: conditions, a code rule, the only code left out.
+        let c = ok(&format!(
+            "{}{}",
+            rule("when = { \"/action\" = \"alarm_control_panel.*\" }\nunless = { \"/target/entity_id\" = \"x\" }\npolicy = \"deny\""),
+            rule("policy = \"code\"\non_missing = \"ask\"")
+        ))
+        .unwrap();
+        assert!(c.tool_policies[0].is_conditional());
+        assert_eq!(c.tool_policies[1].on_missing, Some(OnMissing::Ask));
+        assert_eq!(c.auth_codes.valid_for_secs, 300);
+        assert_eq!(c.auth_codes.triggers.len(), 4);
+        for (bad, why) in [
+            (
+                rule("policy = \"code\"\ncode = \"garage\""),
+                "not in [auth_codes.codes]",
+            ),
+            (
+                rule("policy = \"allow\"\ncode = \"alarm\""),
+                "only for policy",
+            ),
+            (
+                rule("policy = \"allow\"\non_missing = \"deny\""),
+                "only for policy",
+            ),
+            (
+                rule("when = { \"action\" = \"x\" }\npolicy = \"deny\""),
+                "JSON pointer",
+            ),
+            (rule("when = { \"/a\" = \"[\" }\npolicy = \"deny\""), "glob"),
+            (
+                rule("policy = \"code\"\nwhen = { \"/a\" = \"x\" }\nbogus = 1"),
+                "unknown field",
+            ),
+        ] {
+            let e = format!("{:#}", ok(&bad).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // Two codes: a code rule must name one.
+        let two = format!(
+            "{base}[auth_codes.codes.garage]\ncode_env = \"G\"\n{}",
+            rule("policy = \"code\"")
+        );
+        assert!(format!("{:#}", Config::from_toml(&two).unwrap_err()).contains("needs code"));
+        // No codes at all: nothing to name.
+        let none = Config::from_toml(&rule("policy = \"code\"")).unwrap_err();
+        assert!(format!("{none:#}").contains("needs code"), "{none:#}");
+        // Code values never go in the file.
+        let e = Config::from_toml("[auth_codes.codes.alarm]\ncode = \"delta\"\n").unwrap_err();
+        assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+    }
+
+    #[test]
+    fn registered_secrets_are_redacted_everywhere() {
+        register_secret("kilo lima 9");
+        assert_eq!(
+            redact_credentials("echoed: kilo lima 9!", None::<&str>),
+            "echoed: [redacted]!"
+        );
+        // Only the whole phrase, not its parts.
+        assert_eq!(redact_credentials("lima 9", None::<&str>), "lima 9");
     }
 }

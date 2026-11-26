@@ -19,6 +19,9 @@
 #   HOMEY_MCP_TOKEN=...                     (if the Homey MCP server needs one)
 #   SHIELDSTRAL_API_KEY=...                 (if [approval] api_key_env names it and
 #                                            llama-server runs with --api-key)
+#   RINGMASTER_CODE_ALARM=delta beta 5      (if [auth_codes.codes.alarm] names it; several
+#                                            spoken forms separated by |; or mount a
+#                                            secret file and set RINGMASTER_CODE_ALARM_FILE)
 #
 # Networks:
 #   edge  - cloudflared <-> ringmaster, with internet access (LLM APIs, ntfy,
@@ -48,6 +51,9 @@ services:
       NTFY_TOKEN: ${NTFY_TOKEN:-}
       HOMEY_MCP_TOKEN: ${HOMEY_MCP_TOKEN:-}
       SHIELDSTRAL_API_KEY: ${SHIELDSTRAL_API_KEY:-}
+      # Spoken authorisation codes ([auth_codes]); Ringmaster refuses to
+      # start if a configured code has no value.
+      RINGMASTER_CODE_ALARM: ${RINGMASTER_CODE_ALARM:-}
       RUST_LOG: info
     volumes:
       - ./ringmaster/config.toml:/etc/ringmaster/config.toml:ro

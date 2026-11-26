@@ -12,6 +12,7 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use tokio::sync::Notify;
 use tower_http::trace::TraceLayer;
 
+use crate::authcode::AuthCodes;
 use crate::config::Config;
 use crate::db::{Db, now};
 use crate::health::Health;
@@ -27,6 +28,9 @@ pub struct AppState {
     pub webhook_secret: Option<String>,
     pub metrics: Option<PrometheusHandle>,
     pub health: Arc<Health>,
+    /// Spoken authorisation codes, removed from the phone's transcription
+    /// before it is stored.
+    pub codes: Arc<AuthCodes>,
 }
 
 /// Longest `/healthz` waits for the database (Docker's probe allows 5 s).

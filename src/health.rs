@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{AlertsConfig, Config, WORKER_LOOP_MAX_WAIT_SECS};
-use crate::db::{Db, DbErrorClass, DbHealth, QueueStats, now};
+use crate::db::{Db, DbErrorClass, DbHealth, Lockout, QueueStats, now};
 use crate::notify::{Kind, Notification, Notifier};
 
 /// Job outcomes that count towards the "jobs failing" alert.
@@ -51,10 +51,11 @@ pub enum Condition {
     JobsFailing,
     BlockingStuck,
     ClassifierFailing,
+    AuthCodeLockout,
 }
 
 impl Condition {
-    pub const ALL: [Condition; 8] = [
+    pub const ALL: [Condition; 9] = [
         Condition::DatabaseCorrupt,
         Condition::DatabaseFailing,
         Condition::WorkerStalled,
@@ -63,6 +64,7 @@ impl Condition {
         Condition::JobsFailing,
         Condition::BlockingStuck,
         Condition::ClassifierFailing,
+        Condition::AuthCodeLockout,
     ];
 
     pub fn key(self) -> &'static str {
@@ -75,6 +77,7 @@ impl Condition {
             Condition::JobsFailing => "jobs_failing",
             Condition::BlockingStuck => "blocking_stuck",
             Condition::ClassifierFailing => "classifier_failing",
+            Condition::AuthCodeLockout => "auth_code_lockout",
         }
     }
 
@@ -88,6 +91,7 @@ impl Condition {
             Condition::JobsFailing => "jobs failing",
             Condition::BlockingStuck => "blocking work stuck",
             Condition::ClassifierFailing => "approval classifier failing",
+            Condition::AuthCodeLockout => "authorisation codes locked out",
         }
     }
 }
@@ -187,6 +191,10 @@ pub struct Health {
     /// `approval.alert_after_failures`).
     classifier: Mutex<ClassifierStatus>,
     classifier_alert_after: u32,
+    /// The authorisation code lockout in force, as last read from the
+    /// database (it is kept there, so a restart does not end it).
+    code_lockout: Mutex<Option<Lockout>>,
+    code_window_secs: u64,
 }
 
 /// What the watchdog knows about the approval classifier.
@@ -220,7 +228,14 @@ impl Health {
             active: Mutex::default(),
             classifier: Mutex::default(),
             classifier_alert_after: config.approval.alert_after_failures.max(1),
+            code_lockout: Mutex::default(),
+            code_window_secs: config.auth_codes.failure_window_secs,
         }
+    }
+
+    /// The authorisation code lockout in force (from the database).
+    pub fn set_code_lockout(&self, lockout: Option<Lockout>) {
+        *lock(&self.code_lockout) = lockout;
     }
 
     /// The approval classifier gave a verdict.
@@ -496,6 +511,22 @@ impl Health {
                     ),
                 );
             }
+        }
+
+        if let Some(l) = *lock(&self.code_lockout)
+            && now < l.until
+        {
+            out.insert(
+                Condition::AuthCodeLockout,
+                format!(
+                    "{} wrong authorisation codes within {}: actions that need a code are \
+                     refused for {} more. If this was not you, someone may be trying codes \
+                     with the ring; check the audit log (kind auth_code).",
+                    l.failures,
+                    human(self.code_window_secs as i64),
+                    human(l.until - now)
+                ),
+            );
         }
 
         let stuck: Vec<BlockingEntry> = self
@@ -840,6 +871,14 @@ impl Watchdog {
             Err(_) => status.record_error(DbErrorClass::Unresponsive),
         }
 
+        match tokio::time::timeout(QUEUE_QUERY_LIMIT, self.db.active_lockout(now)).await {
+            Ok(Ok(l)) => self.health.set_code_lockout(l),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "reading the authorisation code lockout failed")
+            }
+            Err(_) => status.record_error(DbErrorClass::Unresponsive),
+        }
+
         let db = status.snapshot();
         let current = self.health.conditions(now, &db);
         let active = self.alerter.apply(now, &current).await;
@@ -879,6 +918,30 @@ mod tests {
     fn health(extra: &str) -> Health {
         let cfg = Config::from_toml(extra).unwrap();
         Health::new(&cfg, 1000)
+    }
+
+    #[test]
+    fn code_lockout_alerts_with_counts_only_until_it_ends() {
+        let h = health("");
+        let db = DbHealth::default();
+        h.set_code_lockout(Some(Lockout {
+            since: 1000,
+            until: 1900,
+            failures: 3,
+        }));
+        let c = h.conditions(1000, &db);
+        let text = &c[&Condition::AuthCodeLockout];
+        assert!(
+            text.starts_with("3 wrong authorisation codes within 10 min"),
+            "{text}"
+        );
+        assert!(text.contains("15 min more"), "{text}");
+        assert!(
+            !h.conditions(1900, &db)
+                .contains_key(&Condition::AuthCodeLockout)
+        );
+        // Never a reason for /healthz to fail.
+        assert!(h.unhealthy(1000, &db).is_empty());
     }
 
     #[test]

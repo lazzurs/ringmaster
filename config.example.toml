@@ -212,13 +212,102 @@ url = "http://nextcloud-mcp:8000/mcp"
 # url = "http://homey-mcp:3000/mcp"
 # token_env = "HOMEY_MCP_TOKEN"
 
+# --------------------------------------------------------- authorisation codes
+# Spoken authorisation codes for `policy = "code"` rules: "disarm the house
+# alarm, authorisation code delta beta five". Ringmaster checks the code itself
+# right after transcription and replaces it with "[authorisation code
+# accepted]" (or "rejected") before the transcript is stored, logged, audited,
+# or shown to the model, the classifier or ntfy; a recording that held a code
+# is deleted at once. Code values come only from the environment (or
+# <VAR>_FILE): several spoken forms whisper may produce are separated by "|",
+# e.g. RINGMASTER_CODE_ALARM="delta beta 5 | delta better 5". See the README
+# ("Spoken authorisation codes") for what this does and does not protect.
+#
+# [auth_codes]
+# triggers = ["authorisation code", "authorization code", "auth code", "code"]
+# valid_for_secs = 300         # from the recording; a later retry needs a new code
+# max_failures = 3             # wrong codes within failure_window_secs ...
+# failure_window_secs = 600
+# lockout_secs = 900           # ... lock code actions out (and alert) this long
+#
+# [auth_codes.codes.alarm]
+# code_env = "RINGMASTER_CODE_ALARM"
+
 # --------------------------------------------------------------- tool policies
 # Globs over "<server>/<tool>"; first match wins; unmatched tools need
 # confirmation. "deny" tools are never offered to Claude.
-# Policies: allow | confirm | ask | deny. "ask" is "confirm" that the
-# approval classifier may never approve (locks, alarms, payments...).
+# Policies: allow | confirm | ask | deny | code. "ask" is "confirm" that the
+# approval classifier may never approve (locks, alarms, payments...). "code"
+# runs only with a spoken authorisation code in the same request (see above).
 # Tool names depend on the MCP server: list them with the server's own tooling
 # and adjust these patterns.
+#
+# A rule can also look at the call's arguments: `when` (all must match),
+# `when_any` (one must match) and `unless` (the rule is skipped when all of
+# them match; for a list, every element must) map a JSON pointer into the
+# arguments to a glob over the value, compared without regard to case. Numbers
+# and booleans compare as their JSON text ("true", "5"); for a list, any
+# element matching is enough (all of them for `unless`); a pointer that is not
+# there never matches. A conditional "deny" cannot hide the tool, so it is
+# refused when called.
+#
+# Home Assistant (MCP server integration, "homeassistant" here), 2026.11+:
+# homeassistant__call_action takes { action = "<domain>.<action>",
+# target = { entity_id, device_id, area_id, floor_id, label_id }, data = {...} }.
+# Order matters: the first matching rule wins.
+#
+# # Never touch the UniFi alarm panel, whatever the action.
+# [[tool_policies]]
+# match = "homeassistant/*call_action"
+# when_any = { "/target/entity_id" = "*loft_dream_machine_pro_alarm_manager*", "/data/entity_id" = "*loft_dream_machine_pro_alarm_manager*" }
+# policy = "deny"
+#
+# # Alarm actions name their panel by entity id in `target`: no areas,
+# # devices, floors or labels, which could reach another panel.
+# [[tool_policies]]
+# match = "homeassistant/*call_action"
+# when = { "/action" = "alarm_control_panel.*" }
+# when_any = { "/target/area_id" = "*", "/target/device_id" = "*", "/target/floor_id" = "*", "/target/label_id" = "*", "/data/entity_id" = "*", "/data/area_id" = "*", "/data/device_id" = "*", "/data/floor_id" = "*", "/data/label_id" = "*" }
+# policy = "deny"
+#
+# # ... and only the HomeSecure panel and its partitions (a template or any
+# # other entity in the list is refused too).
+# [[tool_policies]]
+# match = "homeassistant/*call_action"
+# when = { "/action" = "alarm_control_panel.*" }
+# unless = { "/target/entity_id" = "{alarm_control_panel.64_104058,alarm_control_panel.64_104058_perimeter_only,alarm_control_panel.64_104058_motions_only,alarm_control_panel.64_104058_shed_only}" }
+# policy = "deny"
+#
+# # Disarming needs the spoken code; without it the model is told so.
+# [[tool_policies]]
+# match = "homeassistant/*call_action"
+# when = { "/action" = "alarm_control_panel.alarm_disarm" }
+# policy = "code"
+# code = "alarm"
+# on_missing = "deny"          # or "ask": Approve/Deny on the phone instead
+#
+# # Arming (away, home, night...) is confirmed; the classifier may pass it.
+# [[tool_policies]]
+# match = "homeassistant/*call_action"
+# when = { "/action" = "alarm_control_panel.*" }
+# policy = "confirm"
+#
+# # Scripts and automations can do anything; their arguments cannot show it.
+# [[tool_policies]]
+# match = "homeassistant/*call_action"
+# when = { "/action" = "{script,automation}.*" }
+# policy = "ask"
+#
+# [[tool_policies]]
+# match = "homeassistant/*render_template"
+# policy = "confirm"
+#
+# Two-step writes (a write called without confirm = true only returns a plan):
+# let the plan through, confirm the real write.
+# [[tool_policies]]
+# match = "nextcloud/*"
+# when = { "/confirm" = "true" }
+# policy = "confirm"
 
 [[tool_policies]]
 match = "*/*delete*"

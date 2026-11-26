@@ -40,16 +40,20 @@ Docker Compose.
    `/inference` with an initial prompt built from your vocabulary. Primary
    server, then fallback server, then the phone's own transcription. If no
    server answers and there is no phone transcription, the job is retried
-   with back-off.
+   with back-off. With [spoken authorisation codes](#spoken-authorisation-codes)
+   configured, the code is checked here and replaced by a marker before the
+   transcript goes anywhere.
 3. **Agent**. The gesture (`X-Index-Trigger`) selects a **profile**: a system
    prompt plus an allow-list of tools. Ringmaster is the MCP client: it lists
    the tools of the servers the profile can use, freezes them (sorted) into
    the job, and runs a manual tool loop against the profile's LLM, executing
    tool calls itself so the MCP servers never leave the private network.
-4. **Policies**. Every tool call is checked against `tool_policies`:
+4. **Policies**. Every tool call is checked against `tool_policies`, by tool
+   name and optionally by [its arguments](#argument-conditions):
    `allow` runs, `deny` never runs (and is not even offered to the model),
    `confirm` pauses the job and sends an ntfy notification with Approve/Deny
-   buttons. Tools that no rule matches need confirmation.
+   buttons, `code` runs only with a spoken authorisation code. Tools that no
+   rule matches need confirmation.
 5. **Result**. The final answer, any error, and any delay are sent through
    ntfy. Everything is in the audit log.
 
@@ -271,6 +275,7 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `NTFY_TOKEN` | ntfy access token, if the topic needs one |
 | the `approval.api_key_env` variable, if set | bearer token for the approval classifier server (a missing one is a warning; calls then go to you) |
 | any `token_env` named by an `[[mcp_servers]]` entry | bearer token for that MCP server |
+| any `code_env` named by an `[auth_codes.codes.<name>]` entry | the spoken authorisation code, e.g. `delta beta 5`; several spoken forms separated by `\|` (at most 5). Ringmaster refuses to start if a configured code has no value |
 
 ### Reference
 
@@ -334,7 +339,14 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `[[mcp_servers]]` `name`, `url`, `token_env` | | streamable HTTP MCP servers; `token_env` sends `Authorization: Bearer` |
 | `[[mcp_servers]]` `basic_auth` | | `{ username = "...", password_env = "VAR" }`: HTTP Basic, e.g. a Nextcloud app password; takes precedence over `token_env` |
 | `[[mcp_servers]]` `headers_env` | | `{ "X-Api-Key" = "VAR" }`: extra headers, values from environment variables |
-| `[[tool_policies]]` `match`, `policy` | | glob over `server/tool`; `allow` `confirm` `ask` `deny`; first match wins (`ask` = `confirm` that the classifier may never approve) |
+| `[[tool_policies]]` `match`, `policy` | | glob over `server/tool`; `allow` `confirm` `ask` `deny` `code`; first match wins (`ask` = `confirm` that the classifier may never approve) |
+| `[[tool_policies]]` `when`, `when_any`, `unless` | none | conditions on the call's arguments: `{ "/json/pointer" = "glob" }`; see [Argument conditions](#argument-conditions) |
+| `[[tool_policies]]` `code`, `on_missing` | the only code / `deny` | for `policy = "code"`: which `[auth_codes.codes]` entry the call needs, and what happens without it (`deny`: an error result the model relays; `ask`: Approve/Deny) |
+| `auth_codes.triggers` | `["authorisation code", "authorization code", "auth code", "code"]` | phrases that introduce a spoken code |
+| `auth_codes.valid_for_secs` | `300` | how long after the recording an accepted code stays valid for its job |
+| `auth_codes.max_failures` / `auth_codes.failure_window_secs` | `3` / `600` | this many wrong codes within the window lock code actions out |
+| `auth_codes.lockout_secs` | `900` | how long the lockout lasts (it survives restarts and raises an alert) |
+| `[auth_codes.codes.<name>]` `code_env` | | environment variable (or `<VAR>_FILE`) holding the code; never the code itself |
 | `[profiles.<name>]` `triggers`, `system_prompt`, `tools` | | gesture → prompt + tool allow-list (globs; `*/*` = all) |
 | `[profiles.<name>]` `provider`, `model`, `effort`, `max_iterations`, `job_max_age_secs` | | per-profile overrides; a profile with a `provider` other than the default needs a `model` (here or in `[llm.<provider>]`) |
 | `[profiles.<name>]` `approval_mode` | `approval.mode` | `manual` `shadow` `classifier` for this profile |
@@ -464,7 +476,9 @@ How each mode behaves (`approval.mode`, or `approval_mode` per profile):
   call runs or the job fails. After `alert_after_failures` failures in a row
   you get an operational alert.
 * `deny` tools are never offered to the model and never classified; `ask`
-  tools always ask you and are never sent to the classifier. If one call in
+  tools always ask you and are never sent to the classifier; `code` calls run
+  on their spoken code or not at all (or ask you, with `on_missing = "ask"`)
+  and are never classified. If one call in
   a turn is `ask`, the others are not classified either.
 * Each call in a turn is classified on its own; the turn runs without asking
   only if every `confirm` call in it passes. Otherwise the whole turn goes to
@@ -517,6 +531,254 @@ policy = "ask"
 match = "homey/*alarm*"
 policy = "ask"
 ```
+
+## Argument conditions
+
+A `[[tool_policies]]` rule can look at a call's arguments as well as the
+tool's name, so one tool can get different policies for different calls.
+That matters for tools that can do anything, such as Home Assistant's
+`call_action`.
+
+```toml
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.alarm_disarm" }
+policy = "code"
+```
+
+* Conditions map a [JSON pointer](https://www.rfc-editor.org/rfc/rfc6901)
+  into the arguments (`/target/entity_id`) to a glob over the value. Globs
+  ignore case (Home Assistant lowercases actions and entity ids, so
+  `Alarm_Control_Panel.Alarm_Disarm` cannot slip past), and `*` matches any
+  text, dots and slashes included. `{a,b,c}` lists alternatives.
+* Strings are matched as they are, numbers and booleans as their JSON text
+  (`"true"`, `"5"`, `"1.5"`), `null` as `"null"`. A list matches if any
+  element does (Home Assistant targets can be lists). Objects never match.
+* `when`: every condition must match. `when_any`: at least one must.
+  `unless`: the rule is skipped when every one of these holds, and for a
+  list every element must match, so it works as an allow-list ("deny alarm
+  actions unless the entity is one of these"). A pointer that is not in the
+  arguments never matches; for `unless` that means the rule applies.
+* Rules are still first match wins, and a rule matches only when its tool
+  glob and all its conditions match. Calls no rule matches need
+  confirmation, as before.
+* A `deny` rule without conditions hides the tool from the model, as
+  before. A conditional `deny` cannot (the same tool is fine with other
+  arguments), so the call is refused when it is made and the model gets an
+  error result ("Not run: policy blocks this call with these arguments").
+  `ask` and `code` calls are never sent to the approval classifier, whether
+  their rule has conditions or not.
+
+**Home Assistant's tools.** With the MCP Server integration and the "Home
+Assistant" LLM API exposed (Home Assistant 2026.11 or later), the tools come
+from `homeassistant/components/homeassistant/llm.py` and are qualified as
+`homeassistant/<name>` with a server named `homeassistant`:
+
+| Tool | Arguments |
+|---|---|
+| `homeassistant__call_action` | `action` (required, `"<domain>.<action>"` in one field, e.g. `"alarm_control_panel.alarm_disarm"`; there is no separate `domain`/`service`), `target` (optional: `entity_id`, `device_id`, `area_id`, `floor_id`, `label_id`, each a string, a comma-separated string or a list), `data` (optional: the action's fields; it may also carry `entity_id` and the other target keys) |
+| `homeassistant__render_template` | `template` (required, a Jinja2 template), `variables` (optional object) |
+
+`call_action` can call any action on any entity, whatever Home Assistant's
+exposure settings say, and values in `target` and `data` may be templates.
+So:
+
+* match the action on `/action` (always one string);
+* refuse alarm calls that target anything but the right entities by name
+  (`unless` with the exact entity ids, which also refuses templates, lists
+  with another entity, and calls with no `entity_id`), and calls that also
+  use areas, devices, floors, labels or `data` keys to target;
+* **a script or automation called through `call_action`** (`script.turn_on`
+  of a script that disarms, `script.disarm_house`, `automation.trigger`)
+  **cannot be detected from the arguments.** Put `script.*` and
+  `automation.*` on `ask`. The same goes for any entity whose action has a
+  side effect elsewhere (a `button.press` or `switch.turn_off` wired to the
+  alarm).
+
+**Two-step writes.** Some MCP servers (such as the Nextcloud "MCP for Cloud"
+server) make a write in two calls: without `confirm: true` the tool only
+returns a plan, and with it the change is made. Let the plan through and
+confirm the real write (check the argument's name in the server's tool
+schema):
+
+```toml
+[[tool_policies]]
+match = "nextcloud/*"
+when = { "/confirm" = "true" }   # JSON true (and the string "true")
+policy = "confirm"
+
+[[tool_policies]]
+match = "nextcloud/*"
+policy = "allow"
+```
+
+## Spoken authorisation codes
+
+Some actions should need more than a gesture. With `policy = "code"`, a call
+runs only if you said its code in the same recording, Star Trek style:
+"Disarm the house alarm, authorisation code delta beta five".
+
+```toml
+[auth_codes.codes.alarm]
+code_env = "RINGMASTER_CODE_ALARM"      # RINGMASTER_CODE_ALARM="delta beta 5 | delta better 5"
+
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.alarm_disarm" }
+policy = "code"
+code = "alarm"          # may be left out when there is only one code
+on_missing = "deny"     # default; "ask" falls back to Approve/Deny
+```
+
+How it works:
+
+* **Ringmaster checks the code, never the model.** Right after
+  transcription it looks for a trigger phrase (`auth_codes.triggers`:
+  "authorisation code", "authorization code", "auth code", "code") followed
+  by the code's words. Both sides are normalised first: lowercase,
+  punctuation removed, number words as digits (`five` = `5`, `zero` and `oh`
+  = `0`, `1234` = `one two three four`), whitespace collapsed. Comparison is
+  exact and in constant time; there is no fuzzy matching. Whisper may mishear
+  a code word: list the forms it produces as extra spoken variants in the
+  same variable, separated by `|` (at most 5).
+* **The code never leaves Ringmaster.** The trigger phrase and the code are
+  replaced by `[authorisation code accepted]` (or `[authorisation code
+  rejected]`) before the transcript is stored (`jobs.transcript`,
+  `deliveries.phone_transcription`), audited, logged, saved in the
+  conversation, or sent to the model, the classifier or ntfy. The model only
+  sees the marker. Code words heard without a trigger phrase are removed too
+  (`[redacted]`) and authorise nothing. Notifications, confirmation
+  summaries and every credential redaction remove the code words again as a
+  last line of defence. A phone transcription is stripped by the webhook,
+  before it is stored.
+* **The recording is deleted.** The audio holds the spoken code and cannot
+  be redacted, so a recording in which a code phrase (or the code's words)
+  was heard is deleted right after transcription, whatever
+  `retention.audio_days` says, and audited as `audio_deleted` ("contained an
+  authorisation code").
+* **Both transcripts count.** The whisper transcript and the phone's own
+  transcription are both checked, and the code counts if either has it. This
+  makes a mishearing by one of them less of a problem; the cost is that
+  there are two chances for a near miss to be heard as the code (still
+  exact, after normalisation). If several codes are tried in one recording,
+  that transcript authorises nothing.
+* **One job, one window.** A valid code authorises only `code` calls naming
+  that code, in that job, for `valid_for_secs` (300) from the recording. The
+  job keeps "authorised for code X until T", never the code. Another job, a
+  rule naming another code, or the same job resumed or retried after the
+  window, needs the code said again.
+* **Wrong codes lock out.** A trigger phrase followed by words that are no
+  code counts as a wrong code. After `max_failures` (3) within
+  `failure_window_secs` (10 minutes), codes are locked out for
+  `lockout_secs` (15 minutes): codes are not even checked meanwhile, `code`
+  calls are refused (or asked about, with `on_missing = "ask"`), and you get
+  an "authorisation codes locked out" alert with the count, never the words.
+  The lockout is kept in the database, so a restart does not end it.
+* **The code is the approval.** A `code` call with a valid code runs without
+  an Approve/Deny notification and without the classifier, is audited with
+  `approved_by: "auth_code"`, and is listed at the end of the final
+  notification ("Authorised by code: homeassistant/call_action {...} (code
+  "alarm")"). Without a valid code, `on_missing = "deny"` refuses it with an
+  error result the model relays ("this action needs the user's spoken
+  authorisation code"), and `on_missing = "ask"` sends the usual Approve/Deny
+  (never the classifier). The classifier is never asked about `code` calls.
+* Nothing code-related is added to the system prompt. If you want the model
+  to know that some actions need a code, say so in the profile's
+  `system_prompt`.
+
+### What a spoken code protects, and what it does not
+
+* It is a second factor next to the ring itself: a request has to come
+  through the ring app's signed webhook (HMAC with a secret only the app
+  has) **and** carry the code. Someone who only reaches the webhook URL, or
+  only has the ring, cannot disarm.
+* It is spoken aloud. **Anyone who hears you say it and gets hold of the
+  ring can reuse it.** Change it if it may have been overheard; the
+  variable is read at start-up, so restart Ringmaster after changing it.
+* Whisper makes mistakes. A misheard code is refused (and counts towards the
+  lockout); add the forms it really produces as variants rather than making
+  the code shorter. Do not put the code's words in `stt.vocabulary`: that
+  goes into the config file and every whisper request.
+* With `code` as a trigger, ordinary speech can look like an attempt ("add a
+  card about the code review" removes the words after "code" from the
+  transcript and counts a wrong code). If that bites, use longer triggers
+  only: `triggers = ["authorisation code", "authorization code"]`.
+* Policies only see arguments. Anything that reaches the same effect through
+  another action (a script, an automation, another integration's entity) is
+  not covered by an argument rule; keep those on `ask` or `deny`.
+
+### Worked example: a Home Assistant alarm
+
+HomeSecure panel `alarm_control_panel.64_104058` with partitions
+`_perimeter_only`, `_motions_only` and `_shed_only`; a UniFi panel that must
+never be used. All alarm actions by voice, disarming only with the code;
+arming confirmed (the classifier may pass it in `classifier` mode).
+
+```toml
+[auth_codes.codes.alarm]
+code_env = "RINGMASTER_CODE_ALARM"
+
+# Never touch the UniFi panel, whatever the action.
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when_any = { "/target/entity_id" = "*loft_dream_machine_pro_alarm_manager*", "/data/entity_id" = "*loft_dream_machine_pro_alarm_manager*" }
+policy = "deny"
+
+# Alarm actions name their panel by entity id in `target`: no areas,
+# devices, floors or labels, which could reach another panel.
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.*" }
+when_any = { "/target/area_id" = "*", "/target/device_id" = "*", "/target/floor_id" = "*", "/target/label_id" = "*", "/data/entity_id" = "*", "/data/area_id" = "*", "/data/device_id" = "*", "/data/floor_id" = "*", "/data/label_id" = "*" }
+policy = "deny"
+
+# Only the HomeSecure panel and its partitions (templates, other entities and
+# lists holding another entity are refused).
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.*" }
+unless = { "/target/entity_id" = "{alarm_control_panel.64_104058,alarm_control_panel.64_104058_perimeter_only,alarm_control_panel.64_104058_motions_only,alarm_control_panel.64_104058_shed_only}" }
+policy = "deny"
+
+# Disarming needs the spoken code.
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.alarm_disarm" }
+policy = "code"
+code = "alarm"
+
+# Every other alarm action (arm away, arm home, arm night, ...) is confirmed.
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "alarm_control_panel.*" }
+policy = "confirm"
+
+# Scripts and automations could do anything, a disarm included.
+[[tool_policies]]
+match = "homeassistant/*call_action"
+when = { "/action" = "{script,automation}.*" }
+policy = "ask"
+
+[[tool_policies]]
+match = "homeassistant/*render_template"
+policy = "confirm"
+
+[profiles.command]
+triggers = ["double-click-hold"]
+tools = ["*/*"]
+system_prompt = """
+Command mode. ...
+The house alarm is alarm_control_panel.64_104058, with the partitions
+alarm_control_panel.64_104058_perimeter_only, _motions_only and _shed_only.
+Never use alarm_control_panel.loft_dream_machine_pro_alarm_manager. Disarming
+needs the user's spoken authorisation code: the transcript shows
+"[authorisation code accepted]" when it was given; if a disarm is refused for
+want of a code, say so.
+"""
+```
+
+Other `call_action` calls fall through to your remaining rules (no rule
+means `confirm`).
 
 ## Transcription on the Mac
 
@@ -573,7 +835,9 @@ label), `ringmaster_tool_calls_total{outcome}`,
 `unsafe`, `unavailable`, `ask`, `skipped`),
 `ringmaster_classifier_score{mode}` (histogram),
 `ringmaster_shadow_comparisons_total{result}` and the classifier's requests
-as `ringmaster_llm_requests_total{provider="classifier",status}`.
+as `ringmaster_llm_requests_total{provider="classifier",status}`, and for
+spoken codes `ringmaster_auth_code_failures_total` and
+`ringmaster_auth_code_lockouts_total`.
 
 Health gauges (refreshed by the watchdog and on every scrape):
 `ringmaster_db_healthy` (0/1), `ringmaster_db_errors_total{class}`,
@@ -601,6 +865,7 @@ A watchdog task, independent of the worker, checks every
 | jobs failing | `failure_threshold` jobs failed, expired, were quarantined or panicked within `failure_window_secs` |
 | blocking work stuck | a decode (or an audio write) has not returned `overrun_margin_secs` after its limit |
 | approval classifier failing | `approval.alert_after_failures` classifications in a row got no verdict (the calls went to you); never affects `/healthz` |
+| authorisation codes locked out | `auth_codes.max_failures` wrong codes within `failure_window_secs`; `code` actions are refused for `lockout_secs`. The alert gives the count, never the words; never affects `/healthz` |
 
 Each problem gets one alert when it starts, a reminder every `reminder_secs`
 while it lasts and one "recovered" message when it clears. Alerts carry
@@ -654,7 +919,11 @@ conversation; `confirmations` the hashed one-time tokens and decisions;
 `audit` a timeline per job: `delivery`, `transcript`, `agent_start`,
 `claude_response` (stop reason, tool calls, usage; `llm_response` with the
 provider and finish reason for the other providers), `tool_call` (input,
-policy action, result, `approved_by` `human` or `classifier`),
+policy action, result, `approved_by` `human`, `classifier` or `auth_code`
+with the code's name in `auth_code`), `auth_code` (status `accepted` /
+`rejected` / `locked_out`, the codes authorised and until when, wrong codes
+counted: names and counts, never the words), `auth_code_lockout`,
+`audio_deleted` (a recording that held a code, deleted after transcription),
 `classification` (per classified call: tool, mode, verdict, score,
 `threshold`, `auto_approve_below`, outcome `auto_approved` / `escalated` /
 `shadow`, error), `confirmation_requested` (with the classifier's
@@ -693,6 +962,8 @@ docker compose cp ringmaster:/data/ringmaster.db /tmp/ && sqlite3 /tmp/ringmaste
   not trained on tool calls and can be wrong or talked round. Keep
   destructive tools on `deny` and security-relevant ones on `ask`, and start
   in `shadow` mode (see [Automatic approval](#automatic-approval-shieldstral)).
+* A spoken code is heard by anyone nearby and works for anyone who has the
+  ring; see [what it protects](#what-a-spoken-code-protects-and-what-it-does-not).
 
 ## Development
 
