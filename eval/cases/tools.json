@@ -340,6 +340,10 @@
         "description": {
           "type": "string",
           "description": "Optional details."
+        },
+        "confirm": {
+          "type": "boolean",
+          "description": "Set to true to carry out the change after its plan."
         }
       },
       "required": [

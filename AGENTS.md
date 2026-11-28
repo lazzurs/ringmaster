@@ -37,11 +37,12 @@ outages and pending confirmations resume where they stopped.
 | `src/worker.rs` | job loop: one task per job (`InFlight`, up to `worker_concurrency`), attempt deadline, panic isolation, max age, transcribe, run agent, retry with back-off, notify, audio retention | job lifecycle |
 | `src/stt.rs` | whisper-server client and fallback chain | transcription |
 | `src/audio.rs` | M4A (AAC-LC) to 16 kHz mono WAV in pure Rust (symphonia + hound); `Budget` (deadline and duration checked in the decode loop) and `Decoder` (size cap, semaphore, timeout; `with_fn` for tests) | audio decoding |
-| `src/agent.rs` | provider-neutral agent loop, `AgentState`, tool discovery, planning, confirmations, tool execution | agent behaviour |
+| `src/agent.rs` | provider-neutral agent loop, `AgentState`, tool discovery, planning (`plan_call`), confirmations, tool execution, the capture guarantee (`guarantee`, `run_fallback`) | agent behaviour |
+| `src/capture.rs` | the capture guarantee's pieces: `Requirement` (a profile's compiled `require`: tool glob, result globs over text and structured content, `check`), `Fallback`, `title`, `fill` (`{{title}}`, `{{transcript}}`, `{{result:/pointer}}`), `CaptureLog` (persisted in `AgentState::capture`) | capture success criteria, fallback |
 | `src/policy.rs` | `Policies` (allow/confirm/ask/deny/code; argument conditions `when`/`when_any`/`unless` as JSON pointer -> case-insensitive glob; `matched`, `always_denies`) and per-profile `ToolFilter` globs | tool policy rules |
 | `src/authcode.rs` | spoken authorisation codes: `AuthCodes` (keyed HMAC tags, never plain codes; `scan` strips trigger + code into a marker, `scrub` strips code words), normalisation, `decide` (combine whisper and phone scans, lockout), `CodeAuth` ("code X until T") | code detection and redaction |
 | `src/classifier.rs` | Shieldstral approval classifier: `Classifier` (request body, bounded `classify`, health reporting), `document`, `score_from_response`, `Verdict` | automatic approval |
-| `src/tools.rs` | `ToolBackend` trait (`housekeeping`), `McpBackend` (rmcp client; sessions closed when idle `MCP_SESSION_IDLE` or dead, bounded close), `to_defs` (sorted, sanitised names), `check_schema` | MCP integration |
+| `src/tools.rs` | `ToolBackend` trait (`housekeeping`), `McpBackend` (rmcp client; sessions closed when idle `MCP_SESSION_IDLE` or dead, bounded close), `ToolOutput` (text for the model, `structured` for checks), `to_defs` (sorted, sanitised names), `check_schema` | MCP integration |
 | `src/confirm.rs` | `GET /confirm/{token}` page, `POST /confirm/{token}/{approve,deny}` | confirmation UX |
 | `src/notify.rs` | `Notifier` trait, ntfy client (`with_topic` for alerts), `Kind` (incl. `Alert`, `Recovered`), `LogNotifier` | notifications |
 | `src/claude.rs` | thin Anthropic Messages client (headers, usage metrics); legacy re-exports | Anthropic HTTP details |
@@ -320,7 +321,9 @@ outages and pending confirmations resume where they stopped.
       results keep reflecting what the service does. Known differences: no
       MCP servers (fixture tools, scripted results), no tool policies,
       confirmations or classifier approval in the loop, no retry without
-      tools after a 400.
+      tools after a 400, no capture fallback (the capture suite scores
+      create calls with the profile's `require` through
+      `capture::Requirement::check`, but measures the model alone).
     - Expectations use the policy matcher (`Policies::first_match`), so they
       are written like `[[tool_policies]]` rules.
     - Keys come from the environment as in production and never reach
@@ -331,6 +334,41 @@ outages and pending confirmations resume where they stopped.
       (`fixtures_hold_no_obvious_personal_data`). Everything in them is sent
       to the providers being evaluated.
     - CI never calls a real provider: `tests/eval.rs` uses wiremock.
+
+14. **A capture never reports success it can't verify, and never loses the
+    transcript** (`src/capture.rs`, `Agent::guarantee`/`run_fallback` in
+    `src/agent.rs`, `Worker::fail`).
+    - A job of a profile with `require` succeeds only if a call of a
+      `require.tool` tool returned a non-error result that matches
+      `result_matching` (when set) and none of `result_not_matching`. Globs
+      are checked against the result text and its MCP `structuredContent`
+      (MCP for Cloud translates its plan prose; `requiresConfirmation` is in
+      the structured content), before the text is shortened for the model.
+      `Agent::execute` records every call of the required tool in
+      `AgentState::capture` (`saved` / `rejected`).
+    - Otherwise (whatever the model replied: final, refused, gave up, a
+      permanent error) the model's text is never the result. It is audited
+      once as `capture_unverified`, and the guarantee owns the job from then
+      on: later attempts skip the model (`unverified` is set).
+    - The optional fallback runs only if nothing was saved (no duplicates),
+      goes through `plan_call` (profile allow-list, policies: `deny` blocks,
+      `confirm`/`ask` park it for a human, never the classifier; one
+      approval covers its plan and confirm calls; `code` needs the code), is
+      audited as `tool_call` with `"fallback": true` and `approved_by`
+      `fallback`/`human`/`auth_code`, plus `capture_fallback` per step. Its
+      progress is saved after every step.
+    - A fallback that could not reach its server is transient (normal
+      back-off; it starts again from its first call). Anything else that
+      leaves the note unsaved is permanent, and `Worker::fail` notifies
+      "Ringmaster: not saved" with the reason and the whole transcript (not
+      the 160-character `short` quote), for every failure of such a job
+      (max age, panics, quarantine aside) unless `capture.saved` says the
+      note was saved.
+    - `AgentState::capture` is `serde(default)` and skipped when unset: a
+      state saved before the guarantee (or by a profile without `require`)
+      has none and the job behaves exactly as before. Tests: the capture
+      tests at the end of `tests/pipeline.rs` (a fake MCP for Cloud Deck),
+      `capture_records_round_trip_and_old_states_have_none`.
 
 Other behaviour to keep: `GET /confirm/*` never changes state; confirmation
 tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after

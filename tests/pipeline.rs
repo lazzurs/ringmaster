@@ -4040,3 +4040,571 @@ async fn a_recording_with_a_code_is_deleted_even_if_the_job_is_too_old_to_run() 
     assert_eq!(audit_of(h, "audio_deleted").await.len(), 1);
     assert_no_code("database", &database_dump(h));
 }
+
+// ------------------------------------------------- the capture guarantee
+
+/// MCP for Cloud's `deck_create_card` arguments (`CreateCard.php`): there
+/// is no board id, and `confirm` is what makes a write happen.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct CardArgs {
+    #[serde(rename = "stackId")]
+    stack_id: i64,
+    title: String,
+    description: Option<String>,
+    confirm: Option<bool>,
+    confirm_shared: Option<bool>,
+    plan_state: Option<String>,
+}
+
+const PLAN_STATE: &str = "5f1c0de5";
+
+/// A Deck like MCP for Cloud's: a write without `confirm: true` returns a
+/// plan (not an error) and changes nothing. With `needs_plan_state`, the
+/// confirmed call also needs the plan's `plan_state`, and the plan's text
+/// is translated (only its structured content says what it is).
+#[derive(Clone)]
+struct Deck {
+    calls: Arc<Mutex<Vec<Value>>>,
+    cards: Arc<Mutex<Vec<Value>>>,
+    needs_plan_state: bool,
+}
+
+#[tool_router]
+impl Deck {
+    #[tool(description = "Create a card in a stack")]
+    async fn deck_create_card(
+        &self,
+        Parameters(a): Parameters<CardArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.calls.lock().unwrap().push(json!({
+            "stackId": a.stack_id, "title": a.title, "description": a.description,
+            "confirm": a.confirm, "confirm_shared": a.confirm_shared, "plan_state": a.plan_state,
+        }));
+        let confirmed = a.confirm == Some(true)
+            && (!self.needs_plan_state || a.plan_state.as_deref() == Some(PLAN_STATE));
+        if !confirmed {
+            let text = if self.needs_plan_state {
+                "**Criar cartão no Deck**\n\nNada foi alterado. Confirme para executar.".to_string()
+            } else {
+                format!(
+                    "**Create card in Deck**\n\nCreate card in *Inbox* › *Inbox*: **{}**\n\n\
+                     Nothing was changed. Confirm to execute.",
+                    a.title
+                )
+            };
+            let mut r = CallToolResult::success(vec![ContentBlock::text(text)]);
+            r.structured_content = Some(json!({
+                "requiresConfirmation": true,
+                "tool": "deck_create_card",
+                "plan_state": PLAN_STATE,
+            }));
+            return Ok(r);
+        }
+        let mut cards = self.cards.lock().unwrap();
+        let card = json!({
+            "id": 100 + cards.len(),
+            "stackId": a.stack_id,
+            "title": a.title,
+            "description": a.description.unwrap_or_default(),
+        });
+        cards.push(card.clone());
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            serde_json::to_string_pretty(&card).unwrap(),
+        )]))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for Deck {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+}
+
+struct DeckServer {
+    config: McpServerConfig,
+    deck: Deck,
+    _stop: CancellationToken,
+}
+
+/// A free port nothing listens on (yet).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The Deck as MCP server "nextcloud" on `port`.
+async fn start_deck(needs_plan_state: bool, port: u16) -> DeckServer {
+    let deck = Deck {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        cards: Arc::new(Mutex::new(Vec::new())),
+        needs_plan_state,
+    };
+    let ct = CancellationToken::new();
+    let d = deck.clone();
+    let service = StreamableHttpService::new(
+        move || Ok(d.clone()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_cancellation_token(ct.child_token()),
+    );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let stop = ct.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { stop.cancelled().await })
+            .await
+            .unwrap();
+    });
+    DeckServer {
+        config: deck_config(port),
+        deck,
+        _stop: ct,
+    }
+}
+
+fn deck_config(port: u16) -> McpServerConfig {
+    McpServerConfig {
+        name: "nextcloud".into(),
+        url: format!("http://127.0.0.1:{port}/mcp"),
+        ..Default::default()
+    }
+}
+
+const CAPTURE_PROFILE: &str = "[profiles.capture]\ntriggers = [\"single-click-hold\"]\ntools = [\"home/set_light\"]\nsystem_prompt = \"Capture mode.\"\n";
+
+/// The success criteria for MCP for Cloud's Deck.
+const REQUIRE: &str = r#"
+[profiles.capture.require]
+tool = "nextcloud/deck_create_card"
+result_not_matching = ["*Nothing was changed*", "*requiresConfirmation*"]
+"#;
+
+/// The one-call fallback: `confirm: true` on the first call writes.
+const FALLBACK: &str = r#"
+[profiles.capture.require.fallback]
+tool = "nextcloud/deck_create_card"
+arguments = { stackId = 49, title = "{{title}}", description = "{{transcript}}", confirm_shared = true, confirm = true }
+"#;
+
+/// The test config with a capture profile on the Deck: `policies` go
+/// before the `nextcloud/*` allow rule, `require` after the profile.
+fn capture_config(policies: &str, require: &str) -> String {
+    assert!(CONFIG.contains(CAPTURE_PROFILE));
+    let profile = format!(
+        "[profiles.capture]\ntriggers = [\"single-click-hold\"]\ntools = [\"nextcloud/deck_*\"]\n\
+         system_prompt = \"Capture mode.\"\n{require}"
+    );
+    CONFIG
+        .replace(
+            "[profiles.command]",
+            &format!(
+                "{policies}\n[[tool_policies]]\nmatch = \"nextcloud/*\"\npolicy = \"allow\"\n\n[profiles.command]"
+            ),
+        )
+        .replace(CAPTURE_PROFILE, &profile)
+}
+
+/// A long spoken note: notifications usually shorten what the user said.
+const NOTE: &str = "So I was thinking we should probably sort out the gutters before the winter, \
+because last year they overflowed and the wall got damp. Maybe ask next door who they used, and \
+get two quotes before the end of the month so we can compare them properly.";
+
+/// What a small model did in production: the create call returned a plan,
+/// and the model said "Added" anyway (with the note shortened).
+fn plan_then_added() -> Vec<Value> {
+    vec![
+        tool_use_turn(
+            "toolu_c1",
+            "nextcloud__deck_create_card",
+            json!({"stackId": 49, "title": "Gutters", "description": "sort the gutters"}),
+        ),
+        final_turn("Added: Gutters"),
+    ]
+}
+
+async fn capture_harness(config: &str, turns: Vec<Value>, deck: &DeckServer) -> Harness {
+    let cfg = deck.config.clone();
+    harness_config(config, turns, Some(NOTE), move |home| vec![home, cfg]).await
+}
+
+fn cards(d: &DeckServer) -> Vec<Value> {
+    d.deck.cards.lock().unwrap().clone()
+}
+
+fn deck_calls(d: &DeckServer) -> Vec<Value> {
+    d.deck.calls.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_plan_is_not_a_card_and_the_fallback_saves_the_whole_transcript() {
+    let deck = start_deck(false, free_port()).await;
+    let config = capture_config("", &format!("{REQUIRE}{FALLBACK}"));
+    let h = capture_harness(&config, plan_then_added(), &deck).await;
+    run_command(&h, "rec-cap-1", "single-click-hold").await;
+
+    // The model's call only planned; Ringmaster's created the card, with
+    // every word the user said.
+    let calls = deck_calls(&deck);
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0]["confirm"], Value::Null);
+    assert_eq!(calls[1]["confirm"], true);
+    assert_eq!(calls[1]["confirm_shared"], true);
+    let cards = cards(&deck);
+    assert_eq!(cards.len(), 1, "{cards:?}");
+    assert_eq!(cards[0]["stackId"], 49);
+    assert_eq!(cards[0]["description"], NOTE);
+    let title = cards[0]["title"].as_str().unwrap();
+    assert!(title.starts_with("So I was thinking"), "{title}");
+    assert!(title.chars().count() <= 80, "{title}");
+
+    // The model's "Added" never reaches the user.
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0]
+            .body
+            .starts_with("Added by Ringmaster's fallback: \""),
+        "{}",
+        notes[0].body
+    );
+    assert!(notes[0].body.contains(title), "{}", notes[0].body);
+    assert!(
+        !notes[0].body.contains("Added: Gutters"),
+        "{}",
+        notes[0].body
+    );
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+
+    // Audit: why the model's call did not count, the fallback, its call.
+    let unverified = audit_of(&h, "capture_unverified").await;
+    assert_eq!(unverified.len(), 1);
+    let reason = unverified[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("*Nothing was changed*"), "{reason}");
+    assert_eq!(unverified[0]["reply"], "Added: Gutters");
+    let fallback = audit_of(&h, "capture_fallback").await;
+    let outcomes: Vec<&str> = fallback
+        .iter()
+        .map(|f| f["outcome"].as_str().unwrap())
+        .collect();
+    assert_eq!(outcomes, ["saved"]);
+    let tool_calls = audit_of(&h, "tool_call").await;
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0]["outcome"], "ok");
+    assert!(tool_calls[0].get("fallback").is_none());
+    assert_eq!(tool_calls[1]["approved_by"], "fallback");
+    assert_eq!(tool_calls[1]["fallback"], true);
+    assert_eq!(tool_calls[1]["outcome"], "ok");
+    assert_eq!(tool_calls[1]["input"]["description"], NOTE);
+
+    // Saved state records who saved it.
+    let state = serde_json::to_value(job.agent_state.unwrap()).unwrap();
+    assert_eq!(state["capture"]["saved"][0]["by"], "fallback");
+}
+
+#[tokio::test]
+async fn without_a_fallback_the_job_fails_with_the_whole_transcript() {
+    let deck = start_deck(false, free_port()).await;
+    let config = capture_config("", REQUIRE);
+    let h = capture_harness(&config, plan_then_added(), &deck).await;
+    run_command(&h, "rec-cap-2", "single-click-hold").await;
+
+    assert!(cards(&deck).is_empty());
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Error);
+    assert_eq!(notes[0].title, "Ringmaster: not saved");
+    let body = &notes[0].body;
+    assert!(body.starts_with("Not saved: "), "{body}");
+    assert!(body.contains("*Nothing was changed*"), "{body}");
+    // Every word, not a shortened quote.
+    assert!(body.ends_with(&format!("You said: \"{NOTE}\"")), "{body}");
+    assert!(!body.contains("Added: Gutters"), "{body}");
+    assert_eq!(audit_of(&h, "capture_unverified").await.len(), 1);
+    assert!(audit_of(&h, "capture_fallback").await.is_empty());
+    assert_eq!(audit_of(&h, "job_failed").await.len(), 1);
+}
+
+#[tokio::test]
+async fn the_fallback_follows_a_plan_with_the_confirm_call() {
+    // This Deck wants the plan's plan_state back and answers in Portuguese:
+    // only the plan's structured content says it is a plan.
+    let deck = start_deck(true, free_port()).await;
+    let two_step = r#"
+[profiles.capture.require.fallback]
+tool = "nextcloud/deck_create_card"
+arguments = { stackId = 49, title = "{{title}}", description = "{{transcript}}" }
+
+[profiles.capture.require.fallback.confirm]
+when_result_matching = ["*requiresConfirmation*"]
+arguments = { confirm = true, plan_state = "{{result:/plan_state}}" }
+"#;
+    let config = capture_config("", &format!("{REQUIRE}{two_step}"));
+    // The model never calls the tool and claims success.
+    let h = capture_harness(&config, vec![final_turn("Added: Gutters")], &deck).await;
+    run_command(&h, "rec-cap-3", "single-click-hold").await;
+
+    let calls = deck_calls(&deck);
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0]["confirm"], Value::Null);
+    assert_eq!(calls[0]["plan_state"], Value::Null);
+    // The confirm call repeats the first call's arguments.
+    assert_eq!(calls[1]["confirm"], true);
+    assert_eq!(calls[1]["plan_state"], PLAN_STATE);
+    assert_eq!(calls[1]["description"], NOTE);
+    assert_eq!(calls[1]["title"], calls[0]["title"]);
+    assert_eq!(cards(&deck).len(), 1);
+
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].body.starts_with("Added by Ringmaster's fallback"),
+        "{}",
+        notes[0].body
+    );
+    let reason = audit_of(&h, "capture_unverified").await[0]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        reason.contains("made no nextcloud/deck_create_card call"),
+        "{reason}"
+    );
+    let outcomes: Vec<String> = audit_of(&h, "capture_fallback")
+        .await
+        .iter()
+        .map(|f| format!("{}:{}", f["step"], f["outcome"].as_str().unwrap()))
+        .collect();
+    assert_eq!(outcomes, ["0:planned", "1:saved"]);
+    let steps: Vec<Value> = audit_of(&h, "tool_call")
+        .await
+        .iter()
+        .map(|c| c["step"].clone())
+        .collect();
+    assert_eq!(steps, [json!(0), json!(1)]);
+}
+
+#[tokio::test]
+async fn the_fallback_never_runs_after_a_real_success() {
+    let deck = start_deck(false, free_port()).await;
+    let config = capture_config("", &format!("{REQUIRE}{FALLBACK}"));
+    let h = capture_harness(
+        &config,
+        vec![
+            tool_use_turn(
+                "toolu_c1",
+                "nextcloud__deck_create_card",
+                json!({"stackId": 49, "title": "Gutters", "description": NOTE, "confirm": true}),
+            ),
+            final_turn("Added: Gutters"),
+        ],
+        &deck,
+    )
+    .await;
+    run_command(&h, "rec-cap-4", "single-click-hold").await;
+
+    assert_eq!(deck_calls(&deck).len(), 1);
+    assert_eq!(cards(&deck).len(), 1, "no duplicate card");
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert_eq!(notes[0].body, "Added: Gutters");
+    assert!(audit_of(&h, "capture_unverified").await.is_empty());
+    assert!(audit_of(&h, "capture_fallback").await.is_empty());
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+    let state = serde_json::to_value(job.agent_state.unwrap()).unwrap();
+    assert_eq!(state["capture"]["saved"][0]["by"], "model");
+}
+
+#[tokio::test]
+async fn a_deny_policy_blocks_the_fallback() {
+    let deck = start_deck(false, free_port()).await;
+    // The model's own call is allowed; the fallback's confirm_shared is not.
+    let deny = r#"
+[[tool_policies]]
+match = "nextcloud/deck_create_card"
+when = { "/confirm_shared" = "true" }
+policy = "deny"
+"#;
+    let config = capture_config(deny, &format!("{REQUIRE}{FALLBACK}"));
+    let h = capture_harness(&config, plan_then_added(), &deck).await;
+    run_command(&h, "rec-cap-5", "single-click-hold").await;
+
+    assert_eq!(deck_calls(&deck).len(), 1, "only the model's plan ran");
+    assert!(cards(&deck).is_empty());
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].title, "Ringmaster: not saved");
+    assert!(notes[0].body.contains("policy blocks"), "{}", notes[0].body);
+    assert!(notes[0].body.contains(NOTE), "{}", notes[0].body);
+    let fallback = audit_of(&h, "capture_fallback").await;
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0]["outcome"], "blocked");
+    let tool_calls = audit_of(&h, "tool_call").await;
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[1]["fallback"], true);
+    assert_eq!(tool_calls[1]["outcome"], "not_run");
+    assert_eq!(tool_calls[1]["approved"], false);
+}
+
+#[tokio::test]
+async fn an_ask_policy_parks_the_fallback_for_approval() {
+    let deck = start_deck(false, free_port()).await;
+    let ask = r#"
+[[tool_policies]]
+match = "nextcloud/deck_create_card"
+when = { "/confirm_shared" = "true" }
+policy = "ask"
+"#;
+    let config = capture_config(ask, &format!("{REQUIRE}{FALLBACK}"));
+    let h = capture_harness(&config, plan_then_added(), &deck).await;
+    run_command(&h, "rec-cap-6", "single-click-hold").await;
+
+    assert!(cards(&deck).is_empty(), "not before approval");
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::AwaitingConfirmation);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].body.contains("nextcloud/deck_create_card"),
+        "{}",
+        notes[0].body
+    );
+    assert!(
+        notes[0].body.contains("capture fallback"),
+        "{}",
+        notes[0].body
+    );
+    let (status, _) = send(
+        &h,
+        Request::post(button(&notes[0], true))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    tick(&h).await;
+
+    assert_eq!(cards(&deck).len(), 1);
+    assert_eq!(cards(&deck)[0]["description"], NOTE);
+    // The model is not asked again.
+    assert_eq!(h.claude_seen.lock().unwrap().len(), 2);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].body.starts_with("Added by Ringmaster's fallback"),
+        "{}",
+        notes[0].body
+    );
+    let fallback = audit_of(&h, "tool_call")
+        .await
+        .into_iter()
+        .filter(|c| c["fallback"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0]["approved_by"], "human");
+    let outcomes: Vec<String> = audit_of(&h, "capture_fallback")
+        .await
+        .iter()
+        .map(|f| f["outcome"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(outcomes, ["awaiting_confirmation", "saved"]);
+}
+
+#[tokio::test]
+async fn an_unreachable_deck_is_retried_and_never_reported_as_added() {
+    // Nothing listens on the Deck's port yet.
+    let port = free_port();
+    let config = capture_config("", &format!("{REQUIRE}{FALLBACK}"));
+    let h = harness_config(
+        &config,
+        // With no Deck tools, the model still claims success.
+        vec![final_turn("Added: Gutters")],
+        Some(NOTE),
+        move |home| vec![home, deck_config(port)],
+    )
+    .await;
+    run_command(&h, "rec-cap-7", "single-click-hold").await;
+
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Queued, "transient: retried later");
+    let notes = h.notes.take();
+    assert!(
+        notes
+            .iter()
+            .all(|n| n.kind != Kind::Result && !n.body.contains("Added")),
+        "{notes:?}"
+    );
+    assert_eq!(audit_of(&h, "retry_scheduled").await.len(), 1);
+    let fallback = audit_of(&h, "capture_fallback").await;
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback[0]["outcome"], "unreachable");
+    let reason = audit_of(&h, "capture_unverified").await[0]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        reason.contains("nextcloud tool server was unavailable"),
+        "{reason}"
+    );
+
+    // The Deck comes back; the retry saves the note without asking the
+    // model again.
+    let deck = start_deck(false, port).await;
+    let conn = rusqlite::Connection::open(&h.db_path).unwrap();
+    conn.execute("UPDATE jobs SET next_attempt_at = ?1", [now() - 1])
+        .unwrap();
+    tick(&h).await;
+
+    assert_eq!(cards(&deck).len(), 1);
+    assert_eq!(cards(&deck)[0]["description"], NOTE);
+    assert_eq!(h.claude_seen.lock().unwrap().len(), 1);
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert!(
+        notes[0].body.starts_with("Added by Ringmaster's fallback"),
+        "{}",
+        notes[0].body
+    );
+    assert_eq!(
+        audit_of(&h, "capture_unverified").await.len(),
+        1,
+        "audited once"
+    );
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+}
+
+#[tokio::test]
+async fn profiles_without_require_report_the_reply_as_before() {
+    let deck = start_deck(false, free_port()).await;
+    let config = capture_config("", "");
+    let h = capture_harness(&config, plan_then_added(), &deck).await;
+    run_command(&h, "rec-cap-8", "single-click-hold").await;
+
+    // No guarantee: the model's word is the result, as it always was.
+    assert_eq!(deck_calls(&deck).len(), 1);
+    assert!(cards(&deck).is_empty());
+    let notes = h.notes.take();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].kind, Kind::Result);
+    assert_eq!(notes[0].body, "Added: Gutters");
+    let job = h.db.get_job(1).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Done);
+    let state = serde_json::to_value(job.agent_state.unwrap()).unwrap();
+    assert!(state.get("capture").is_none(), "{state}");
+    assert!(audit_of(&h, "capture_unverified").await.is_empty());
+}

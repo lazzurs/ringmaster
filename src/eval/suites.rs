@@ -14,6 +14,7 @@ use super::fixtures::{
 use super::judge;
 use super::{Call, ModelSpec, Row, Sink, Suite, Usage};
 use crate::agent::{self, Context};
+use crate::capture::{Check, Requirement};
 use crate::classifier::{Classifier, ProposedCall};
 use crate::config::Config;
 use crate::llm::{ChatRequest, Llms, StopKind, ToolResult};
@@ -144,11 +145,14 @@ pub fn agent_outcome(decided: Option<CallScore>, end: &End, allow_no_call: bool)
     }
 }
 
-/// A capture case's outcome, flags and a short explanation.
+/// A capture case's outcome, flags and a short explanation. With the
+/// capture profile's `require`, a create call counts only if its result
+/// meets it (production's check), so a plan is not a card.
 pub fn capture_outcome(
     suite: &CaptureSuite,
     create: &MatchSet,
     inbox: &MatchSet,
+    require: Option<&Requirement>,
     case: &CaptureCase,
     conv: &Conversation,
 ) -> (String, Vec<String>, String) {
@@ -163,6 +167,12 @@ pub fn capture_outcome(
         .calls()
         .filter(|c| c.known && c.invalid.is_none() && c.result_error == Some(false))
         .filter(|c| create.matches(&c.tool, &c.arguments))
+        .filter(|c| {
+            require.is_none_or(|r| {
+                let text = c.result_text.as_deref().unwrap_or_default();
+                !matches!(r.check(&c.tool, text, None, false), Check::Rejected(_))
+            })
+        })
         .collect();
     let final_text = match &conv.end {
         End::Final(t) => t.as_str(),
@@ -388,6 +398,7 @@ impl<'a> Runner<'a> {
                                     script.answer(&call.tool, &call.arguments)
                                 };
                                 call.result_error = Some(is_error);
+                                call.result_text = Some(text.clone());
                                 ToolResult {
                                     id: c.id.clone(),
                                     name: c.name.clone(),
@@ -565,6 +576,11 @@ impl<'a> Runner<'a> {
         let setup = self.setup(profile_name, n)?;
         let create = MatchSet::new(std::slice::from_ref(&suite.create))?;
         let inbox = MatchSet::new(std::slice::from_ref(&suite.inbox))?;
+        let require = profile
+            .require
+            .as_ref()
+            .map(|r| Requirement::new(r, &profile.tools))
+            .transpose()?;
         for case in &suite.cases {
             let script = Script::new(&case.results, &fx.results)?;
             for r in 1..=repeat {
@@ -580,7 +596,8 @@ impl<'a> Runner<'a> {
                         |_| false,
                     )
                     .await;
-                let (outcome, flags, detail) = capture_outcome(suite, &create, &inbox, case, &conv);
+                let (outcome, flags, detail) =
+                    capture_outcome(suite, &create, &inbox, require.as_ref(), case, &conv);
                 let pass = outcome == "good";
                 self.write_conversation(
                     Suite::Capture,
@@ -943,6 +960,16 @@ mod tests {
     }
 
     fn capture(expect: CaptureExpect, transcript: &str, calls: Vec<Call>, end: End) -> String {
+        capture_with(None, expect, transcript, calls, end)
+    }
+
+    fn capture_with(
+        require: Option<&Requirement>,
+        expect: CaptureExpect,
+        transcript: &str,
+        calls: Vec<Call>,
+        end: End,
+    ) -> String {
         let suite = capture_suite();
         let create = MatchSet::new(std::slice::from_ref(&suite.create)).unwrap();
         let inbox = MatchSet::new(std::slice::from_ref(&suite.inbox)).unwrap();
@@ -961,7 +988,7 @@ mod tests {
             }],
             end,
         };
-        capture_outcome(&suite, &create, &inbox, &case, &conv).0
+        capture_outcome(&suite, &create, &inbox, require, &case, &conv).0
     }
 
     fn created(board: u64, stack: u64, title: &str, failed: bool) -> Call {
@@ -972,6 +999,65 @@ mod tests {
                 json!({"board_id": board, "stack_id": stack, "title": title}),
             )
         }
+    }
+
+    #[test]
+    fn with_require_a_plan_is_not_a_card() {
+        use CaptureExpect::*;
+        let require = Requirement::new(
+            &crate::config::RequireConfig {
+                tool: "nextcloud/deck_create_card".into(),
+                result_matching: vec![],
+                result_not_matching: vec!["*Nothing was changed*".into()],
+                fallback: Option::None,
+            },
+            &[],
+        )
+        .unwrap();
+        let said = "buy batteries for the smoke alarm";
+        let plan = Call {
+            result_text: Some(
+                "Create card: Buy batteries. Nothing was changed. Confirm to execute.".into(),
+            ),
+            ..created(1, 11, "Buy batteries", false)
+        };
+        let mut confirmed = created(1, 11, "Buy batteries", false);
+        confirmed.arguments["confirm"] = json!(true);
+        confirmed.result_text = Some("{\"id\": 900}".into());
+        let fin = |t: &str| End::Final(t.into());
+        // "Added" after the plan alone is a false success...
+        assert_eq!(
+            capture_with(
+                Some(&require),
+                Card,
+                said,
+                vec![plan.clone()],
+                fin("Added: Buy batteries")
+            ),
+            "false_success"
+        );
+        // ...which the scoring without `require` cannot see.
+        assert_eq!(
+            capture_with(
+                Option::None,
+                Card,
+                said,
+                vec![plan.clone()],
+                fin("Added: Buy batteries")
+            ),
+            "good"
+        );
+        // Plan, then the confirmed call: one card.
+        assert_eq!(
+            capture_with(
+                Some(&require),
+                Card,
+                said,
+                vec![plan, confirmed],
+                fin("Added: Buy batteries")
+            ),
+            "good"
+        );
     }
 
     #[test]

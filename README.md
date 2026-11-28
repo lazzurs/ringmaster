@@ -55,7 +55,10 @@ Docker Compose.
    buttons, `code` runs only with a spoken authorisation code. Tools that no
    rule matches need confirmation.
 5. **Result**. The final answer, any error, and any delay are sent through
-   ntfy. Everything is in the audit log.
+   ntfy. Everything is in the audit log. A profile can say which tool call
+   makes a job a success ([capture reliability](#capture-reliability)): then
+   the model's word is not enough, and a note that was not saved is never
+   reported as added.
 
 Jobs are durable: a restart, a sleeping Mac, an API outage or a pending
 confirmation all resume from the last saved step.
@@ -366,6 +369,11 @@ Each can also be given as `<NAME>_FILE` pointing at a file.
 | `[profiles.<name>]` `triggers`, `system_prompt`, `tools` | | gesture → prompt + tool allow-list (globs; `*/*` = all) |
 | `[profiles.<name>]` `provider`, `model`, `effort`, `max_iterations`, `job_max_age_secs` | | per-profile overrides; a profile with a `provider` other than the default needs a `model` (here or in `[llm.<provider>]`) |
 | `[profiles.<name>]` `approval_mode` | `approval.mode` | `manual` `shadow` `classifier` for this profile |
+| `[profiles.<name>.require]` `tool` | none (no guarantee) | the job succeeds only if a call of this tool (glob over `server/tool`, as in `[[tool_policies]]`) met the criteria below; see [Capture reliability](#capture-reliability) |
+| `[profiles.<name>.require]` `result_matching` / `result_not_matching` | `[]` / `[]` | globs over the call's result (its text, and its structured content as JSON; case-insensitive, `*` matches anything): one of the first must match (when given) and none of the second may. The result must not be an error |
+| `[profiles.<name>.require.fallback]` `tool`, `arguments` | none | Ringmaster's own call when the criteria are not met: one tool (`server/tool`, matching `require.tool` and the profile's `tools`), with `{{title}}` and `{{transcript}}` filled in string arguments |
+| `[profiles.<name>.require.fallback]` `title_max_chars` | `80` | longest `{{title}}`: the transcript's first line or sentence, cut at a word boundary |
+| `[profiles.<name>.require.fallback.confirm]` `when_result_matching`, `arguments` | none | a second call when the first result matches (a plan): the first call's arguments plus these, with `{{result:/pointer}}` from the first result (structured content, or the text as JSON) |
 | `approval.mode` | `manual` | who approves `confirm` calls: `manual` (you), `shadow` (you, with the classifier's verdict recorded), `classifier` (the classifier for clear passes, you for the rest); see [Automatic approval](#automatic-approval-shieldstral) |
 | `approval.base_url` | none; required unless every mode is `manual` | classifier server (llama-server, vLLM, SGLang), without `/v1` |
 | `approval.model` | `mistralai/Shieldstral-1.0-3B` | model name in the request (vLLM checks it, llama-server ignores it) |
@@ -419,6 +427,91 @@ minute up to 10 times with the same delivery id; Ringmaster acknowledges
 repeats without reprocessing them. Ringmaster answers `4xx` for requests it
 will never accept (bad signature, unknown gesture), which the app does not
 retry.
+
+## Capture reliability
+
+A capture must never say "Added" for a note that was not saved. Small local
+models sometimes do: in production, MCP for Cloud's `deck_create_card`
+returned a plan ("Nothing was changed. Confirm to execute.") instead of a
+card, the model replied "Added: ...", and the note was gone. A profile's
+`require` makes Ringmaster check for itself:
+
+```toml
+[profiles.capture.require]
+tool = "nextcloud/deck_create_card"
+# MCP for Cloud plans every write sent without confirm: true. The prose of a
+# plan is translated into the user's language; requiresConfirmation is not.
+result_not_matching = ["*requiresConfirmation*", "*Nothing was changed*"]
+
+# Optional: Ringmaster files the note itself when the model did not.
+[profiles.capture.require.fallback]
+tool = "nextcloud/deck_create_card"
+arguments = { stackId = 49, title = "{{title}}", description = "{{transcript}}", confirm_shared = true, confirm = true }
+```
+
+A job on this profile succeeds only if at least one call of a `require.tool`
+tool returned a result that is not an error, matches `result_matching` (if
+given) and none of `result_not_matching`. The model's reply does not count.
+When no call did (the model never called the tool, the call failed or only
+planned, the model gave up, refused or was cut off):
+
+* **With a `fallback`**, Ringmaster makes that call itself: `{{title}}` is
+  the transcript's first line or sentence, cut at a word boundary to
+  `title_max_chars`, and `{{transcript}}` is everything the user said. If
+  its result meets the criteria, the job succeeds and the notification says
+  `Added by Ringmaster's fallback: "<title>"`. For a server that plans first
+  and writes on a second call, add `[profiles.<name>.require.fallback.confirm]`
+  (below).
+* **Without one, or if the fallback fails too**, the job fails with
+  `Ringmaster: not saved`, why, and the whole transcript (`You said:
+  "..."`), so you can file it by hand. If the fallback could not reach the
+  tool server, the job is retried with the usual back-off instead (and the
+  model is not asked again); at `job_max_age_secs` it fails the same way.
+
+The model's own text is never the result when the criteria are not met; it
+is kept in the audit log (`capture_unverified`).
+
+The fallback is an ordinary tool call: it must be in the profile's `tools`,
+the [tool policies](#argument-conditions) apply to its arguments (`deny`
+blocks it and the job fails as above; `confirm` and `ask` send an
+Approve/Deny request marked as the capture fallback, never to the
+classifier; one approval covers both calls of a plan and confirm), and it is
+audited as a `tool_call` with `"fallback": true` and `approved_by:
+"fallback"` (or `human` after an approval). It never runs when a call
+already met the criteria, so it cannot make a duplicate card. Like every
+tool call it is at-least-once: a crash between the call and saving its
+result can repeat it.
+
+Note what this means for notes the model decides to drop: with `require`, a
+reply that created nothing ("Nothing added." for a cancelled request) is not
+a success either. Without a fallback you get the transcript back in a "not
+saved" notification; with one, it is filed anyway. Losing a note is worse
+than an extra card.
+
+**MCP for Cloud** (`sintax-tech/mcp-for-nextcloud`, checked at 1.4.0): every
+write tool returns a plan, not an error, unless the call has `confirm: true`
+(`WriteGate`). With `confirm: true`, `deck_create_card` creates the card in
+one call; a board owned by someone else also needs `confirm_shared: true`.
+Only a call with `labels` needs the plan's `plan_state` too. The tool takes
+`stackId` (no board id), `title` and `description`, and returns the card as
+JSON. The plan's text is in the user's Nextcloud language, but its structured
+content always has `"requiresConfirmation": true`, and Ringmaster checks the
+globs against both. For a two-step server, or `labels`:
+
+```toml
+[profiles.capture.require.fallback]
+tool = "nextcloud/deck_create_card"
+arguments = { stackId = 49, title = "{{title}}", description = "{{transcript}}", labels = ["inbox"] }
+
+[profiles.capture.require.fallback.confirm]
+when_result_matching = ["*requiresConfirmation*"]
+arguments = { confirm = true, confirm_shared = true, plan_state = "{{result:/plan_state}}" }
+```
+
+A string that is exactly `{{result:/pointer}}` takes that value with its
+type; a pointer the plan does not have fails the fallback. Profiles without
+`require` behave exactly as before, and so do jobs started before it was
+added.
 
 ## Cloudflare Tunnel and Access
 
@@ -853,7 +946,9 @@ label), `ringmaster_tool_calls_total{outcome}`,
 `ringmaster_shadow_comparisons_total{result}` and the classifier's requests
 as `ringmaster_llm_requests_total{provider="classifier",status}`, and for
 spoken codes `ringmaster_auth_code_failures_total` and
-`ringmaster_auth_code_lockouts_total`.
+`ringmaster_auth_code_lockouts_total`, and for the capture guarantee
+`ringmaster_captures_total{outcome}` (`verified`, `unverified`, then
+`fallback` or `not_saved`).
 
 Health gauges (refreshed by the watchdog and on every scrape):
 `ringmaster_db_healthy` (0/1), `ringmaster_db_errors_total{class}`,
@@ -936,7 +1031,11 @@ conversation; `confirmations` the hashed one-time tokens and decisions;
 `claude_response` (stop reason, tool calls, usage; `llm_response` with the
 provider and finish reason for the other providers), `tool_call` (input,
 policy action, result, `approved_by` `human`, `classifier` or `auth_code`
-with the code's name in `auth_code`), `auth_code` (status `accepted` /
+with the code's name in `auth_code`, or `fallback` with `"fallback": true`
+for the capture fallback), `capture_unverified` (a job of a profile with
+`require` that no call satisfied: why, the model's reply, the calls that did
+not count), `capture_fallback` (each step: `planned`, `saved`, `not_saved`,
+`blocked`, `unreachable`, `awaiting_confirmation`, `declined`), `auth_code` (status `accepted` /
 `rejected` / `locked_out`, the codes authorised and until when, wrong codes
 counted: names and counts, never the words), `auth_code_lockout`,
 `audio_deleted` (a recording that held a code, deleted after transcription),
@@ -974,6 +1073,9 @@ docker compose cp ringmaster:/data/ringmaster.db /tmp/ && sqlite3 /tmp/ringmaste
   order; a stuck job then delays the rest by up to `attempt_timeout_secs`.
 * The transcript is untrusted input. The capture profile only has Deck
   tools, so even "unlock the door" said in capture mode becomes a card.
+* With `require`, a capture never reports a success Ringmaster could not
+  verify, and a note that was not saved comes back to you in full
+  ([Capture reliability](#capture-reliability)).
 * The approval classifier is a convenience, not a safety boundary: it was
   not trained on tool calls and can be wrong or talked round. Keep
   destructive tools on `deny` and security-relevant ones on `ask`, and start
