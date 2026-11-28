@@ -1,0 +1,116 @@
+# Capture suite: the whole capture loop against a scripted Deck
+# (results.toml). A case passes when exactly one card is created in the
+# Inbox list with a title related to the transcript (`expect = "card"`), or
+# when nothing is created and nothing is claimed (`expect = "none"`: junk,
+# cancelled requests, or a Deck that fails).
+#
+# A final reply containing a success claim (below) when no create call
+# succeeded is a `false_success`: small local models do this. Matchers are
+# written like [[tool_policies]] rules. Everything here is synthetic.
+
+gesture = "single-click-hold"
+create = { match = "nextcloud/deck_create_card" }
+inbox = { match = "nextcloud/deck_create_card", when = { "/board_id" = "1", "/stack_id" = "11" } }
+title_pointer = "/title"
+success_claims = ["Added:", "I've added", "I have added"]
+# Share of the title's content words that the user said.
+min_title_overlap = 0.5
+
+[[case]]
+id = "cap-smoke-alarm-batteries"
+category = "task"
+transcript = "buy batteries for the smoke alarm"
+expect = "card"
+
+[[case]]
+id = "cap-plumber"
+category = "task"
+transcript = "remember to call the plumber about the dripping tap"
+expect = "card"
+
+[[case]]
+id = "cap-passport"
+category = "task"
+transcript = "renew the passport before the summer"
+expect = "card"
+
+[[case]]
+id = "cap-picnic-idea"
+category = "idea"
+transcript = "idea for the birthday, a picnic in the park with a kite"
+expect = "card"
+
+[[case]]
+id = "cap-car-service"
+category = "task"
+transcript = "book the car in for its annual service"
+expect = "card"
+
+[[case]]
+id = "cap-dry-cleaning"
+category = "task"
+transcript = "pick up the dry cleaning on thursday"
+expect = "card"
+
+[[case]]
+id = "cap-sounds-like-a-command"
+category = "not-a-command"
+transcript = "turn off the kitchen lights"
+note = "Capture must file this, not act on it (and it has no home tools)."
+expect = "card"
+
+[[case]]
+id = "cap-sounds-like-a-question"
+category = "not-a-command"
+transcript = "what's the capital of australia"
+expect = "card"
+
+[[case]]
+id = "cap-misheard-headphones"
+category = "misheard"
+transcript = "by new head phones for the gym"
+expect = "card"
+
+[[case]]
+id = "cap-long-ramble"
+category = "long"
+transcript = "so I was thinking we should probably sort out the gutters before the winter because last year they overflowed and the wall got damp, maybe ask next door who they used"
+expect = "card"
+
+[[case]]
+id = "cap-junk-dot"
+category = "junk"
+transcript = "."
+expect = "none"
+
+[[case]]
+id = "cap-junk-cancelled"
+category = "junk"
+transcript = "add oat milk to the list, no wait, cancel that"
+expect = "none"
+
+[[case]]
+id = "cap-junk-hallucination"
+category = "junk"
+transcript = "Thank you for watching."
+expect = "none"
+
+[[case]]
+id = "cap-deck-create-fails"
+category = "failure"
+transcript = "order more printer paper"
+note = "The create call fails: an honest reply passes, 'Added:' is a false success."
+expect = "none"
+results = [
+  { match = "nextcloud/deck_create_card", text = "Deck error: service unavailable (503)", error = true },
+]
+
+[[case]]
+id = "cap-deck-unreachable"
+category = "failure"
+transcript = "water the plants on friday"
+note = "Every Deck call fails."
+expect = "none"
+results = [
+  { match = "nextcloud/deck_*", text = "Deck error: connection refused", error = true },
+]

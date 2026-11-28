@@ -26,7 +26,7 @@ outages and pending confirmations resume where they stopped.
 
 | Path | What lives there | Change it for |
 |---|---|---|
-| `src/main.rs` | CLI: `serve`, `healthcheck`, `check-config`; logging setup; the runtime (built by hand so `shutdown_timeout` drops stuck blocking threads) | new subcommands, `check-config` output |
+| `src/main.rs` | CLI: `serve`, `healthcheck`, `check-config`, `eval`; logging setup; the runtime (built by hand so `shutdown_timeout` drops stuck blocking threads) | new subcommands, `check-config` output |
 | `src/lib.rs` | `serve()`: wires config, secrets, DB (`open_db` retries and alerts instead of exiting), notifier and alert notifier, LLMs, MCP backend, worker, watchdog, HTTP; `run_service()`: runs them and shuts down within `server.shutdown_grace_secs` | start-up wiring, shutdown |
 | `src/health.rs` | `Health` (heartbeats, jobs in flight, failures, `BlockingTracker`, gauges, `/healthz` reasons), `Condition`s, `AlertBook` (debounce, `alerts.json`), `Alerter`, `Watchdog` | alerts, health, gauges |
 | `src/config.rs` | TOML structs (`deny_unknown_fields`), defaults, validation, `Secrets::from_env`, `secret_from_env`, `mcp_headers`, provider resolution (`provider_settings`, `profile_llm`) | any config key |
@@ -49,6 +49,14 @@ outages and pending confirmations resume where they stopped.
 | `src/llm/anthropic.rs` | Anthropic adapter: request body, cache breakpoints, fallbacks, `sanitize_fallback` | Claude request/response shape |
 | `src/llm/chat.rs` | OpenAI-style adapter with a `Dialect` per provider (OpenAI, Mistral, OpenRouter, Ollama native) | other providers' shapes |
 | `src/llm/transport.rs` | shared JSON POST with retries, quota detection, error formatting | retry rules |
+| `src/eval/mod.rs` | `ringmaster eval`: `Options`, `ModelSpec` (`provider:model`, resolved like a profile), `Row` (one per request, `results.jsonl`), `Sink` (redacts every key), `run`, `offered_tools` (fixtures + distractors through `agent::prepare_tools`) | the eval CLI, results format |
+| `src/eval/fixtures.rs` | fixture formats and checks: `Matcher`/`MatchSet` (policy-rule syntax, matched by `Policies::first_match`), `Script` (scripted tool results, `{{/pointer}}` templates), agent/capture/judge suites | fixture formats |
+| `src/eval/suites.rs` | `Runner::converse` (production first message, adapters and error results, scripted tools), agent scoring (`score_call`, `turn_outcome`), `capture_outcome` (false success, junk cards), judge and classifier runs, cold/warm | scoring |
+| `src/eval/judge.rs` | `JUDGE_SYSTEM_PROMPT` (the one place for a future LLM-judge mode), `judge_message` (the classifier's `document`), `parse_judge_reply` (first JSON object) | judge prompt |
+| `src/eval/stats.rs`, `src/eval/report.rs` | AUC, best cut-off and margin, percentiles, title overlap; `report.md` | report |
+| `eval/cases/` | synthetic fixtures: `tools.json`, `distractors.json`, `profiles.toml`, `results.toml`, `agent.toml`, `capture.toml`, `judge.toml` | eval cases |
+| `tests/eval.rs` | eval against wiremock OpenAI, Ollama, Anthropic and classifier servers; fixture and personal-data checks | eval behaviour |
+| `docs/model-evaluation.md` | user guide for `ringmaster eval` | eval docs |
 | `tests/pipeline.rs` | end-to-end tests: signed webhook to notification, real rmcp server, wiremock model APIs | any behaviour change |
 | `tests/fixtures/tone-1s.m4a` | real AAC-LC recording for decoder tests | |
 | `deploy/docker-compose.example.yml` | reference deployment (ringmaster, cloudflared, MCP servers on an internal network) | deployment changes |
@@ -114,7 +122,7 @@ outages and pending confirmations resume where they stopped.
    in `AgentState` when the job starts and never change for that job.
 3. **Prompt caching.** Volatile context (current time, recording time,
    gesture, transcript source, unavailable servers, transcript) goes only in
-   the first user message (`Agent::context_text`), never in the system prompt
+   the first user message (`agent::context_text`), never in the system prompt
    or tool definitions. Tool lists are sorted (`tools::to_defs`). Anthropic
    puts a cache breakpoint after the system prompt plus automatic caching of
    the tail (`Anthropic::body`).
@@ -300,6 +308,30 @@ outages and pending confirmations resume where they stopped.
       the database dump, model and classifier requests and notifications;
       `tests/log_redaction.rs` checks the logs.
 
+13. **The eval uses production request code, and its fixtures stay
+    synthetic** (`src/eval/`, `eval/cases/`).
+    - Every eval request goes through the real adapters (`Llms`,
+      `ChatModel::complete`, `Classifier::classify`) with the production
+      system prompt (`agent::system_prompt`), first message
+      (`agent::context_text`), tool list (`agent::prepare_tools`: schema
+      check, profile filter, `to_defs` sorting) and error results
+      (`agent::unknown_tool_result`, `agent::malformed_arguments_result`).
+      Change those helpers rather than copying their logic into the eval, so
+      results keep reflecting what the service does. Known differences: no
+      MCP servers (fixture tools, scripted results), no tool policies,
+      confirmations or classifier approval in the loop, no retry without
+      tools after a 400.
+    - Expectations use the policy matcher (`Policies::first_match`), so they
+      are written like `[[tool_policies]]` rules.
+    - Keys come from the environment as in production and never reach
+      `results.jsonl` or `report.md` (`Sink` redacts every line;
+      `agent_suite_scores_calls_through_the_openai_adapter` checks it).
+    - Fixtures are invented: no real devices, entity ids, boards, names,
+      places, transcripts, IP or e-mail addresses
+      (`fixtures_hold_no_obvious_personal_data`). Everything in them is sent
+      to the providers being evaluated.
+    - CI never calls a real provider: `tests/eval.rs` uses wiremock.
+
 Other behaviour to keep: `GET /confirm/*` never changes state; confirmation
 tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
 `confirmation_ttl_secs` (no answer counts as deny). Jobs older than
@@ -353,6 +385,8 @@ tokens are 256-bit, stored hashed (`hash_token`), single use, and expire after
   volumes or services.
 - `docs/mac-transcription.md` for anything about the whisper-server contract,
   `docs/mac-shieldstral.md` for the classifier server contract.
+- `docs/model-evaluation.md` for anything about `ringmaster eval`, its
+  fixtures or its report.
 
 ## Contributing and releases
 

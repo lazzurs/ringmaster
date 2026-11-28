@@ -1,0 +1,864 @@
+[
+  {
+    "server": "calendar",
+    "name": "list_events",
+    "description": "List calendar events between two dates.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "Start date, YYYY-MM-DD."
+        },
+        "end": {
+          "type": "string",
+          "description": "End date, YYYY-MM-DD."
+        }
+      },
+      "required": [
+        "start"
+      ]
+    }
+  },
+  {
+    "server": "calendar",
+    "name": "create_event",
+    "description": "Create a calendar event.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Event title."
+        },
+        "start": {
+          "type": "string",
+          "description": "Start, ISO 8601."
+        },
+        "end": {
+          "type": "string",
+          "description": "End, ISO 8601."
+        }
+      },
+      "required": [
+        "title",
+        "start"
+      ]
+    }
+  },
+  {
+    "server": "calendar",
+    "name": "delete_event",
+    "description": "Delete a calendar event.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "description": "Event id."
+        }
+      },
+      "required": [
+        "event_id"
+      ]
+    }
+  },
+  {
+    "server": "recipes",
+    "name": "get_recipe",
+    "description": "Get a saved recipe by name, with ingredients and steps.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Recipe name."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  {
+    "server": "recipes",
+    "name": "scale_recipe",
+    "description": "Scale a saved recipe to a number of servings.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Recipe name."
+        },
+        "servings": {
+          "type": "integer",
+          "description": "Servings."
+        }
+      },
+      "required": [
+        "name",
+        "servings"
+      ]
+    }
+  },
+  {
+    "server": "convert",
+    "name": "units",
+    "description": "Convert a quantity between units (length, mass, volume, temperature).",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "number"
+        },
+        "from": {
+          "type": "string",
+          "description": "Unit to convert from."
+        },
+        "to": {
+          "type": "string",
+          "description": "Unit to convert to."
+        }
+      },
+      "required": [
+        "value",
+        "from",
+        "to"
+      ]
+    }
+  },
+  {
+    "server": "convert",
+    "name": "currency",
+    "description": "Convert an amount between currencies at today's rate.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "amount": {
+          "type": "number"
+        },
+        "from": {
+          "type": "string",
+          "description": "ISO currency code."
+        },
+        "to": {
+          "type": "string",
+          "description": "ISO currency code."
+        }
+      },
+      "required": [
+        "amount",
+        "from",
+        "to"
+      ]
+    }
+  },
+  {
+    "server": "timers",
+    "name": "start_timer",
+    "description": "Start a countdown timer on the kitchen display.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "minutes": {
+          "type": "integer",
+          "description": "Duration in minutes."
+        },
+        "label": {
+          "type": "string",
+          "description": "Optional label."
+        }
+      },
+      "required": [
+        "minutes"
+      ]
+    }
+  },
+  {
+    "server": "timers",
+    "name": "list_timers",
+    "description": "List running timers.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "timers",
+    "name": "cancel_timer",
+    "description": "Cancel a running timer.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "timer_id": {
+          "type": "string",
+          "description": "Timer id."
+        }
+      },
+      "required": [
+        "timer_id"
+      ]
+    }
+  },
+  {
+    "server": "parcels",
+    "name": "track_parcel",
+    "description": "Track a parcel by its tracking number.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "tracking_number": {
+          "type": "string",
+          "description": "Tracking number."
+        }
+      },
+      "required": [
+        "tracking_number"
+      ]
+    }
+  },
+  {
+    "server": "parcels",
+    "name": "list_deliveries",
+    "description": "List expected deliveries.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "transit",
+    "name": "next_departures",
+    "description": "Next departures from a public transport stop.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "stop": {
+          "type": "string",
+          "description": "Stop name."
+        },
+        "count": {
+          "type": "integer",
+          "description": "How many."
+        }
+      },
+      "required": [
+        "stop"
+      ]
+    }
+  },
+  {
+    "server": "transit",
+    "name": "journey_plan",
+    "description": "Plan a public transport journey.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Origin."
+        },
+        "to": {
+          "type": "string",
+          "description": "Destination."
+        },
+        "depart_at": {
+          "type": "string",
+          "description": "ISO 8601 time."
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ]
+    }
+  },
+  {
+    "server": "flights",
+    "name": "flight_status",
+    "description": "Status of a flight by its number.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "flight": {
+          "type": "string",
+          "description": "Flight number, e.g. XY123."
+        },
+        "date": {
+          "type": "string",
+          "description": "YYYY-MM-DD."
+        }
+      },
+      "required": [
+        "flight"
+      ]
+    }
+  },
+  {
+    "server": "translate",
+    "name": "translate_text",
+    "description": "Translate text into another language.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "Text to translate."
+        },
+        "target_language": {
+          "type": "string",
+          "description": "Language code."
+        }
+      },
+      "required": [
+        "text",
+        "target_language"
+      ]
+    }
+  },
+  {
+    "server": "dictionary",
+    "name": "define_word",
+    "description": "Dictionary definition of a word.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "word": {
+          "type": "string",
+          "description": "The word."
+        }
+      },
+      "required": [
+        "word"
+      ]
+    }
+  },
+  {
+    "server": "finance",
+    "name": "stock_quote",
+    "description": "Latest price of a stock ticker.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "ticker": {
+          "type": "string",
+          "description": "Ticker symbol."
+        }
+      },
+      "required": [
+        "ticker"
+      ]
+    }
+  },
+  {
+    "server": "finance",
+    "name": "list_budgets",
+    "description": "List household budget categories and what is left this month.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "sports",
+    "name": "team_fixtures",
+    "description": "Upcoming fixtures of a sports team.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "team": {
+          "type": "string",
+          "description": "Team name."
+        }
+      },
+      "required": [
+        "team"
+      ]
+    }
+  },
+  {
+    "server": "car",
+    "name": "charging_status",
+    "description": "Charging status and range of the electric car.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "car",
+    "name": "start_charging",
+    "description": "Start charging the electric car.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "car",
+    "name": "precondition_cabin",
+    "description": "Heat or cool the car cabin before a trip.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "temperature": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "temperature"
+      ]
+    }
+  },
+  {
+    "server": "printer",
+    "name": "printer_status",
+    "description": "Ink levels and status of the home printer.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "printer",
+    "name": "print_document",
+    "description": "Print a document from the shared folder.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "File path."
+        },
+        "copies": {
+          "type": "integer",
+          "description": "Copies."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "server": "network",
+    "name": "list_clients",
+    "description": "List devices connected to the home network.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "network",
+    "name": "pause_client",
+    "description": "Pause internet access for one connected device.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string",
+          "description": "Client id."
+        },
+        "minutes": {
+          "type": "integer",
+          "description": "Minutes."
+        }
+      },
+      "required": [
+        "client_id"
+      ]
+    }
+  },
+  {
+    "server": "network",
+    "name": "speed_test",
+    "description": "Run an internet speed test.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "backup",
+    "name": "backup_status",
+    "description": "Status of the last backup of the home server.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "backup",
+    "name": "start_backup",
+    "description": "Start a backup of the home server now.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "energy",
+    "name": "electricity_prices",
+    "description": "Electricity prices for the next 24 hours.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "energy",
+    "name": "solar_production",
+    "description": "Solar panel production today.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "air",
+    "name": "air_quality",
+    "description": "Outdoor air quality index for the home's location.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "plants",
+    "name": "plant_status",
+    "description": "Soil moisture of the monitored house plants.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "plant": {
+          "type": "string",
+          "description": "Plant name."
+        }
+      }
+    }
+  },
+  {
+    "server": "pets",
+    "name": "feed_pet",
+    "description": "Dispense one portion from the automatic pet feeder.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "portions": {
+          "type": "integer",
+          "description": "Portions."
+        }
+      }
+    }
+  },
+  {
+    "server": "pets",
+    "name": "feeding_log",
+    "description": "When the pet feeder last dispensed food.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "fitness",
+    "name": "daily_steps",
+    "description": "Step count for a day.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "date": {
+          "type": "string",
+          "description": "YYYY-MM-DD."
+        }
+      }
+    }
+  },
+  {
+    "server": "fitness",
+    "name": "log_workout",
+    "description": "Log a workout.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Type of workout."
+        },
+        "minutes": {
+          "type": "integer",
+          "description": "Duration."
+        }
+      },
+      "required": [
+        "kind",
+        "minutes"
+      ]
+    }
+  },
+  {
+    "server": "podcasts",
+    "name": "list_episodes",
+    "description": "List new episodes of subscribed podcasts.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "photos",
+    "name": "list_albums",
+    "description": "List shared photo albums.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "photos",
+    "name": "share_album",
+    "description": "Share a photo album with a contact.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "album": {
+          "type": "string",
+          "description": "Album name."
+        },
+        "contact": {
+          "type": "string",
+          "description": "Contact name."
+        }
+      },
+      "required": [
+        "album",
+        "contact"
+      ]
+    }
+  },
+  {
+    "server": "contacts",
+    "name": "lookup_contact",
+    "description": "Find a contact's phone number by name.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Contact name."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  {
+    "server": "bins",
+    "name": "collection_days",
+    "description": "Next bin collection days by bin colour.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "library",
+    "name": "loans",
+    "description": "Books on loan from the public library and their due dates.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "library",
+    "name": "renew_loan",
+    "description": "Renew a library loan.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "loan_id": {
+          "type": "string",
+          "description": "Loan id."
+        }
+      },
+      "required": [
+        "loan_id"
+      ]
+    }
+  },
+  {
+    "server": "vacuum",
+    "name": "vacuum_status",
+    "description": "Status and battery of the robot vacuum.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "vacuum",
+    "name": "start_cleaning",
+    "description": "Start the robot vacuum.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "rooms": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Rooms to clean."
+        }
+      }
+    }
+  },
+  {
+    "server": "vacuum",
+    "name": "return_to_dock",
+    "description": "Send the robot vacuum back to its dock.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "water",
+    "name": "water_usage",
+    "description": "Water meter reading and usage this week.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "irrigation",
+    "name": "run_zone",
+    "description": "Run one garden irrigation zone.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "zone": {
+          "type": "string",
+          "description": "Zone name."
+        },
+        "minutes": {
+          "type": "integer",
+          "description": "Minutes."
+        }
+      },
+      "required": [
+        "zone",
+        "minutes"
+      ]
+    }
+  },
+  {
+    "server": "irrigation",
+    "name": "irrigation_schedule",
+    "description": "The garden irrigation schedule.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "server",
+    "name": "container_status",
+    "description": "Status of the containers on the home server.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "server",
+    "name": "restart_container",
+    "description": "Restart one container on the home server.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Container name."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  {
+    "server": "wifi",
+    "name": "guest_network",
+    "description": "Turn the guest Wi-Fi on or off.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ]
+    }
+  },
+  {
+    "server": "wifi",
+    "name": "guest_password",
+    "description": "Show the guest Wi-Fi password.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "doorbell",
+    "name": "last_rings",
+    "description": "When the doorbell last rang (times only, no video).",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "weather_station",
+    "name": "rain_gauge",
+    "description": "Rainfall measured by the garden rain gauge today.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "notes",
+    "name": "list_notes",
+    "description": "List the titles of saved notes.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "stocks_pantry",
+    "name": "pantry_expiry",
+    "description": "Pantry items close to their best-before date.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "mail",
+    "name": "unread_count",
+    "description": "Number of unread e-mails per folder.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+]

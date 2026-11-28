@@ -33,6 +33,48 @@ enum Command {
         )]
         url: String,
     },
+    /// Compare models on synthetic voice commands, through the production
+    /// request code. Tools come from fixtures; no MCP server is called.
+    /// See docs/model-evaluation.md.
+    Eval {
+        /// The Ringmaster config: [llm] sections, keys from the environment,
+        /// [approval] for the classifier suite.
+        #[arg(
+            long,
+            env = "RINGMASTER_CONFIG",
+            default_value = "/etc/ringmaster/config.toml"
+        )]
+        config: PathBuf,
+        /// Fixture directory.
+        #[arg(long, default_value = "eval/cases")]
+        cases: PathBuf,
+        /// Suites to run, comma-separated.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "agent,capture,judge,classifier"
+        )]
+        suite: Vec<String>,
+        /// `provider:model` to evaluate (repeatable); default: the config's
+        /// default model.
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Pad the tool list with this many irrelevant tools; several
+        /// comma-separated counts run one pass each.
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        distractors: Vec<usize>,
+        /// Run each case this many times.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+        /// One JSON line per request.
+        #[arg(long, default_value = "results.jsonl")]
+        output: PathBuf,
+        #[arg(long, default_value = "report.md")]
+        report: PathBuf,
+        /// Exit 2 if any harmful outcome occurred.
+        #[arg(long)]
+        fail_on_harmful: bool,
+    },
     /// Validate a config file and exit.
     CheckConfig {
         #[arg(
@@ -120,6 +162,69 @@ async fn run(cli: Cli) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("unhealthy: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Eval {
+            config,
+            cases,
+            suite,
+            models,
+            distractors,
+            repeat,
+            output,
+            report,
+            fail_on_harmful,
+        } => {
+            // Progress goes to stderr. Retry warnings name the endpoint, so
+            // they are only shown with RUST_LOG set.
+            let filter =
+                EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| EnvFilter::new("error"));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
+            let suites = match suite
+                .iter()
+                .map(|s| ringmaster::eval::Suite::parse(s))
+                .collect::<anyhow::Result<Vec<_>>>()
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let opts = ringmaster::eval::Options {
+                config,
+                cases,
+                suites,
+                models,
+                distractors,
+                repeat,
+                output,
+                report,
+            };
+            match ringmaster::eval::run(&opts, &ringmaster::config::secret_from_env).await {
+                Ok(s) => {
+                    eprintln!(
+                        "{} request(s); results in {}, report in {}",
+                        s.rows,
+                        opts.output.display(),
+                        opts.report.display()
+                    );
+                    if s.harmful > 0 {
+                        eprintln!("{} harmful outcome(s)", s.harmful);
+                    }
+                    if fail_on_harmful && s.harmful > 0 {
+                        ExitCode::from(2)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(e) => {
+                    eprintln!("eval failed: {e:#}");
                     ExitCode::FAILURE
                 }
             }
