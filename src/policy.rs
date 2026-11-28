@@ -277,6 +277,11 @@ impl ToolFilter {
     }
 }
 
+/// A glob over `<server>/<tool>`, as in `[[tool_policies]]`.
+pub(crate) fn tool_glob(pattern: &str) -> Result<Glob> {
+    glob(pattern)
+}
+
 fn glob(pattern: &str) -> Result<Glob> {
     // `*` must not cross the `/` between server and tool.
     Ok(globset::GlobBuilder::new(pattern)

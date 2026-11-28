@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::authcode::{AuthCodes, CodeAuth};
+use crate::capture::{self, CaptureLog, Check, FallbackProgress, Requirement, SavedCall};
 use crate::classifier::{Classifier, ClassifyError, ProposedCall, Verdict};
 use crate::config::{ApprovalMode, Config, OnMissing, ProfileConfig};
 use crate::db::{Db, Job, JobStatus};
@@ -52,6 +53,10 @@ pub struct AgentState {
     /// final notification. Holds the code's name, never the code.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub code_authorised: Vec<CodeApproval>,
+    /// The capture guarantee's record, for jobs of a profile with
+    /// `require` (`src/capture.rs`). Unset: no guarantee, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureLog>,
 }
 
 /// A `code` call that ran because the request carried its code.
@@ -223,6 +228,8 @@ pub struct Agent {
     classifier: Option<Arc<Classifier>>,
     /// Spoken authorisation codes (none by default).
     codes: Arc<AuthCodes>,
+    /// Profile name -> its `require` (the capture guarantee).
+    requirements: HashMap<String, Requirement>,
 }
 
 impl Agent {
@@ -240,7 +247,14 @@ impl Agent {
             .iter()
             .map(|(n, p)| Ok((n.clone(), ToolFilter::new(&p.tools)?)))
             .collect::<anyhow::Result<_>>()?;
+        let requirements = config
+            .profiles
+            .iter()
+            .filter_map(|(n, p)| p.require.as_ref().map(|r| (n, p, r)))
+            .map(|(n, p, r)| Ok((n.clone(), Requirement::new(r, &p.tools)?)))
+            .collect::<anyhow::Result<_>>()?;
         Ok(Self {
+            requirements,
             config,
             db,
             llms,
@@ -281,7 +295,21 @@ impl Agent {
 
     pub async fn run(&self, job: &Job, req: &Request<'_>) -> Result<AgentOutcome, AgentError> {
         let mut state = job.agent_state.clone().unwrap_or_default();
-        let outcome = self.run_state(job, req, &mut state).await;
+        // Once the guarantee has taken over, the model is done: later
+        // attempts (a retry, an answered fallback approval) go straight to
+        // it.
+        let outcome = if state
+            .capture
+            .as_ref()
+            .is_some_and(|c| c.unverified.is_some())
+        {
+            Ok(AgentOutcome::Final(
+                state.final_text.clone().unwrap_or_default(),
+            ))
+        } else {
+            self.run_state(job, req, &mut state).await
+        };
+        let outcome = self.guarantee(job, req, &mut state, outcome).await;
         // Every action the classifier approved is listed in what the user
         // is told at the end, however the job ends.
         let note = |text: String| with_code_note(with_auto_approved_note(text, &state), &state);
@@ -292,6 +320,407 @@ impl Agent {
             Err(AgentError::Permanent(e)) => Err(AgentError::Permanent(note(e))),
             other => other,
         }
+    }
+
+    /// The capture guarantee (`src/capture.rs`): a job of a profile with
+    /// `require` ends as a success only if a call of the required tool met
+    /// the criteria. Otherwise the model's reply is dropped, the fallback
+    /// (if any) runs, and the job fails with a "not saved" result, or
+    /// retries while the tool server is unreachable. Jobs without the
+    /// guarantee get `outcome` back unchanged.
+    async fn guarantee(
+        &self,
+        job: &Job,
+        req: &Request<'_>,
+        state: &mut AgentState,
+        outcome: Result<AgentOutcome, AgentError>,
+    ) -> Result<AgentOutcome, AgentError> {
+        let (Some(r), Some(log)) = (self.requirements.get(&job.profile), state.capture.as_ref())
+        else {
+            return outcome;
+        };
+        let reply = match &outcome {
+            Ok(AgentOutcome::AwaitingConfirmation) | Err(AgentError::Transient(_)) => {
+                return outcome;
+            }
+            _ if log.is_saved() => {
+                if log.saved.iter().all(|s| s.by == "model") {
+                    metrics::counter!("ringmaster_captures_total", "outcome" => "verified")
+                        .increment(1);
+                }
+                return outcome;
+            }
+            Ok(AgentOutcome::Final(t) | AgentOutcome::Refused(t) | AgentOutcome::GaveUp(t)) => {
+                t.clone()
+            }
+            Err(AgentError::Permanent(e)) => e.clone(),
+        };
+        let reason = match &log.unverified {
+            Some(reason) => reason.clone(),
+            None => {
+                let reason = unverified_reason(r, log, state);
+                tracing::warn!(job = job.id, %reason, "capture not verified; the model's reply is not used");
+                self.audit(
+                    job,
+                    "capture_unverified",
+                    json!({
+                        "require": r.pattern(),
+                        "reason": reason,
+                        "reply": truncate(&reply, 500),
+                        "calls": log.rejected,
+                        "fallback": r.fallback.as_ref().map(|f| f.tool.clone()),
+                    }),
+                )
+                .await;
+                metrics::counter!("ringmaster_captures_total", "outcome" => "unverified")
+                    .increment(1);
+                if let Some(log) = state.capture.as_mut() {
+                    log.unverified = Some(reason.clone());
+                }
+                self.db.save_agent_state(job.id, state).await?;
+                reason
+            }
+        };
+        let Some(fb) = &r.fallback else {
+            metrics::counter!("ringmaster_captures_total", "outcome" => "not_saved").increment(1);
+            return Err(AgentError::Permanent(reason));
+        };
+        match self.run_fallback(job, req, state, r, fb).await? {
+            FallbackEnd::Saved(title) => {
+                metrics::counter!("ringmaster_captures_total", "outcome" => "fallback")
+                    .increment(1);
+                let text = format!(
+                    "Added by Ringmaster's fallback: \"{title}\". The model's reply could not be \
+                     verified ({reason}), so Ringmaster saved the whole transcript itself."
+                );
+                state.final_text = Some(text.clone());
+                self.db.save_agent_state(job.id, state).await?;
+                Ok(AgentOutcome::Final(text))
+            }
+            FallbackEnd::Parked => Ok(AgentOutcome::AwaitingConfirmation),
+            FallbackEnd::Unreachable(e) => Err(AgentError::Transient(format!(
+                "not saved yet, the tool server is unreachable: {e}"
+            ))),
+            FallbackEnd::Failed(why) => {
+                metrics::counter!("ringmaster_captures_total", "outcome" => "not_saved")
+                    .increment(1);
+                Err(AgentError::Permanent(format!(
+                    "{reason}; Ringmaster's fallback did not save it either: {why}"
+                )))
+            }
+        }
+    }
+
+    /// Ringmaster's own call of the required tool, through the profile's
+    /// allow-list and the tool policies like any call: `deny` blocks it,
+    /// `confirm`/`ask` park it for Approve/Deny (one approval covers the
+    /// plan and the confirm call; the classifier is never asked), `code`
+    /// needs the request's code. Progress is saved after every step.
+    async fn run_fallback(
+        &self,
+        job: &Job,
+        req: &Request<'_>,
+        state: &mut AgentState,
+        r: &Requirement,
+        fb: &capture::Fallback,
+    ) -> Result<FallbackEnd, AgentError> {
+        let (_, filter) = self.profile(&job.profile)?;
+        let transcript = req.transcript.trim();
+        let first = |title: &str| {
+            capture::fill(
+                &fb.arguments,
+                &capture::Values {
+                    title,
+                    transcript,
+                    result: None,
+                },
+            )
+            .map(Value::Object)
+        };
+        let mut prog = match state.capture.as_ref().and_then(|c| c.fallback.clone()) {
+            Some(p) => p,
+            None => {
+                let title = capture::title(transcript, fb.title_max_chars);
+                match first(&title) {
+                    Ok(input) => FallbackProgress {
+                        step: 0,
+                        input,
+                        title,
+                        awaiting: false,
+                        approved_by: None,
+                    },
+                    Err(why) => return Ok(FallbackEnd::Failed(why)),
+                }
+            }
+        };
+        let event = |prog: &FallbackProgress, outcome: &str, detail: Value| {
+            let mut d = json!({
+                "tool": fb.tool,
+                "step": prog.step,
+                "outcome": outcome,
+                "title": prog.title,
+            });
+            if let (Some(d), Some(extra)) = (d.as_object_mut(), detail.as_object()) {
+                d.extend(extra.clone());
+            }
+            d
+        };
+
+        if prog.awaiting {
+            let Some(decision) = self.db.latest_decision(job.id).await? else {
+                self.db
+                    .set_status(job.id, JobStatus::AwaitingConfirmation)
+                    .await?;
+                return Ok(FallbackEnd::Parked);
+            };
+            self.audit(
+                job,
+                "confirmation_decision",
+                json!({ "decision": decision, "fallback": true }),
+            )
+            .await;
+            if decision != "approve" {
+                self.audit(
+                    job,
+                    "capture_fallback",
+                    event(&prog, "declined", json!({ "decision": decision })),
+                )
+                .await;
+                self.set_fallback(job, state, None).await?;
+                return Ok(FallbackEnd::Failed(if decision == "expired" {
+                    "its approval request was not answered in time".into()
+                } else {
+                    "the user declined it".into()
+                }));
+            }
+            prog.awaiting = false;
+            prog.approved_by = Some(Approver::Human.as_str().into());
+        }
+
+        let mut lockout = None;
+        loop {
+            let (action, _) = self
+                .plan_call(
+                    &fb.tool,
+                    &prog.input,
+                    filter,
+                    req,
+                    crate::db::now(),
+                    &mut lockout,
+                )
+                .await?;
+            let blocked = match &action {
+                CallAction::Reject(why) => Some(why.clone()),
+                CallAction::Authorised(code) => self.code_still_valid(req, code).await.err(),
+                _ => None,
+            };
+            if let Some(why) = blocked {
+                self.audit(
+                    job,
+                    "tool_call",
+                    json!({
+                        "tool": fb.tool,
+                        "input": prog.input,
+                        "action": action,
+                        "approved": false,
+                        "approved_by": null,
+                        "fallback": true,
+                        "outcome": "not_run",
+                        "result": why,
+                    }),
+                )
+                .await;
+                metrics::counter!("ringmaster_tool_calls_total", "outcome" => "not_run")
+                    .increment(1);
+                self.audit(
+                    job,
+                    "capture_fallback",
+                    event(&prog, "blocked", json!({ "reason": why })),
+                )
+                .await;
+                self.set_fallback(job, state, None).await?;
+                return Ok(FallbackEnd::Failed(format!("not run: {why}")));
+            }
+            let approved_by = match (&action, &prog.approved_by) {
+                (CallAction::Confirm, Some(by)) => by.clone(),
+                (CallAction::Confirm, None) => {
+                    prog.awaiting = true;
+                    self.set_fallback(job, state, Some(prog.clone())).await?;
+                    let call = PlannedCall {
+                        tool_use_id: "ringmaster-fallback".into(),
+                        claude_name: fb.tool.clone(),
+                        input: prog.input.clone(),
+                        action: CallAction::Confirm,
+                    };
+                    self.request_confirmation(
+                        job,
+                        req,
+                        state,
+                        std::slice::from_ref(&call),
+                        ApprovalMode::Manual,
+                        &[],
+                        Some(FALLBACK_CONFIRM_NOTE),
+                    )
+                    .await?;
+                    self.audit(
+                        job,
+                        "capture_fallback",
+                        event(&prog, "awaiting_confirmation", json!({})),
+                    )
+                    .await;
+                    return Ok(FallbackEnd::Parked);
+                }
+                (CallAction::Authorised(code), _) => {
+                    state.code_authorised.push(CodeApproval {
+                        tool: fb.tool.clone(),
+                        input: prog.input.clone(),
+                        code: code.clone(),
+                    });
+                    "auth_code".into()
+                }
+                _ => "fallback".into(),
+            };
+
+            let args = prog.input.as_object().cloned().unwrap_or_default();
+            let (text, is_error, structured, outcome, unreachable) =
+                match self.tools.call_tool(&fb.server, &fb.name, args).await {
+                    Ok(out) => {
+                        let outcome = if out.is_error { "tool_error" } else { "ok" };
+                        (out.text, out.is_error, out.structured, outcome, false)
+                    }
+                    Err(e) => {
+                        let unreachable = matches!(e, ToolError::Unreachable(..));
+                        (
+                            format!("Tool call failed: {e}"),
+                            true,
+                            None,
+                            "call_failed",
+                            unreachable,
+                        )
+                    }
+                };
+            metrics::counter!("ringmaster_tool_calls_total", "outcome" => outcome).increment(1);
+            self.audit(
+                job,
+                "tool_call",
+                json!({
+                    "tool": fb.tool,
+                    "input": prog.input,
+                    "action": action,
+                    "approved": true,
+                    "approved_by": approved_by,
+                    "fallback": true,
+                    "step": prog.step,
+                    "outcome": outcome,
+                    "result": truncate(&text, 2000),
+                }),
+            )
+            .await;
+
+            if unreachable {
+                // Start again from the first call next time (a plan may not
+                // survive the outage); an approval already given still holds.
+                prog.step = 0;
+                if let Ok(input) = first(&prog.title) {
+                    prog.input = input;
+                }
+                self.audit(
+                    job,
+                    "capture_fallback",
+                    event(&prog, "unreachable", json!({ "error": text })),
+                )
+                .await;
+                self.set_fallback(job, state, Some(prog)).await?;
+                return Ok(FallbackEnd::Unreachable(text));
+            }
+
+            let check = r.check(&fb.tool, &text, structured.as_ref(), is_error);
+            if check == Check::Saved {
+                if let Some(log) = state.capture.as_mut() {
+                    log.saved.push(SavedCall {
+                        tool: fb.tool.clone(),
+                        input: prog.input.clone(),
+                        by: "fallback".into(),
+                    });
+                }
+                self.audit(job, "capture_fallback", event(&prog, "saved", json!({})))
+                    .await;
+                self.set_fallback(job, state, None).await?;
+                return Ok(FallbackEnd::Saved(prog.title));
+            }
+            let plan = (prog.step == 0 && !is_error)
+                .then_some(fb.confirm.as_ref())
+                .flatten()
+                .filter(|c| c.is_plan(&text, structured.as_ref()));
+            if let Some(c) = plan {
+                let result = capture::result_json(&text, structured.as_ref());
+                let extra = capture::fill(
+                    &c.arguments,
+                    &capture::Values {
+                        title: &prog.title,
+                        transcript,
+                        result: result.as_ref(),
+                    },
+                );
+                match extra {
+                    Ok(extra) => {
+                        self.audit(job, "capture_fallback", event(&prog, "planned", json!({})))
+                            .await;
+                        let mut next = prog.input.as_object().cloned().unwrap_or_default();
+                        next.extend(extra);
+                        prog.input = Value::Object(next);
+                        prog.step = 1;
+                        self.set_fallback(job, state, Some(prog.clone())).await?;
+                        continue;
+                    }
+                    Err(why) => {
+                        self.audit(
+                            job,
+                            "capture_fallback",
+                            event(&prog, "not_saved", json!({ "reason": why })),
+                        )
+                        .await;
+                        self.set_fallback(job, state, None).await?;
+                        return Ok(FallbackEnd::Failed(why));
+                    }
+                }
+            }
+            let why = match check {
+                Check::Rejected(why) => why,
+                _ => "its result did not meet the criteria".into(),
+            };
+            if let Some(log) = state.capture.as_mut() {
+                log.record(
+                    &fb.tool,
+                    &prog.input,
+                    Check::Rejected(why.clone()),
+                    false,
+                    "fallback",
+                );
+            }
+            self.audit(
+                job,
+                "capture_fallback",
+                event(&prog, "not_saved", json!({ "reason": why })),
+            )
+            .await;
+            self.set_fallback(job, state, None).await?;
+            return Ok(FallbackEnd::Failed(why));
+        }
+    }
+
+    /// Store the fallback's progress (or that it is over) and save.
+    async fn set_fallback(
+        &self,
+        job: &Job,
+        state: &mut AgentState,
+        progress: Option<FallbackProgress>,
+    ) -> Result<(), AgentError> {
+        if let Some(log) = state.capture.as_mut() {
+            log.fallback = progress;
+        }
+        self.db.save_agent_state(job.id, state).await?;
+        Ok(())
     }
 
     async fn run_state(
@@ -530,6 +959,10 @@ impl Agent {
         state.model = choice.model;
         state.effort = choice.effort;
         state.system = system_prompt(&self.config, profile);
+        state.capture = self
+            .requirements
+            .contains_key(&job.profile)
+            .then(CaptureLog::default);
         state.messages = vec![llm.user_message(&context_text(
             &self.config,
             &Context {
@@ -598,55 +1031,11 @@ impl Agent {
                 )),
                 None => CallAction::Reject(unknown_tool_result(&name)),
                 Some(def) => {
-                    let q = def.qualified();
-                    if !filter.allows(&q) {
-                        CallAction::Reject("This tool is not available for this gesture.".into())
-                    } else {
-                        let m = self.policies.matched(&q, &input);
-                        let (p, conditional, code) = (m.policy, m.conditional, m.code.cloned());
-                        policy = Some(p);
-                        match (p, code) {
-                            (Policy::Allow, _) => CallAction::Run,
-                            (Policy::Confirm | Policy::Ask, _) => CallAction::Confirm,
-                            // A deny that depends on the arguments cannot
-                            // hide the tool, so it is enforced here.
-                            (Policy::Deny, _) if conditional => {
-                                CallAction::Reject(BLOCKED_FOR_ARGUMENTS.into())
-                            }
-                            (Policy::Deny, _) => {
-                                CallAction::Reject("This tool is blocked by policy.".into())
-                            }
-                            (Policy::Code, None) => CallAction::Reject(code_refusal(false, false)),
-                            (Policy::Code, Some(need)) => {
-                                let locked = match lockout {
-                                    Some(l) => l,
-                                    None => {
-                                        let l = self.db.active_lockout(now).await?.is_some();
-                                        lockout = Some(l);
-                                        l
-                                    }
-                                };
-                                let auth = req.code_auth;
-                                if !locked && auth.is_some_and(|a| a.allows(&need.code, now)) {
-                                    CallAction::Authorised(need.code)
-                                } else {
-                                    match need.on_missing {
-                                        // No valid code: a human decides,
-                                        // never the classifier.
-                                        OnMissing::Ask => {
-                                            policy = Some(Policy::Ask);
-                                            CallAction::Confirm
-                                        }
-                                        OnMissing::Deny => {
-                                            let expired = auth
-                                                .is_some_and(|a| a.until.contains_key(&need.code));
-                                            CallAction::Reject(code_refusal(locked, expired))
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let (action, p) = self
+                        .plan_call(&def.qualified(), &input, filter, req, now, &mut lockout)
+                        .await?;
+                    policy = p;
+                    action
                 }
             };
             policies.push(policy);
@@ -706,7 +1095,7 @@ impl Agent {
                 judgements: judgements.clone(),
             });
             self.db.save_agent_state(job.id, state).await?;
-            self.request_confirmation(job, req, state, &calls, mode, &judgements)
+            self.request_confirmation(job, req, state, &calls, mode, &judgements, None)
                 .await?;
             return Ok(Some(AgentOutcome::AwaitingConfirmation));
         }
@@ -715,6 +1104,64 @@ impl Agent {
         state.messages.extend(llm.tool_results(&results));
         self.db.save_agent_state(job.id, state).await?;
         Ok(None)
+    }
+
+    /// What to do with a call of `q` with `input`: the profile's
+    /// allow-list, then the tool policies (and, for `code`, the request's
+    /// authorisation code). Returns the action and the policy that decided
+    /// it (`None` when the allow-list refused it). `lockout` caches the
+    /// code lockout for the turn.
+    async fn plan_call(
+        &self,
+        q: &str,
+        input: &Value,
+        filter: &ToolFilter,
+        req: &Request<'_>,
+        now: i64,
+        lockout: &mut Option<bool>,
+    ) -> Result<(CallAction, Option<Policy>), AgentError> {
+        if !filter.allows(q) {
+            return Ok((
+                CallAction::Reject("This tool is not available for this gesture.".into()),
+                None,
+            ));
+        }
+        let m = self.policies.matched(q, input);
+        let (p, conditional, code) = (m.policy, m.conditional, m.code.cloned());
+        let action = match (p, code) {
+            (Policy::Allow, _) => CallAction::Run,
+            (Policy::Confirm | Policy::Ask, _) => CallAction::Confirm,
+            // A deny that depends on the arguments cannot hide the tool, so
+            // it is enforced here.
+            (Policy::Deny, _) if conditional => CallAction::Reject(BLOCKED_FOR_ARGUMENTS.into()),
+            (Policy::Deny, _) => CallAction::Reject("This tool is blocked by policy.".into()),
+            (Policy::Code, None) => CallAction::Reject(code_refusal(false, false)),
+            (Policy::Code, Some(need)) => {
+                let locked = match *lockout {
+                    Some(l) => l,
+                    None => {
+                        let l = self.db.active_lockout(now).await?.is_some();
+                        *lockout = Some(l);
+                        l
+                    }
+                };
+                let auth = req.code_auth;
+                if !locked && auth.is_some_and(|a| a.allows(&need.code, now)) {
+                    CallAction::Authorised(need.code)
+                } else {
+                    match need.on_missing {
+                        // No valid code: a human decides, never the
+                        // classifier.
+                        OnMissing::Ask => return Ok((CallAction::Confirm, Some(Policy::Ask))),
+                        OnMissing::Deny => {
+                            let expired = auth.is_some_and(|a| a.until.contains_key(&need.code));
+                            CallAction::Reject(code_refusal(locked, expired))
+                        }
+                    }
+                }
+            }
+        };
+        Ok((action, Some(p)))
     }
 
     /// The classifier's say on each `confirm` call of a turn (nothing in
@@ -872,6 +1319,7 @@ impl Agent {
         .await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn request_confirmation(
         &self,
         job: &Job,
@@ -880,6 +1328,7 @@ impl Agent {
         calls: &[PlannedCall],
         mode: ApprovalMode,
         judgements: &[Judgement],
+        note: Option<&str>,
     ) -> Result<(), AgentError> {
         let token_bytes: [u8; 32] = rand::random();
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
@@ -901,7 +1350,7 @@ impl Agent {
                 line
             })
             .collect();
-        let summary = format!(
+        let mut summary = format!(
             "Request: \"{}\"\nRun {}:\n{}",
             truncate(&self.codes.scrub(req.transcript.trim()), 200),
             if lines.len() == 1 {
@@ -911,6 +1360,9 @@ impl Agent {
             },
             lines.join("\n")
         );
+        if let Some(note) = note {
+            summary.push_str(&format!("\n{note}"));
+        }
         let ttl = self.config.agent.confirmation_ttl_secs as i64;
         let expires_at = crate::db::now() + ttl;
         self.db
@@ -1022,21 +1474,45 @@ impl Agent {
                 CallAction::Confirm => Err(refusal_text.to_string()),
                 CallAction::Reject(r) => Err(r.clone()),
             };
+            let mut structured = None;
+            let mut unreachable = false;
             let (text, is_error, outcome) = match (run, def) {
                 (Err(reason), _) => (reason, true, "not_run"),
                 (Ok(()), None) => ("Unknown tool.".to_string(), true, "not_run"),
                 (Ok(()), Some(def)) => {
                     let args = c.input.as_object().cloned().unwrap_or_default();
                     match self.tools.call_tool(&def.server, &def.tool, args).await {
-                        Ok(out) => (
-                            out.text,
-                            out.is_error,
-                            if out.is_error { "tool_error" } else { "ok" },
-                        ),
-                        Err(e) => (format!("Tool call failed: {e}"), true, "call_failed"),
+                        Ok(out) => {
+                            structured = out.structured;
+                            (
+                                out.text,
+                                out.is_error,
+                                if out.is_error { "tool_error" } else { "ok" },
+                            )
+                        }
+                        Err(e) => {
+                            unreachable = matches!(e, ToolError::Unreachable(..));
+                            (format!("Tool call failed: {e}"), true, "call_failed")
+                        }
                     }
                 }
             };
+            // The capture guarantee looks at the whole result, before it
+            // is shortened for the model.
+            if let (Some(log), Some(r)) =
+                (state.capture.as_mut(), self.requirements.get(&job.profile))
+            {
+                let check = if outcome == "not_run" {
+                    if r.applies_to(&qualified) {
+                        Check::Rejected(format!("not run: {}", truncate(&text, 200)))
+                    } else {
+                        Check::NotRequired
+                    }
+                } else {
+                    r.check(&qualified, &text, structured.as_ref(), is_error)
+                };
+                log.record(&qualified, &c.input, check, unreachable, "model");
+            }
             let code = match &c.action {
                 CallAction::Authorised(code) if outcome != "not_run" => {
                     tracing::info!(job = job.id, tool = %qualified, code = %code, "ran on a spoken authorisation code");
@@ -1118,6 +1594,38 @@ pub fn malformed_arguments_result(why: &str) -> String {
 /// The error result for a call of a tool that was not offered.
 pub fn unknown_tool_result(name: &str) -> String {
     format!("Unknown tool {name}.")
+}
+
+/// How a capture fallback ended.
+enum FallbackEnd {
+    /// Saved; the card's title.
+    Saved(String),
+    /// Waiting for Approve/Deny.
+    Parked,
+    /// The tool server could not be reached: try again later.
+    Unreachable(String),
+    /// Not saved, and trying again would not help.
+    Failed(String),
+}
+
+/// Added to the confirmation request of a capture fallback.
+const FALLBACK_CONFIRM_NOTE: &str = "(Ringmaster's capture fallback: the model's reply could not \
+be verified, so Ringmaster wants to save the whole transcript itself.)";
+
+/// Why a job of a profile with `require` did not meet it.
+fn unverified_reason(r: &Requirement, log: &CaptureLog, state: &AgentState) -> String {
+    if let Some(last) = log.rejected.last() {
+        return format!("{} did not confirm it ({})", last.tool, last.reason);
+    }
+    let server = r.pattern().split('/').next().unwrap_or_default();
+    if state
+        .unavailable
+        .iter()
+        .any(|u| u == server || u == "all tools")
+    {
+        return format!("the {server} tool server was unavailable");
+    }
+    format!("the model made no {} call", r.pattern())
 }
 
 /// The system prompt a job of `profile` starts with: the frozen base prompt,
@@ -1373,6 +1881,51 @@ mod tests {
     }
 
     #[test]
+    fn capture_records_round_trip_and_old_states_have_none() {
+        // Saved before the capture guarantee: no record, so no guarantee.
+        let old = json!({
+            "provider": "openai", "model": "m", "system": "s", "effort": "", "tools": [],
+            "messages": [], "iterations": 2, "final_text": "Added: x", "unavailable": [],
+            "pending": null
+        });
+        let s: AgentState = serde_json::from_value(old.clone()).unwrap();
+        assert!(s.capture.is_none());
+        assert_eq!(serde_json::to_value(&s).unwrap(), old);
+        let mut s = s;
+        s.capture = Some(CaptureLog::default());
+        // An empty record is just `{}`.
+        assert_eq!(serde_json::to_value(&s).unwrap()["capture"], json!({}));
+        let log = s.capture.as_mut().unwrap();
+        log.record(
+            "nextcloud/deck_create_card",
+            &json!({"stackId": 1}),
+            Check::Rejected("the result matched \"*Nothing*\"".into()),
+            false,
+            "model",
+        );
+        log.record(
+            "nextcloud/deck_list_boards",
+            &json!({}),
+            Check::NotRequired,
+            false,
+            "model",
+        );
+        log.unverified = Some("why".into());
+        log.fallback = Some(FallbackProgress {
+            step: 1,
+            input: json!({"confirm": true}),
+            title: "t".into(),
+            awaiting: true,
+            approved_by: None,
+        });
+        let back: AgentState = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back.capture, s.capture);
+        let log = back.capture.unwrap();
+        assert_eq!(log.rejected.len(), 1);
+        assert!(!log.is_saved() && !log.unreachable());
+    }
+
+    #[test]
     fn auto_approved_actions_are_listed_with_scores() {
         let mut s = AgentState::default();
         assert_eq!(with_auto_approved_note("Done.".into(), &s), "Done.");
@@ -1518,6 +2071,7 @@ mod tests {
             max_iterations: None,
             job_max_age_secs: None,
             approval_mode: None,
+            require: None,
         };
         assert_eq!(
             system_prompt(&config, &profile),

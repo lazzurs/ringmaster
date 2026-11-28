@@ -386,6 +386,18 @@ async fn capture_suite_catches_false_success_and_junk_cards_over_ollama() {
                 json!({"board_id": 1, "stack_id": 11, "title": "Oat milk"}),
             ),
             ("add oat milk to the list, no wait, cancel that", _) => ollama_text("Added: Oat milk"),
+            // The create call only plans; the model confirms it.
+            ("book a table for the anniversary dinner", 1) => ollama_tool(
+                "nextcloud__deck_create_card",
+                json!({"board_id": 1, "stack_id": 11, "title": "Book a table for the anniversary dinner"}),
+            ),
+            ("book a table for the anniversary dinner", 2) => ollama_tool(
+                "nextcloud__deck_create_card",
+                json!({"board_id": 1, "stack_id": 11, "title": "Book a table for the anniversary dinner", "confirm": true}),
+            ),
+            ("book a table for the anniversary dinner", _) => {
+                ollama_text("Added: Book a table for the anniversary dinner")
+            }
             // Acting on the content with a tool capture does not have.
             ("turn off the kitchen lights", 1) => ollama_tool(
                 "homeassistant__HassTurnOff",
@@ -422,6 +434,17 @@ async fn capture_suite_catches_false_success_and_junk_cards_over_ollama() {
         .filter(|r| r.case == "cap-deck-create-fails")
         .collect();
     assert_eq!(failed[0].calls[0].result_error, Some(true));
+    // A plan, then the confirmed call: one card, not two (the plan is not a
+    // card under the profile's `require`).
+    let plan = o("cap-plan-then-confirm");
+    assert_eq!(plan.outcome, "good", "{plan:?}");
+    assert!(
+        plan.detail
+            .as_deref()
+            .unwrap()
+            .starts_with("1 card(s) created"),
+        "{plan:?}"
+    );
 
     // Ollama native request: /api/chat shape with num_ctx and no truncation;
     // the capture profile sees only its three Deck tools.

@@ -621,17 +621,46 @@ impl Worker {
             .finish_job(job.id, JobStatus::Failed, None, Some(error.to_string()))
             .await;
         self.audit(job, "job_failed", json!({"error": error})).await;
-        // `job` is the row as claimed; the transcript may have been saved
-        // since, in this attempt.
+        let guaranteed = self
+            .config
+            .profiles
+            .get(&job.profile)
+            .is_some_and(|p| p.require.is_some());
+        // `job` is the row as claimed; the transcript (and, for the capture
+        // guarantee, what was saved) may have changed since, in this
+        // attempt.
         let saved = match &job.transcript {
-            Some(_) => None,
-            None => self.db.get_job(job.id).await.ok().flatten(),
+            Some(_) if !guaranteed => None,
+            _ => self.db.get_job(job.id).await.ok().flatten(),
         };
-        let heard = job
+        let said = job
             .transcript
             .as_deref()
             .or_else(|| saved.as_ref().and_then(|j| j.transcript.as_deref()))
-            .or(job.phone_transcription.as_deref())
+            .or(job.phone_transcription.as_deref());
+        let captured = saved
+            .as_ref()
+            .and_then(|j| j.agent_state.as_ref())
+            .and_then(|s| s.capture.as_ref())
+            .is_some_and(|c| c.is_saved());
+        if guaranteed && !captured {
+            // The capture guarantee: say plainly that nothing was saved,
+            // with every word the user said, so it can be recovered.
+            let said = said
+                .map(|t| format!("\n\nYou said: \"{}\"", t.trim()))
+                .unwrap_or_default();
+            self.notify(Notification {
+                title: "Ringmaster: not saved".into(),
+                body: format!(
+                    "Not saved: {}.{said}",
+                    crate::agent::truncate(error.trim().trim_end_matches('.'), 400)
+                ),
+                kind: Kind::Error,
+            })
+            .await;
+            return;
+        }
+        let heard = said
             .map(|t| format!(" (\"{}\")", short(t)))
             .unwrap_or_default();
         self.notify(Notification {

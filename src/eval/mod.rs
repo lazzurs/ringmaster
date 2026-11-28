@@ -120,6 +120,7 @@ impl ModelSpec {
             max_iterations: None,
             job_max_age_secs: None,
             approval_mode: None,
+            require: None,
         };
         let choice = config
             .profile_llm(Some(&profile))
@@ -225,6 +226,10 @@ pub struct Call {
     /// Whether the scripted result was an error (unset: not answered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_error: Option<bool>,
+    /// The scripted result's text, for the capture profile's `require`
+    /// (not written to `results.jsonl`).
+    #[serde(skip)]
+    pub result_text: Option<String>,
 }
 
 /// One request, as written to `results.jsonl`.

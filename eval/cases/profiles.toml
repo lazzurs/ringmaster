@@ -34,3 +34,10 @@ question. If the transcript is empty, noise, or the user cancels it, create
 nothing and reply "Nothing added." Only after the card was created, reply with
 "Added: <title>". If a tool fails, say what failed.
 """
+
+# The capture guarantee's success criteria, as in production: a create call
+# whose result is a plan ("Nothing was changed") is not a card. The eval
+# scores with them; it does not run the fallback.
+[profiles.capture.require]
+tool = "nextcloud/deck_create_card"
+result_not_matching = ["*Nothing was changed*", "*requiresConfirmation*"]

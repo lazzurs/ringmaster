@@ -39,6 +39,9 @@ impl DiscoveredTool {
 pub struct ToolOutput {
     pub text: String,
     pub is_error: bool,
+    /// The result's `structuredContent`, if any. Only `text` goes to the
+    /// model; this is for checks such as a profile's `require`.
+    pub structured: Option<Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -396,13 +399,18 @@ impl ToolBackend for McpBackend {
                 Ok(Ok(result)) => {
                     let is_error = result.is_error.unwrap_or(false);
                     let text = render_content(&result.content, result.structured_content.as_ref());
-                    return Ok(ToolOutput { text, is_error });
+                    return Ok(ToolOutput {
+                        text,
+                        is_error,
+                        structured: result.structured_content,
+                    });
                 }
                 Ok(Err(rmcp::ServiceError::McpError(e))) => {
                     return Ok(ToolOutput {
                         text: self
                             .redact(server, &format!("MCP error {}: {}", e.code.0, e.message)),
                         is_error: true,
+                        structured: None,
                     });
                 }
                 Ok(Err(e @ rmcp::ServiceError::TransportClosed))

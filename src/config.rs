@@ -882,6 +882,65 @@ pub struct ProfileConfig {
     /// Overrides `approval.mode` for this profile.
     #[serde(default)]
     pub approval_mode: Option<ApprovalMode>,
+    /// What a job of this profile must have done to count as a success
+    /// (the capture guarantee, `src/capture.rs`). Unset: the model's reply
+    /// is the result, as before.
+    #[serde(default)]
+    pub require: Option<RequireConfig>,
+}
+
+/// `[profiles.<name>.require]`: a job succeeds only if a call of `tool`
+/// returned a result that is not an error, matches `result_matching` (when
+/// given) and matches none of `result_not_matching`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequireConfig {
+    /// Glob over `<server>/<tool>`, as in `[[tool_policies]]`.
+    pub tool: String,
+    /// Globs over the result (its text, and its structured content as
+    /// JSON); case-insensitive, `*` matches anything. One must match.
+    #[serde(default)]
+    pub result_matching: Vec<String>,
+    /// A result matching any of these does not count (a plan, a "nothing
+    /// was changed").
+    #[serde(default)]
+    pub result_not_matching: Vec<String>,
+    /// Ringmaster's own call when the model's calls do not meet the
+    /// criteria (opt-in).
+    #[serde(default)]
+    pub fallback: Option<FallbackConfig>,
+}
+
+/// `[profiles.<name>.require.fallback]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackConfig {
+    /// `<server>/<tool>` (no globs); must match `require.tool`.
+    pub tool: String,
+    /// The call's arguments. In strings, `{{title}}` is a title made from
+    /// the transcript and `{{transcript}}` the whole transcript.
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    /// Longest `{{title}}`, in characters (cut at a word boundary).
+    #[serde(default = "default_fallback_title_chars")]
+    pub title_max_chars: usize,
+    /// A second call when the first one only returned a plan.
+    #[serde(default)]
+    pub confirm: Option<FallbackConfirmConfig>,
+}
+
+/// `[profiles.<name>.require.fallback.confirm]`: when the first result
+/// matches `when_result_matching`, call the tool again with the first
+/// call's arguments plus `arguments`, where `{{result:/pointer}}` is taken
+/// from the first result (its structured content, or its text as JSON).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FallbackConfirmConfig {
+    pub when_result_matching: Vec<String>,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_fallback_title_chars() -> usize {
+    80
 }
 
 /// Secrets read from the environment.
@@ -1412,6 +1471,10 @@ impl Config {
             for g in &p.tools {
                 globset::Glob::new(g)
                     .with_context(|| format!("profile {name} tools glob {g:?}"))?;
+            }
+            if let Some(r) = &p.require {
+                crate::capture::Requirement::new(r, &p.tools)
+                    .with_context(|| format!("profiles.{name}.require"))?;
             }
         }
         check_effort(&self.claude.effort)?;
@@ -2075,6 +2138,57 @@ basic_auth = { username = "x", password_env = "UNSET" }
         // Code values never go in the file.
         let e = Config::from_toml("[auth_codes.codes.alarm]\ncode = \"delta\"\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+    }
+
+    #[test]
+    fn capture_requirements_are_checked_when_loading() {
+        let profile = |require: &str| {
+            format!(
+                "[profiles.capture]\ntriggers = [\"single-click-hold\"]\n\
+                 tools = [\"nextcloud/deck_create_card\"]\nsystem_prompt = \"x\"\n{require}"
+            )
+        };
+        let ok = profile(
+            r#"
+[profiles.capture.require]
+tool = "nextcloud/deck_create_card"
+result_not_matching = ["*requiresConfirmation*"]
+[profiles.capture.require.fallback]
+tool = "nextcloud/deck_create_card"
+arguments = { stackId = 49, title = "{{title}}", description = "{{transcript}}", confirm = true }
+"#,
+        );
+        let c = Config::from_toml(&ok).unwrap();
+        let r = c.profiles["capture"].require.as_ref().unwrap();
+        let fb = r.fallback.as_ref().unwrap();
+        assert_eq!(fb.title_max_chars, 80);
+        assert_eq!(fb.arguments["stackId"], 49);
+        assert_eq!(fb.arguments["confirm"], true);
+        // A profile without `require` has none.
+        assert!(
+            Config::from_toml(&profile("")).unwrap().profiles["capture"]
+                .require
+                .is_none()
+        );
+        for (bad, why) in [
+            (
+                "[profiles.capture.require]\ntool = \"nextcloud/deck_create_card\"\nresult_not = []\n",
+                "unknown field",
+            ),
+            (
+                "[profiles.capture.require]\ntool = \"nextcloud/deck_create_card\"\n\
+                 [profiles.capture.require.fallback]\ntool = \"nextcloud/deck_delete_card\"\narguments = {}\n",
+                "does not match require.tool",
+            ),
+            (
+                "[profiles.capture.require]\ntool = \"nextcloud/*\"\n\
+                 [profiles.capture.require.fallback]\ntool = \"nextcloud/deck_list_boards\"\narguments = {}\n",
+                "not in the profile's tools",
+            ),
+        ] {
+            let e = format!("{:#}", Config::from_toml(&profile(bad)).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]

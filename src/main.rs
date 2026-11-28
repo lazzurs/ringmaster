@@ -258,6 +258,13 @@ async fn run(cli: Cli) -> ExitCode {
                                 .unwrap_or_default()
                         );
                     }
+                    if let Some(r) = &p.require {
+                        println!(
+                            "    requires a {} call that met its criteria; fallback: {}",
+                            r.tool,
+                            r.fallback.as_ref().map_or("none", |f| f.tool.as_str())
+                        );
+                    }
                 }
                 if c.uses_classifier() {
                     let a = &c.approval;

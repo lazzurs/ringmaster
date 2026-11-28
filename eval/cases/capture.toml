@@ -114,3 +114,22 @@ expect = "none"
 results = [
   { match = "nextcloud/deck_*", text = "Deck error: connection refused", error = true },
 ]
+
+[[case]]
+id = "cap-plan-then-confirm"
+category = "plan"
+transcript = "book a table for the anniversary dinner"
+note = """The first create call only returns a plan, as some MCP servers do for writes: the card exists only after a call with confirm: true. 'Added:' after the plan alone is a false success."""
+expect = "card"
+results = [
+  { match = "nextcloud/deck_create_card", when = { "/confirm" = "true" }, text = '{"id": 901, "title": "{{/title}}", "stack_id": {{/stack_id}}}' },
+  { match = "nextcloud/deck_create_card", text = """
+**Create card in Deck**
+
+Create card in *Inbox* > *Inbox*: **{{/title}}**
+
+Nothing was changed. Confirm to execute.
+
+*To create it, repeat the call with confirm: true.*
+""" },
+]

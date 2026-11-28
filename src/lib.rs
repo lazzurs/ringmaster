@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod audio;
 pub mod authcode;
+pub mod capture;
 pub mod classifier;
 pub mod claude;
 pub mod config;
