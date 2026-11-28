@@ -4,9 +4,9 @@
 # host's platform and cross-compiles for TARGETPLATFORM with tonistiigi/xx.
 # The runtime stage only copies files, so no RUN executes under QEMU.
 
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0@sha256:c64defb9ed5a91eacb37f96ccc3d4cd72521c4bd18d5442905b95e2226b0e707 AS xx
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.10.0@sha256:40fe21f44bb8cddf1eb1226db190d0a984118f62ee02a91b77d99448d28264a6 AS xx
 
-FROM --platform=$BUILDPLATFORM rust:1.98-trixie@sha256:a8a5f0a1e5fe7dfe1d352591e4a1c7dd2c08fd70475cae872cf3458ba0df0546 AS build
+FROM --platform=$BUILDPLATFORM rust:1.100-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254 AS build
 COPY --from=xx / /
 RUN apt-get update \
  && apt-get install -y --no-install-recommends clang lld \
@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && mkdir -p /data-skel /config-skel
 
 # distroless/cc: glibc + libgcc + CA certificates, no shell, no package manager.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:532c7a94f9e96ba9db75eb9388f4227751131c7cb0a411d1a8521af4096135de
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2
 ARG RINGMASTER_VERSION
 LABEL org.opencontainers.image.title="ringmaster" \
       org.opencontainers.image.description="Voice commands from a smart ring: webhook, local transcription, Claude agent with MCP tools" \
