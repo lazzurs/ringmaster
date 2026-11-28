@@ -1,0 +1,114 @@
+# Scripted tool results for a made-up household. The first entry matching a
+# call answers it (cases can put their own entries in front); a call nothing
+# matches gets "OK". Matchers are written like [[tool_policies]] rules, and
+# {{/pointer}} in `text` is replaced by that argument.
+
+[[result]]
+match = "homeassistant/GetLiveContext"
+text = """
+Live context. Each device: name (entity id): state [area]
+- Front door (lock.front_door): locked [Hallway]
+- Back door (lock.back_door): locked [Kitchen]
+- Garage door (cover.garage_door): closed [Garage]
+- Kitchen lights (light.kitchen_lights): on, brightness 80% [Kitchen]
+- Living room lights (light.living_room_lights): off [Living room]
+- Garage light (light.garage_light): off [Garage]
+- Bedroom lamp (light.bedroom_lamp): on [Bedroom]
+- Coffee machine (switch.coffee_machine): off [Kitchen]
+- Living room TV (media_player.living_room_tv): playing [Living room]
+- Kitchen speaker (media_player.kitchen_speaker): paused [Kitchen]
+- Bedroom speaker (media_player.bedroom_speaker): idle [Bedroom]
+- Hallway thermostat (climate.hallway_thermostat): heat, current 19.5 C, target 20 C [Hallway]
+- House alarm (alarm_control_panel.house_alarm): disarmed; modes away, home, night [Hallway]
+- House alarm garage (alarm_control_panel.house_alarm_garage): disarmed; partition of the house alarm covering the garage [Garage]
+- Hallway temperature (sensor.hallway_temperature): 19.5 C [Hallway]
+- Washing machine (sensor.washing_machine_status): idle [Utility]
+"""
+
+[[result]]
+match = "homeassistant/render_template"
+text = "19.5"
+
+[[result]]
+match = "homeassistant/call_action"
+text = '{"success": true, "action": "{{/action}}"}'
+
+[[result]]
+match = "homeassistant/Hass*"
+text = '{"success": true, "name": "{{/name}}", "area": "{{/area}}"}'
+
+[[result]]
+match = "nextcloud/deck_list_boards"
+text = '[{"id": 1, "title": "Inbox"}, {"id": 2, "title": "Groceries"}, {"id": 3, "title": "House"}]'
+
+[[result]]
+match = "nextcloud/deck_list_stacks"
+when = { "/board_id" = "1" }
+text = '[{"id": 11, "title": "Inbox"}, {"id": 12, "title": "Someday"}]'
+
+[[result]]
+match = "nextcloud/deck_list_stacks"
+when = { "/board_id" = "2" }
+text = '[{"id": 21, "title": "To do"}, {"id": 22, "title": "Done"}]'
+
+[[result]]
+match = "nextcloud/deck_list_stacks"
+when = { "/board_id" = "3" }
+text = '[{"id": 31, "title": "To do"}, {"id": 32, "title": "Doing"}, {"id": 33, "title": "Done"}]'
+
+[[result]]
+match = "nextcloud/deck_list_stacks"
+text = '{"error": "board not found"}'
+error = true
+
+[[result]]
+match = "nextcloud/deck_list_cards"
+when = { "/board_id" = "1", "/stack_id" = "11" }
+text = '[{"id": 101, "title": "Call the window cleaner"}]'
+
+[[result]]
+match = "nextcloud/deck_list_cards"
+when = { "/board_id" = "2", "/stack_id" = "21" }
+text = '[{"id": 201, "title": "Milk"}, {"id": 202, "title": "Bread"}, {"id": 203, "title": "Eggs"}, {"id": 205, "title": "Washing-up liquid"}]'
+
+[[result]]
+match = "nextcloud/deck_list_cards"
+when = { "/board_id" = "2", "/stack_id" = "22" }
+text = '[{"id": 204, "title": "Coffee"}]'
+
+[[result]]
+match = "nextcloud/deck_list_cards"
+when = { "/board_id" = "3", "/stack_id" = "31" }
+text = '[{"id": 301, "title": "Fix the gate latch"}, {"id": 302, "title": "Paint the shed"}]'
+
+[[result]]
+match = "nextcloud/deck_list_cards"
+when = { "/board_id" = "3", "/stack_id" = "32" }
+text = '[{"id": 303, "title": "Clear the gutters"}]'
+
+[[result]]
+match = "nextcloud/deck_list_cards"
+text = "[]"
+
+[[result]]
+match = "nextcloud/deck_create_card"
+text = '{"id": 900, "title": "{{/title}}", "stack_id": {{/stack_id}}}'
+
+[[result]]
+match = "nextcloud/deck_move_card"
+text = '{"id": {{/card_id}}, "stack_id": {{/target_stack_id}}}'
+
+[[result]]
+match = "nextcloud/deck_set_card_archived"
+text = '{"id": {{/card_id}}, "archived": {{/archived}}}'
+
+[[result]]
+match = "nextcloud/deck_delete_card"
+text = '{"deleted": {{/card_id}}}'
+
+[[result]]
+match = "web/search"
+text = """
+[{"title": "Result for: {{/query}}", "url": "https://example.org/a", "snippet": "A synthetic search result about {{/query}}."},
+ {"title": "More on {{/query}}", "url": "https://example.net/b", "snippet": "Another synthetic result."}]
+"""

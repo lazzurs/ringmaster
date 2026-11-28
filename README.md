@@ -246,6 +246,22 @@ quietly forgotten transcript.
   clear message instead of retrying it for an hour. An empty first reply
   (no text, no tool call) also fails the job rather than claiming "Done."
 
+### Comparing models
+
+`ringmaster eval` runs synthetic voice commands (a made-up household: lights,
+locks, an alarm with a garage partition, a Deck board, web questions, junk
+transcripts) against any models you configure, through Ringmaster's own
+request code, and writes a report: which model picks the right action, which
+ones do something harmful, claim success without a tool call or call tools
+that do not exist, how slow each one is cold and warm, and how both change as
+the tool list grows. It can also test an LLM as approval judge and check your
+Shieldstral cut-off. No MCP server is called. See
+[docs/model-evaluation.md](docs/model-evaluation.md).
+
+```sh
+ringmaster eval --config config.toml --model anthropic:claude-haiku-5-5 --model ollama:qwen3.5:9b
+```
+
 ### The tool fallback, for every provider
 
 If the API rejects the very first request of a job with a 400 while tools
@@ -981,6 +997,8 @@ dedupe, multipart parsing, M4A→WAV decoding of a real AAC-LC file
 the whole pipeline end to end against mocked model APIs (wiremock: Claude,
 OpenAI, Mistral, OpenRouter and Ollama request and message shapes) and a
 real MCP server (rmcp) on localhost, including approve and deny.
+`tests/eval.rs` runs `ringmaster eval` against mocked providers and checks
+the shipped fixtures.
 
 ## Releases
 

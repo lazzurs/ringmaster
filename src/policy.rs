@@ -198,9 +198,8 @@ impl Policies {
     /// The rule for a call of `<server>/<tool>` with `args`; calls no rule
     /// matches need confirmation.
     pub fn matched(&self, qualified: &str, args: &Value) -> Matched<'_> {
-        self.rules
-            .iter()
-            .find(|r| r.matches(qualified, args))
+        self.first_match(qualified, args)
+            .map(|i| &self.rules[i])
             .map(|r| Matched {
                 policy: r.policy,
                 code: r.code.as_ref(),
@@ -211,6 +210,13 @@ impl Policies {
                 code: None,
                 conditional: false,
             })
+    }
+
+    /// The index of the first rule matching a call of `<server>/<tool>`
+    /// with `args`, if any. The model evaluation uses this to match calls
+    /// against expectations written like policy rules.
+    pub fn first_match(&self, qualified: &str, args: &Value) -> Option<usize> {
+        self.rules.iter().position(|r| r.matches(qualified, args))
     }
 
     /// Policy for a call of `<server>/<tool>` with `args`.
@@ -299,6 +305,23 @@ mod tests {
 
     fn none() -> Value {
         json!({})
+    }
+
+    #[test]
+    fn first_match_gives_the_rule_index() {
+        let p = Policies::new(&[
+            when("ha/call_action", Policy::Deny, &[("/action", "lock.*")]),
+            rule("ha/*", Policy::Allow),
+        ])
+        .unwrap();
+        assert_eq!(
+            p.first_match("ha/call_action", &json!({"action": "Lock.Unlock"})),
+            Some(0)
+        );
+        assert_eq!(p.first_match("ha/call_action", &json!({})), Some(1));
+        assert_eq!(p.first_match("web/search", &json!({})), None);
+        // `matched` still defaults to confirm when nothing matches.
+        assert_eq!(p.policy_for("web/search", &json!({})), Policy::Confirm);
     }
 
     #[test]

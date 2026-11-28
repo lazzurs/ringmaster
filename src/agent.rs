@@ -23,7 +23,7 @@ use crate::db::{Db, Job, JobStatus};
 use crate::llm::{ChatModel, ChatRequest, LlmError, Llms, Provider, StopKind, ToolResult};
 use crate::notify::{Kind, Notification, Notifier};
 use crate::policy::{Policies, Policy, ToolFilter};
-use crate::tools::{ToolBackend, ToolDef, ToolError, to_defs};
+use crate::tools::{DiscoveredTool, ToolBackend, ToolDef, ToolError, to_defs};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentState {
@@ -499,22 +499,7 @@ impl Agent {
         let mut unavailable = Vec::new();
         for (server, res) in listings {
             match res {
-                Ok(tools) => {
-                    for t in tools {
-                        match crate::tools::check_schema(&t.input_schema) {
-                            Ok(()) => discovered.push(t),
-                            Err(why) => {
-                                tracing::warn!(job = job.id, tool = %t.qualified(), %why, "skipping tool with an unusable schema");
-                                self.audit(
-                                    job,
-                                    "tool_skipped",
-                                    json!({"tool": t.qualified(), "reason": why}),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
+                Ok(tools) => discovered.extend(tools),
                 Err(e) => {
                     tracing::warn!(job = job.id, server = %server, error = %e, "skipping unavailable tool server");
                     metrics::counter!("ringmaster_tool_server_skipped_total", "server" => server.clone()).increment(1);
@@ -528,29 +513,33 @@ impl Agent {
                 }
             }
         }
-        let offered: Vec<_> = discovered
-            .into_iter()
-            .filter(|t| {
-                let q = t.qualified();
-                filter.allows(&q) && !self.policies.always_denies(&q)
-            })
-            .collect();
+        let (offered, skipped) = prepare_tools(discovered, filter, &self.policies);
+        for (tool, why) in skipped {
+            tracing::warn!(job = job.id, tool = %tool, %why, "skipping tool with an unusable schema");
+            self.audit(job, "tool_skipped", json!({"tool": tool, "reason": why}))
+                .await;
+        }
         let choice = self
             .config
             .profile_llm(Some(profile))
             .map_err(|e| AgentError::Permanent(format!("{e:#}")))?;
         let llm = self.llms.get(choice.provider);
-        state.tools = to_defs(offered);
+        state.tools = offered;
         state.unavailable = unavailable.clone();
         state.provider = choice.provider;
         state.model = choice.model;
         state.effort = choice.effort;
-        state.system = format!(
-            "{}\n\n{}",
-            self.config.base_prompt().trim(),
-            profile.system_prompt.trim()
-        );
-        state.messages = vec![llm.user_message(&self.context_text(job, req, &unavailable))];
+        state.system = system_prompt(&self.config, profile);
+        state.messages = vec![llm.user_message(&context_text(
+            &self.config,
+            &Context {
+                trigger: &job.trigger,
+                recorded_at_ms: job.recorded_at_ms,
+                transcript_source: req.transcript_source,
+                transcript: req.transcript,
+                unavailable: &unavailable,
+            },
+        ))];
         self.audit(
             job,
             "agent_start",
@@ -564,39 +553,6 @@ impl Agent {
         .await;
         self.db.save_agent_state(job.id, state).await?;
         Ok(())
-    }
-
-    /// Volatile context goes in the first user message, never in the system
-    /// prompt, so the cached prefix (tools + system) stays identical.
-    fn context_text(&self, job: &Job, req: &Request<'_>, unavailable: &[String]) -> String {
-        let tz =
-            jiff::tz::TimeZone::get(&self.config.agent.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
-        let fmt = |ts: jiff::Timestamp| {
-            ts.to_zoned(tz.clone())
-                .strftime("%A %Y-%m-%d %H:%M:%S %Z")
-                .to_string()
-        };
-        let now = fmt(jiff::Timestamp::now());
-        let recorded = job
-            .recorded_at_ms
-            .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
-            .map(fmt)
-            .unwrap_or_else(|| "unknown".into());
-        let unavailable = if unavailable.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Unavailable right now (their tools are missing; say so if the request needs them): {}\n",
-                unavailable.join(", ")
-            )
-        };
-        format!(
-            "<context>\nCurrent time: {now} ({tzname})\nRecorded at: {recorded}\nGesture: {trigger}\nTranscript source: {source}\n{unavailable}</context>\n<transcript>\n{text}\n</transcript>",
-            tzname = self.config.agent.timezone,
-            trigger = job.trigger,
-            source = req.transcript_source,
-            text = req.transcript.trim(),
-        )
     }
 
     /// Plan and run (or park) the tool calls of the last assistant turn.
@@ -637,11 +593,10 @@ impl Agent {
             let action = match state.tools.iter().find(|d| d.claude_name == name) {
                 // Malformed arguments (a small model, or a cut-off reply)
                 // are never run, whatever the tool's policy.
-                _ if bad_input.is_some() => CallAction::Reject(format!(
-                    "Not run: {}. Call the tool again with a JSON object as its arguments.",
-                    bad_input.as_deref().unwrap_or_default()
+                _ if bad_input.is_some() => CallAction::Reject(malformed_arguments_result(
+                    bad_input.as_deref().unwrap_or_default(),
                 )),
-                None => CallAction::Reject(format!("Unknown tool {name}.")),
+                None => CallAction::Reject(unknown_tool_result(&name)),
                 Some(def) => {
                     let q = def.qualified();
                     if !filter.allows(&q) {
@@ -1155,6 +1110,97 @@ impl Agent {
     }
 }
 
+/// The error result for a call whose arguments are not a JSON object.
+pub fn malformed_arguments_result(why: &str) -> String {
+    format!("Not run: {why}. Call the tool again with a JSON object as its arguments.")
+}
+
+/// The error result for a call of a tool that was not offered.
+pub fn unknown_tool_result(name: &str) -> String {
+    format!("Unknown tool {name}.")
+}
+
+/// The system prompt a job of `profile` starts with: the frozen base prompt,
+/// then the profile's. Never holds per-request data (prompt caching).
+pub fn system_prompt(config: &Config, profile: &ProfileConfig) -> String {
+    format!(
+        "{}\n\n{}",
+        config.base_prompt().trim(),
+        profile.system_prompt.trim()
+    )
+}
+
+/// The tools a job of a profile is offered, from everything its servers
+/// listed: tools with an input schema the APIs would reject are dropped
+/// (returned as `(server/tool, why)`), then the profile's allow-list and
+/// unconditional `deny` policies apply, and the rest become sorted
+/// definitions ([`to_defs`]).
+pub fn prepare_tools(
+    discovered: Vec<DiscoveredTool>,
+    filter: &ToolFilter,
+    policies: &Policies,
+) -> (Vec<ToolDef>, Vec<(String, String)>) {
+    let mut skipped = Vec::new();
+    let offered: Vec<DiscoveredTool> = discovered
+        .into_iter()
+        .filter(|t| match crate::tools::check_schema(&t.input_schema) {
+            Ok(()) => true,
+            Err(why) => {
+                skipped.push((t.qualified(), why));
+                false
+            }
+        })
+        .filter(|t| {
+            let q = t.qualified();
+            filter.allows(&q) && !policies.always_denies(&q)
+        })
+        .collect();
+    (to_defs(offered), skipped)
+}
+
+/// What the first user message says about the request.
+pub struct Context<'a> {
+    /// The gesture (`X-Index-Trigger`).
+    pub trigger: &'a str,
+    pub recorded_at_ms: Option<i64>,
+    pub transcript_source: &'a str,
+    pub transcript: &'a str,
+    /// MCP servers (or "all tools") that could not be used.
+    pub unavailable: &'a [String],
+}
+
+/// The first user message. Volatile context goes here, never in the system
+/// prompt, so the cached prefix (tools + system) stays identical.
+pub fn context_text(config: &Config, c: &Context<'_>) -> String {
+    let tz = jiff::tz::TimeZone::get(&config.agent.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
+    let fmt = |ts: jiff::Timestamp| {
+        ts.to_zoned(tz.clone())
+            .strftime("%A %Y-%m-%d %H:%M:%S %Z")
+            .to_string()
+    };
+    let now = fmt(jiff::Timestamp::now());
+    let recorded = c
+        .recorded_at_ms
+        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+        .map(fmt)
+        .unwrap_or_else(|| "unknown".into());
+    let unavailable = if c.unavailable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Unavailable right now (their tools are missing; say so if the request needs them): {}\n",
+            c.unavailable.join(", ")
+        )
+    };
+    format!(
+        "<context>\nCurrent time: {now} ({tzname})\nRecorded at: {recorded}\nGesture: {trigger}\nTranscript source: {source}\n{unavailable}</context>\n<transcript>\n{text}\n</transcript>",
+        tzname = config.agent.timezone,
+        trigger = c.trigger,
+        source = c.transcript_source,
+        text = c.transcript.trim(),
+    )
+}
+
 /// The error result for a conditional `deny`.
 const BLOCKED_FOR_ARGUMENTS: &str = "Not run: policy blocks this call with these arguments. Do not try \
 to achieve the same effect another way.";
@@ -1353,6 +1399,76 @@ mod tests {
             "400 Bad Request: \"gemma3\" does not support thinking"
         ));
         assert!(!rejects_tools("401 Unauthorized: bad key"));
+    }
+
+    #[test]
+    fn tools_are_checked_filtered_and_sorted() {
+        let tool = |server: &str, name: &str, schema: Value| DiscoveredTool {
+            server: server.into(),
+            name: name.into(),
+            description: String::new(),
+            input_schema: schema.as_object().cloned().unwrap(),
+        };
+        let policies = Policies::new(&[crate::config::ToolPolicyRule::new(
+            "*/*delete*",
+            Policy::Deny,
+        )])
+        .unwrap();
+        let filter = ToolFilter::new(&["home/*".into(), "deck/*".into()]).unwrap();
+        let (defs, skipped) = prepare_tools(
+            vec![
+                tool("home", "set_light", json!({})),
+                tool("deck", "delete_card", json!({})),
+                tool("deck", "create_card", json!({})),
+                tool("home", "broken", json!({"type": "array"})),
+                tool("web", "search", json!({})),
+            ],
+            &filter,
+            &policies,
+        );
+        let names: Vec<&str> = defs.iter().map(|d| d.claude_name.as_str()).collect();
+        assert_eq!(names, ["deck__create_card", "home__set_light"]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "home/broken");
+    }
+
+    #[test]
+    fn the_first_message_holds_the_volatile_context() {
+        let mut config = Config::from_toml("").unwrap();
+        config.agent.timezone = "Europe/Lisbon".into();
+        let text = context_text(
+            &config,
+            &Context {
+                trigger: "double-click-hold",
+                recorded_at_ms: Some(0),
+                transcript_source: "primary",
+                transcript: "  pause the TV ",
+                unavailable: &["home".into()],
+            },
+        );
+        assert!(text.starts_with("<context>\nCurrent time: "), "{text}");
+        assert!(
+            text.contains("(Europe/Lisbon)\nRecorded at: Thursday 1970-01-01 01:00:00 CET\n"),
+            "{text}"
+        );
+        assert!(text.contains("Gesture: double-click-hold\nTranscript source: primary\n"));
+        assert!(text.contains("Unavailable right now (their tools are missing; say so if the request needs them): home\n"));
+        assert!(text.ends_with("</context>\n<transcript>\npause the TV\n</transcript>"));
+        let profile = ProfileConfig {
+            triggers: vec![],
+            system_prompt: " Command mode. ".into(),
+            tools: vec![],
+            provider: None,
+            model: None,
+            effort: None,
+            max_iterations: None,
+            job_max_age_secs: None,
+            approval_mode: None,
+        };
+        assert_eq!(
+            system_prompt(&config, &profile),
+            format!("{}\n\nCommand mode.", crate::config::DEFAULT_BASE_PROMPT)
+        );
     }
 
     #[test]

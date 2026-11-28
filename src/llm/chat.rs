@@ -477,7 +477,21 @@ fn record_usage(p: Provider, resp: &Value) {
 
 fn usage_summary(resp: &Value) -> Value {
     let [(_, input), (_, output), (_, cached)] = usage_numbers(resp);
-    json!({"input_tokens": input, "output_tokens": output, "cached_tokens": cached})
+    let mut usage =
+        json!({"input_tokens": input, "output_tokens": output, "cached_tokens": cached});
+    // Ollama's native API also says where the time went (nanoseconds):
+    // loading the model, reading the prompt, generating.
+    for (field, key) in [
+        ("load_duration", "load_ms"),
+        ("prompt_eval_duration", "prompt_eval_ms"),
+        ("eval_duration", "eval_ms"),
+        ("total_duration", "total_ms"),
+    ] {
+        if let Some(ns) = resp.get(field).and_then(Value::as_u64) {
+            usage[key] = json!(ns as f64 / 1e6);
+        }
+    }
+    usage
 }
 
 #[cfg(test)]
@@ -643,6 +657,36 @@ mod tests {
             adapter(Provider::Ollama).tool_results(&r)[0]["tool_name"],
             "home__set_light"
         );
+    }
+
+    #[test]
+    fn ollama_timings_are_in_the_audit_usage() {
+        let a = adapter(Provider::Ollama);
+        let t = a
+            .turn(
+                &json!({"model": "m", "done": true, "done_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                        "prompt_eval_count": 1800, "eval_count": 9,
+                        "load_duration": 5_000_000u64, "prompt_eval_duration": 1_500_000_000u64,
+                        "eval_duration": 250_000_000u64, "total_duration": 1_760_000_000u64}),
+                true,
+            )
+            .unwrap();
+        let u = &t.audit["usage"];
+        assert_eq!(u["input_tokens"], 1800);
+        assert_eq!(u["output_tokens"], 9);
+        assert_eq!(u["load_ms"], 5.0);
+        assert_eq!(u["prompt_eval_ms"], 1500.0);
+        assert_eq!(u["eval_ms"], 250.0);
+        assert_eq!(u["total_ms"], 1760.0);
+        // Other providers report no durations.
+        let t = adapter(Provider::OpenAi)
+            .turn(
+                &reply(json!({"role": "assistant", "content": "hi"}), "stop"),
+                true,
+            )
+            .unwrap();
+        assert!(t.audit["usage"].get("prompt_eval_ms").is_none());
     }
 
     #[test]

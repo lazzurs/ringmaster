@@ -1,0 +1,466 @@
+[
+  {
+    "server": "homeassistant",
+    "name": "HassTurnOn",
+    "description": "Switch on, open or activate devices by name, area or floor. On a lock this LOCKS it; on a cover (door, gate, blind) this OPENS it.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the device or entity, as the user said it."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area (room) name."
+        },
+        "floor": {
+          "type": "string",
+          "description": "Floor name."
+        },
+        "domain": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Limit to these domains, e.g. light, switch, lock, cover, media_player."
+        },
+        "device_class": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Limit to these device classes, e.g. door, garage, outlet."
+        }
+      }
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassTurnOff",
+    "description": "Switch off, close or deactivate devices by name, area or floor. On a lock this UNLOCKS it; on a cover (door, gate, blind) this CLOSES it.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the device or entity, as the user said it."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area (room) name."
+        },
+        "floor": {
+          "type": "string",
+          "description": "Floor name."
+        },
+        "domain": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Limit to these domains, e.g. light, switch, lock, cover, media_player."
+        },
+        "device_class": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Limit to these device classes, e.g. door, garage, outlet."
+        }
+      }
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassLightSet",
+    "description": "Change the brightness or colour of lights.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Light name."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area name."
+        },
+        "brightness": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Brightness in percent."
+        },
+        "color": {
+          "type": "string",
+          "description": "Colour name."
+        }
+      }
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassMediaPause",
+    "description": "Pause playback on a media player.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Media player name."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area name."
+        }
+      }
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassMediaUnpause",
+    "description": "Resume playback on a paused media player.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Media player name."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area name."
+        }
+      }
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassMediaNext",
+    "description": "Skip to the next track or episode on a media player.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Media player name."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area name."
+        }
+      }
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassSetVolume",
+    "description": "Set the volume of a media player.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Media player name."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area name."
+        },
+        "volume_level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Volume in percent."
+        }
+      },
+      "required": [
+        "volume_level"
+      ]
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "HassClimateSetTemperature",
+    "description": "Set the target temperature of a thermostat.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Thermostat name."
+        },
+        "area": {
+          "type": "string",
+          "description": "Area name."
+        },
+        "temperature": {
+          "type": "number",
+          "description": "Target temperature in degrees Celsius."
+        }
+      },
+      "required": [
+        "temperature"
+      ]
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "GetLiveContext",
+    "description": "Report the current state of every device the assistant can see: names, areas, entity ids and states. Use it to answer questions about the home or to look up names before acting.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "call_action",
+    "description": "Run any Home Assistant action on a target, e.g. light.turn_on, lock.unlock, climate.set_temperature or alarm_control_panel.alarm_arm_away. Use entity ids from GetLiveContext.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "The action as <domain>.<action>."
+        },
+        "target": {
+          "type": "object",
+          "description": "What to act on.",
+          "properties": {
+            "entity_id": {
+              "type": "string",
+              "description": "Entity id, e.g. light.kitchen_lights."
+            },
+            "area_id": {
+              "type": "string",
+              "description": "Area id."
+            },
+            "device_id": {
+              "type": "string",
+              "description": "Device id."
+            }
+          }
+        },
+        "data": {
+          "type": "object",
+          "description": "Extra action data, e.g. temperature or brightness_pct."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "server": "homeassistant",
+    "name": "render_template",
+    "description": "Render a Home Assistant template and return the text, e.g. to read a sensor value or count entities. Read-only.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "template": {
+          "type": "string",
+          "description": "The template, e.g. {{ states('sensor.hallway_temperature') }}."
+        }
+      },
+      "required": [
+        "template"
+      ]
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_list_boards",
+    "description": "List the Deck boards with their ids and titles.",
+    "input_schema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_list_stacks",
+    "description": "List the stacks (lists) of a Deck board with their ids and titles.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "board_id": {
+          "type": "integer",
+          "description": "Board id."
+        }
+      },
+      "required": [
+        "board_id"
+      ]
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_list_cards",
+    "description": "List the cards in one stack with their ids and titles.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "board_id": {
+          "type": "integer",
+          "description": "Board id."
+        },
+        "stack_id": {
+          "type": "integer",
+          "description": "Stack id."
+        }
+      },
+      "required": [
+        "board_id",
+        "stack_id"
+      ]
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_create_card",
+    "description": "Create a card in a stack.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "board_id": {
+          "type": "integer",
+          "description": "Board id."
+        },
+        "stack_id": {
+          "type": "integer",
+          "description": "Stack id."
+        },
+        "title": {
+          "type": "string",
+          "description": "Card title."
+        },
+        "description": {
+          "type": "string",
+          "description": "Optional details."
+        }
+      },
+      "required": [
+        "board_id",
+        "stack_id",
+        "title"
+      ]
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_move_card",
+    "description": "Move a card to another stack of the same board.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "board_id": {
+          "type": "integer",
+          "description": "Board id."
+        },
+        "stack_id": {
+          "type": "integer",
+          "description": "Current stack id."
+        },
+        "card_id": {
+          "type": "integer",
+          "description": "Card id."
+        },
+        "target_stack_id": {
+          "type": "integer",
+          "description": "Stack to move it to."
+        }
+      },
+      "required": [
+        "board_id",
+        "stack_id",
+        "card_id",
+        "target_stack_id"
+      ]
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_set_card_archived",
+    "description": "Archive or unarchive a card.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "board_id": {
+          "type": "integer",
+          "description": "Board id."
+        },
+        "stack_id": {
+          "type": "integer",
+          "description": "Stack id."
+        },
+        "card_id": {
+          "type": "integer",
+          "description": "Card id."
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "true to archive, false to restore."
+        }
+      },
+      "required": [
+        "board_id",
+        "stack_id",
+        "card_id",
+        "archived"
+      ]
+    }
+  },
+  {
+    "server": "nextcloud",
+    "name": "deck_delete_card",
+    "description": "Delete a card permanently. This cannot be undone.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "board_id": {
+          "type": "integer",
+          "description": "Board id."
+        },
+        "stack_id": {
+          "type": "integer",
+          "description": "Stack id."
+        },
+        "card_id": {
+          "type": "integer",
+          "description": "Card id."
+        }
+      },
+      "required": [
+        "board_id",
+        "stack_id",
+        "card_id"
+      ]
+    }
+  },
+  {
+    "server": "web",
+    "name": "search",
+    "description": "Search the web. Returns titles, links and short snippets of the top results. Use it for news, facts, opening hours, prices, weather and anything that may have changed.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to search for."
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Number of results (default 5)."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  }
+]

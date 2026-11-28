@@ -13,6 +13,7 @@ pub mod claude;
 pub mod config;
 pub mod confirm;
 pub mod db;
+pub mod eval;
 pub mod health;
 pub mod http;
 pub mod llm;
