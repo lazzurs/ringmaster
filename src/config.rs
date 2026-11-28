@@ -1716,6 +1716,37 @@ url = "ftp://x/mcp"
     }
 
     #[test]
+    fn mcp_basic_credentials_are_standard_padded_base64() {
+        // Expected values from coreutils `base64`: no padding, one `=`, two
+        // `=`, and a UTF-8 password containing colons (RFC 7617 splits on
+        // the first colon only).
+        for (user, pw, want) in [
+            ("abcd", "e", "YWJjZDpl"),
+            ("ab", "cd", "YWI6Y2Q="),
+            ("ab", "c", "YWI6Yw=="),
+            (
+                "rob",
+                "pässwörd:with:colons",
+                "cm9iOnDDpHNzd8O2cmQ6d2l0aDpjb2xvbnM=",
+            ),
+        ] {
+            let servers: Vec<McpServerConfig> = toml::from_str::<Config>(&format!(
+                "[[mcp_servers]]\nname = \"nc\"\nurl = \"http://nc/mcp\"\n\
+                 basic_auth = {{ username = \"{user}\", password_env = \"PW\" }}\n"
+            ))
+            .unwrap()
+            .mcp_servers;
+            let (h, warnings) = mcp_headers(&servers, |_| Ok(Some(pw.to_string())));
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                h["nc"],
+                [("Authorization".to_string(), format!("Basic {want}"))],
+                "{user}:{pw}"
+            );
+        }
+    }
+
+    #[test]
     fn mcp_headers_basic_bearer_and_custom() {
         let servers: Vec<McpServerConfig> = toml::from_str::<Config>(
             r#"
