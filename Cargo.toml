@@ -21,7 +21,7 @@ globset = "0.4"
 hex = "0.4"
 hmac = "0.13"
 hound = "3.5"
-jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
+jiff = { version = "1.0.3", features = ["tzdb-bundle-always"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 multer = "3"

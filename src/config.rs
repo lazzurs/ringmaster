@@ -1839,6 +1839,19 @@ basic_auth = { username = "x", password_env = "UNSET" }
     }
 
     #[test]
+    fn timezones_are_checked_against_the_bundled_database() {
+        for tz in ["UTC", "Europe/Dublin", "America/New_York", "Asia/Kolkata"] {
+            Config::from_toml(&format!("[agent]\ntimezone = \"{tz}\"\n"))
+                .unwrap_or_else(|e| panic!("{tz}: {e:#}"));
+        }
+        let e = Config::from_toml("[agent]\ntimezone = \"Not/AZone\"\n").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("unknown agent.timezone \"Not/AZone\""),
+            "{e:#}"
+        );
+    }
+
+    #[test]
     fn unknown_provider_rejected() {
         let e = Config::from_toml("[llm]\nprovider = \"gemini\"\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown variant"), "{e:#}");
