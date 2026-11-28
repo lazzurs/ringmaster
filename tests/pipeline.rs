@@ -731,6 +731,20 @@ async fn confirm_approve_resumes_and_runs_tool() {
         .unwrap()
         .to_string();
     let view_path = view.strip_prefix("https://ring.test").unwrap().to_string();
+    // The token is 32 random bytes as unpadded URL-safe base64: 43
+    // characters that need no escaping in a path.
+    let token = approve_path
+        .strip_prefix("/confirm/")
+        .and_then(|t| t.strip_suffix("/approve"))
+        .unwrap();
+    assert_eq!(token.len(), 43, "{token}");
+    assert!(
+        token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "{token}"
+    );
+    assert_eq!(view_path, format!("/confirm/{token}"));
 
     // GET shows the page and changes nothing.
     let (status, page) = send(&h, Request::get(&view_path).body(Body::empty()).unwrap()).await;
