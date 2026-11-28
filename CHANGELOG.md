@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/lazzurs/ringmaster/compare/v0.1.8...v0.1.9) (2026-11-28)
+
+
+### Features
+
+* add a model evaluation suite (ringmaster eval) ([#24](https://github.com/lazzurs/ringmaster/issues/24)) ([26e9535](https://github.com/lazzurs/ringmaster/commit/26e9535957b49762ae49ad3221a543dfbcf95332))
+
 ## [0.1.8](https://github.com/lazzurs/ringmaster/compare/v0.1.7...v0.1.8) (2026-11-26)
 
 
