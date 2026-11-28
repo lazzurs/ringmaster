@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.10](https://github.com/lazzurs/ringmaster/compare/v0.1.9...v0.1.10) (2026-11-28)
+
+
+### Bug Fixes
+
+* **deps:** Bump base64 from 0.22.1 to 0.23.1 ([#5](https://github.com/lazzurs/ringmaster/issues/5)) ([2d2e934](https://github.com/lazzurs/ringmaster/commit/2d2e934fb18fe7a0cf5adc65baf81a38c4fc452e))
+* **deps:** bump jiff from 0.2.46 to 1.0.3 ([#27](https://github.com/lazzurs/ringmaster/issues/27)) ([ea62baa](https://github.com/lazzurs/ringmaster/commit/ea62baa1d1e386f1affa05942e069aba71677e49))
+* **deps:** Bump the base-images group across 1 directory with 3 updates ([#26](https://github.com/lazzurs/ringmaster/issues/26)) ([0d54273](https://github.com/lazzurs/ringmaster/commit/0d54273dd463c8a8f3e16ab34df17b1bfd2442ee))
+
 ## [0.1.9](https://github.com/lazzurs/ringmaster/compare/v0.1.8...v0.1.9) (2026-11-28)
 
 

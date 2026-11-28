@@ -1,6 +1,6 @@
 [package]
 name = "ringmaster"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.89"
 description = "Voice commands from a smart ring: webhook receiver, local transcription, LLM agent (Claude, OpenAI, Mistral, OpenRouter, Ollama) with MCP tools, ntfy notifications"
