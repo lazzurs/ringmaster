@@ -1174,7 +1174,7 @@ pub struct Context<'a> {
 pub fn context_text(config: &Config, c: &Context<'_>) -> String {
     let tz = jiff::tz::TimeZone::get(&config.agent.timezone).unwrap_or(jiff::tz::TimeZone::UTC);
     let fmt = |ts: jiff::Timestamp| {
-        ts.to_zoned(tz.clone())
+        ts.to_zoned_datetime(tz.clone())
             .strftime("%A %Y-%m-%d %H:%M:%S %Z")
             .to_string()
     };
@@ -1430,6 +1430,60 @@ mod tests {
         assert_eq!(names, ["deck__create_card", "home__set_light"]);
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].0, "home/broken");
+    }
+
+    fn recorded_line(timezone: &str, recorded_at_ms: Option<i64>) -> String {
+        let mut config = Config::from_toml("").unwrap();
+        config.agent.timezone = timezone.into();
+        let text = context_text(
+            &config,
+            &Context {
+                trigger: "single-click",
+                recorded_at_ms,
+                transcript_source: "primary",
+                transcript: "x",
+                unavailable: &[],
+            },
+        );
+        text.lines()
+            .find_map(|l| l.strip_prefix("Recorded at: "))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn recording_times_follow_the_zone_and_its_daylight_saving() {
+        // Summer time, with milliseconds dropped (not rounded).
+        assert_eq!(
+            recorded_line("Europe/Dublin", Some(1_784_118_896_789)),
+            "Wednesday 2026-07-15 13:34:56 IST"
+        );
+        assert_eq!(
+            recorded_line("Europe/Dublin", Some(1_768_464_000_000)),
+            "Thursday 2026-01-15 08:00:00 GMT"
+        );
+        // Either side of the spring-forward transition.
+        assert_eq!(
+            recorded_line("Europe/Dublin", Some(1_774_745_999_000)),
+            "Sunday 2026-03-29 00:59:59 GMT"
+        );
+        assert_eq!(
+            recorded_line("Europe/Dublin", Some(1_774_746_000_000)),
+            "Sunday 2026-03-29 02:00:00 IST"
+        );
+        // The default zone, and an unknown one (validation normally refuses
+        // it) both format as UTC.
+        assert_eq!(
+            recorded_line("UTC", Some(1_768_464_000_000)),
+            "Thursday 2026-01-15 08:00:00 UTC"
+        );
+        assert_eq!(
+            recorded_line("Not/AZone", Some(1_768_464_000_000)),
+            "Thursday 2026-01-15 08:00:00 UTC"
+        );
+        // A recording time out of range or missing is "unknown", never a panic.
+        assert_eq!(recorded_line("UTC", Some(i64::MAX)), "unknown");
+        assert_eq!(recorded_line("UTC", None), "unknown");
     }
 
     #[test]
